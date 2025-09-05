@@ -119,7 +119,7 @@ logger = logging.getLogger("smartbiz.main")
 # ──────────────────────────────────────────────────────────────────────────────
 # 5) DB engine/session – detect password column BEFORE importing models
 # ──────────────────────────────────────────────────────────────────────────────
-from backend.db import Base, SessionLocal, engine  # type: ignore
+from db import Base, SessionLocal, engine
 
 def _detect_pw_column_and_set_env() -> str:
     chosen = os.getenv("SMARTBIZ_PWHASH_COL", "").strip()
@@ -144,7 +144,7 @@ def _detect_pw_column_and_set_env() -> str:
     return chosen
 
 _detect_pw_column_and_set_env()
-import backend.models  # noqa
+import models  # noqa
 
 # Optional feature toggles (loaded lazily)
 _HAS_LANG = False
