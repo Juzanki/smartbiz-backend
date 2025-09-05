@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Auto-register all SQLAlchemy models in a safe, deterministic order.
 
@@ -18,13 +18,14 @@ import pkgutil
 import time
 import traceback
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable
 
-from backend.db import Base, engine  # noqa: F401
+# ✅ Tumia local package (SI backend.*)
+from db import Base, engine  # noqa: F401
 
 log = logging.getLogger("smartbiz.models")
 
-_PKG_NAME = __name__                 # "backend.models"
+_PKG_NAME = __name__                 # "models"
 _PKG_PATH = Path(__file__).resolve().parent
 
 # ───────────────────────── Env flags ─────────────────────────
@@ -32,7 +33,7 @@ _ENV = (os.getenv("ENVIRONMENT") or "development").strip().lower()
 _DEV = _ENV in {"dev", "development", "local"}
 _STRICT = os.getenv("STRICT_MODE", "0").strip().lower() in {"1", "true", "yes", "on", "y"}
 
-def _env_list(name: str) -> List[str]:
+def _env_list(name: str) -> list[str]:
     raw = os.getenv(name) or ""
     return [s.strip() for s in raw.split(",") if s.strip()]
 
@@ -42,17 +43,16 @@ _EXCL = set(_env_list("MODELS_EXCLUDE"))
 _ENV_HARD_ORDER = _env_list("MODELS_HARD_ORDER")
 
 # ─────────────────────── Import ordering ───────────────────────
-_CRITICAL_FIRST: Tuple[str, ...] = (
+_CRITICAL_FIRST: tuple[str, ...] = (
     "live_stream",
     "gift_movement",
     "gift_transaction",
     "user",
 )
+_PREFERRED_NEXT: tuple[str, ...] = ("guest", "guests", "co_host")
+_PREFERRED_LATE: tuple[str, ...] = ("order", "product", "products_live")
 
-_PREFERRED_NEXT: Tuple[str, ...] = ("guest", "guests", "co_host")
-_PREFERRED_LATE: Tuple[str, ...] = ("order", "product", "products_live")
-
-_ORDER_RULES: Tuple[Tuple[str, str], ...] = (
+_ORDER_RULES: tuple[tuple[str, str], ...] = (
     ("live_stream", "gift_movement"),
     ("gift_movement", "gift_transaction"),
     ("gift_transaction", "user"),
@@ -64,8 +64,8 @@ def _is_hidden_or_legacy(name: str) -> bool:
     suffixes = (".bak", ".backup", ".old", "~", ".tmp", ".swp", ".swo")
     return any(tok in name for tok in suffixes) or name.endswith("_legacy")
 
-def _discover() -> List[str]:
-    mods: List[str] = []
+def _discover() -> list[str]:
+    mods: list[str] = []
     for _, modname, ispkg in pkgutil.iter_modules([str(_PKG_PATH)]):
         if ispkg or _is_hidden_or_legacy(modname):
             continue
@@ -79,7 +79,7 @@ def _discover() -> List[str]:
         log.warning("Both 'guest' and 'guests' modules found; preferring 'guest'.")
     return mods
 
-def _apply_rules(seq: List[str], rules: Iterable[Tuple[str, str]]) -> None:
+def _apply_rules(seq: list[str], rules: Iterable[tuple[str, str]]) -> None:
     changed = True
     while changed:
         changed = False
@@ -92,9 +92,9 @@ def _apply_rules(seq: List[str], rules: Iterable[Tuple[str, str]]) -> None:
                     seq.insert(ib, item)
                     changed = True
 
-def _order_modules(found: Iterable[str]) -> List[str]:
+def _order_modules(found: Iterable[str]) -> list[str]:
     pool = list(found)
-    ordered: List[str] = []
+    ordered: list[str] = []
 
     def take(names: Iterable[str]):
         for n in list(names):
@@ -123,12 +123,12 @@ def _configure_mappers_now() -> None:
     configure_mappers()
     log.info("SQLAlchemy mapper configuration OK.")
 
-def _post_verify(loaded: List[str]) -> None:
+def _post_verify(loaded: list[str]) -> None:
     if not (_DEV or _STRICT):
         return
     registry = getattr(Base, "registry", None)
     names = set(getattr(registry, "_class_registry", {})) if registry else set()
-    expected = []
+    expected: list[str] = []
     if "gift_movement" in loaded:
         expected.append("GiftMovement")
     if "gift_transaction" in loaded:
@@ -149,8 +149,8 @@ __all__: list[str] = []
 
 def _rebuild_exports() -> None:
     __all__.clear()
-    seen = set()
-    for mapper in sorted(Base.registry.mappers, key=lambda m: m.class_.__name__):
+    seen: set[str] = set()
+    for mapper in sorted(getattr(Base, "registry").mappers, key=lambda m: m.class_.__name__):
         cls = mapper.class_
         name = cls.__name__
         globals()[name] = cls
@@ -160,8 +160,8 @@ def _rebuild_exports() -> None:
 
 # ─────────────────────── Public loader (idempotent) ───────────────────────
 _LOADED_ONCE = False
-_LOADED: List[str] = []
-_SKIPPED: List[str] = []
+_LOADED: list[str] = []
+_SKIPPED: list[str] = []
 
 def load_models() -> tuple[list[str], list[str]]:
     """Import all model modules and configure mappers. Safe to call multiple times."""
@@ -171,7 +171,7 @@ def load_models() -> tuple[list[str], list[str]]:
 
     # Log engine URL if available
     try:
-        log.info("Using DB: %s (env=%s)", engine.url, _ENV)
+        log.info("Using DB: %s (env=%s)", engine.url, _ENV)  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -189,10 +189,7 @@ def load_models() -> tuple[list[str], list[str]]:
                 _SKIPPED.append(f"{m} ← {e.__class__.__name__}: {e}")
                 if _STRICT or _DEV:
                     raise
-                log.warning(
-                    "Skipped model '%s' due to %s: %s\n%s",
-                    m, e.__class__.__name__, e, tb
-                )
+                log.warning("Skipped model '%s' due to %s: %s\n%s", m, e.__class__.__name__, e, tb)
 
         _configure_mappers_now()
         _post_verify(_LOADED)
@@ -214,4 +211,3 @@ def load_models() -> tuple[list[str], list[str]]:
 
 # Run immediately on import (common usage)
 load_models()
-
