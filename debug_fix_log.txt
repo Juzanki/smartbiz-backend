@@ -1,0 +1,14 @@
+05/13/2025 03:33:32 - Fixed imports in __init__.py
+05/13/2025 03:48:32 - Fixed circular import in __init__.py and patched main.py
+05/13/2025 03:55:19 - Fixed circular imports in __init__.py and sanitized main.py
+05/13/2025 03:57:43 - Fixed circular imports in __init__.py and sanitized main.py
+
+05/13/2025 04:00:03 - Fixed circular import in __init__.py and sanitized 7 files:
+  - E:\SmartBiz_Assistance\backend\auth.py
+  - E:\SmartBiz_Assistance\backend\auth_routes.py
+  - E:\SmartBiz_Assistance\backend\crud\user_crud.py
+  - E:\SmartBiz_Assistance\backend\routes\forgot_password.py
+  - E:\SmartBiz_Assistance\backend\routes\schedule.py
+  - E:\SmartBiz_Assistance\backend\tasks\scheduler.py
+  - E:\SmartBiz_Assistance\backend\utils\product_auto_reply.py
+05/13/2025 06:22:23 - Fixed circular imports in __init__.py and sanitized main.py

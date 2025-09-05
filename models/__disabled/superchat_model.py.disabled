@@ -1,0 +1,333 @@
+﻿# backend/models/superchat.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import enum
+import datetime as dt
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Enum as SQLEnum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.event import listens_for
+
+from backend.db import Base
+
+# Prefer JSONB on Postgres; graceful fallback elsewhere
+try:
+    from sqlalchemy.dialects.postgresql import JSONB
+    JSON_TYPE = JSONB  # type: ignore
+except Exception:  # pragma: no cover
+    from sqlalchemy import JSON as JSON_TYPE  # type: ignore
+
+
+_DEC2 = Numeric(18, 2)
+
+
+class SuperchatStatus(str, enum.Enum):
+    pending    = "pending"
+    processing = "processing"
+    paid       = "paid"
+    refunded   = "refunded"
+    failed     = "failed"
+    canceled   = "canceled"
+    flagged    = "flagged"
+    hidden     = "hidden"
+
+
+class Superchat(Base):
+    """
+    Superchat — paid, highlighted messages during live streams.
+
+    • Decimal-safe money (amount/fee/net) + currency
+    • Sender/Receiver/Stream FKs
+    • Status lifecycle + moderation & pin
+    • Highlight window (start/end/seconds) + visuals
+    • Idempotency & external PSP refs
+    • Day bucket + hot-path indexes
+    """
+    __tablename__ = "superchats"
+    __table_args__ = (
+        # Dedupe kwa job retries/webhooks
+        UniqueConstraint("idempotency_key", name="uq_superchat_idempotency"),
+        # PSP uniqueness (kwa provider fulani)
+        UniqueConstraint("provider", "external_ref", name="uq_superchat_provider_ref"),
+        # Hot queries
+        Index("ix_superchat_stream_time", "stream_id", "created_at"),
+        Index("ix_superchat_sender_time", "sender_id", "created_at"),
+        Index("ix_superchat_receiver_time", "receiver_id", "created_at"),
+        Index("ix_superchat_status_time", "status", "created_at"),
+        Index("ix_superchat_stream_amount", "stream_id", "amount"),
+        Index("ix_superchat_day", "day_bucket"),
+        Index("ix_superchat_paid_at", "paid_at"),
+        # Data integrity
+        CheckConstraint("amount > 0", name="ck_superchat_amount_positive"),
+        CheckConstraint("fee_amount IS NULL OR fee_amount >= 0", name="ck_superchat_fee_nonneg"),
+        CheckConstraint("net_amount IS NULL OR net_amount >= 0", name="ck_superchat_net_nonneg"),
+        CheckConstraint("sender_id IS NULL OR receiver_id IS NULL OR sender_id <> receiver_id",
+                        name="ck_superchat_no_self_tip"),
+        CheckConstraint("char_length(currency) BETWEEN 2 AND 8", name="ck_superchat_currency_len"),
+        CheckConstraint("highlight_seconds >= 0", name="ck_superchat_highlight_seconds_nonneg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+
+    # ——— Who / where ———
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"),
+                                           nullable=False, index=True)
+    receiver_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"),
+                                                       default=None, index=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("live_streams.id", ondelete="CASCADE"),
+                                           nullable=False, index=True)
+
+    sender: Mapped["User"] = relationship("User", foreign_keys=[sender_id], lazy="selectin")
+    receiver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[receiver_id], lazy="selectin")
+    stream: Mapped["LiveStream"] = relationship("LiveStream", back_populates="superchats", lazy="selectin")
+
+    # ——— Money ———
+    amount: Mapped[Decimal] = mapped_column(_DEC2, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), default="TZS", nullable=False, index=True)
+    fee_amount: Mapped[Optional[Decimal]] = mapped_column(_DEC2, default=None)
+    net_amount: Mapped[Optional[Decimal]] = mapped_column(_DEC2, default=None)
+
+    # ——— Content & visuals ———
+    message: Mapped[Optional[str]] = mapped_column(String(300), default=None)
+    emoji: Mapped[Optional[str]] = mapped_column(String(20), default=None)
+    animation_id: Mapped[Optional[str]] = mapped_column(String(100), default=None)
+    voice_clip_url: Mapped[Optional[str]] = mapped_column(String(255), default=None)
+    highlight_color: Mapped[str] = mapped_column(String(20), default="#FFD700", nullable=False)  # gold
+    highlight_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    highlight_start_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    highlight_end_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
+    # ——— Lifecycle / moderation ———
+    status: Mapped[SuperchatStatus] = mapped_column(
+        SQLEnum(SuperchatStatus, name="superchat_status"),
+        default=SuperchatStatus.pending,
+        nullable=False,
+        index=True,
+    )
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(String(160))   # e.g., "chargeback", "manual_review"
+
+    # ——— PSP / dedupe ———
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    external_ref:   Mapped[Optional[str]] = mapped_column(String(64), index=True)  # gateway/txn id
+    provider:       Mapped[Optional[str]] = mapped_column(String(24), index=True)  # mpesa/stripe/etc.
+
+    # ——— Analytics ———
+    day_bucket: Mapped[dt.date] = mapped_column(Date, server_default=func.current_date(),
+                                                nullable=False, index=True)
+    platform:   Mapped[Optional[str]] = mapped_column(String(24), index=True)   # "web","android","ios"
+    country:    Mapped[Optional[str]] = mapped_column(String(2), index=True)    # ISO-3166 alpha-2
+
+    # ——— Timestamps ———
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    paid_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    refunded_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+    # ——— Extras ———
+    meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_TYPE)
+    attachments: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON_TYPE)
+
+    # --------------------------- Helpers (no DB I/O) ---------------------------
+
+    @staticmethod
+    def _q2(val: Decimal | float | int | None) -> Optional[Decimal]:
+        if val is None:
+            return None
+        return Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def set_fee_amount(self, fee: Decimal | float | int | None) -> None:
+        """Weka ada (absolute) na uhakikishe net = amount - fee (≥0)."""
+        qfee = self._q2(fee)
+        self.fee_amount = qfee
+        self.net_amount = None if qfee is None else (self.amount - qfee)
+        if self.net_amount is not None and self.net_amount < Decimal("0.00"):
+            raise ValueError("Fee cannot exceed amount")
+
+    def set_fee_percent(self, pct: float | Decimal) -> None:
+        """Weka ada kwa asilimia (0..100)."""
+        p = Decimal(str(pct))
+        if p < 0 or p > 100:
+            raise ValueError("Fee percent must be between 0 and 100")
+        self.set_fee_amount(self.amount * p / Decimal("100"))
+
+    def set_highlight(self, *, seconds: int, start: Optional[dt.datetime] = None) -> None:
+        """Seti dirisha la highlight na uhesabu end."""
+        if seconds < 0:
+            raise ValueError("Highlight seconds must be >= 0")
+        self.highlight_seconds = int(seconds)
+        start_at = start or dt.datetime.now(dt.timezone.utc)
+        if start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=dt.timezone.utc)
+        self.highlight_start_at = start_at
+        self.highlight_end_at = start_at + dt.timedelta(seconds=seconds) if seconds > 0 else None
+
+    # ——— State machine ———
+    def mark_processing(self, *, provider: Optional[str] = None, external_ref: Optional[str] = None) -> None:
+        self.status = SuperchatStatus.processing
+        if provider:
+            self.provider = provider[:24]
+        if external_ref:
+            self.external_ref = external_ref[:64]
+
+    def mark_paid(self, when: Optional[dt.datetime] = None) -> None:
+        self.status = SuperchatStatus.paid
+        self.paid_at = when or dt.datetime.now(dt.timezone.utc)
+
+    def mark_refunded(self, when: Optional[dt.datetime] = None, reason: Optional[str] = None) -> None:
+        self.status = SuperchatStatus.refunded
+        self.refunded_at = when or dt.datetime.now(dt.timezone.utc)
+        if reason:
+            self.status_reason = reason
+
+    def mark_failed(self, reason: Optional[str] = None) -> None:
+        self.status = SuperchatStatus.failed
+        if reason:
+            self.status_reason = reason
+
+    def cancel(self, reason: Optional[str] = None) -> None:
+        if self.status not in (SuperchatStatus.pending, SuperchatStatus.processing):
+            raise ValueError("Only pending/processing superchats can be canceled")
+        self.status = SuperchatStatus.canceled
+        if reason:
+            self.status_reason = reason
+
+    def hide(self, reason: Optional[str] = None) -> None:
+        self.status = SuperchatStatus.hidden
+        if reason:
+            self.status_reason = reason
+
+    def unhide(self) -> None:
+        if self.status == SuperchatStatus.hidden:
+            self.status = SuperchatStatus.paid
+
+    def pin(self) -> None:
+        self.is_pinned = True
+
+    def unpin(self) -> None:
+        self.is_pinned = False
+
+    # ——— Convenience flags ———
+    @property
+    def is_paid(self) -> bool:
+        return self.status == SuperchatStatus.paid
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            SuperchatStatus.paid, SuperchatStatus.refunded,
+            SuperchatStatus.failed, SuperchatStatus.canceled,
+        }
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        """Compact, mobile-ready projection."""
+        return {
+            "id": self.id,
+            "sender_id": self.sender_id,
+            "receiver_id": self.receiver_id,
+            "stream_id": self.stream_id,
+            "amount": str(self.amount),
+            "currency": self.currency,
+            "message": self.message,
+            "emoji": self.emoji,
+            "animation_id": self.animation_id,
+            "voice_clip_url": self.voice_clip_url,
+            "highlight_color": self.highlight_color,
+            "highlight_start_at": self.highlight_start_at.isoformat() if self.highlight_start_at else None,
+            "highlight_end_at": self.highlight_end_at.isoformat() if self.highlight_end_at else None,
+            "is_pinned": self.is_pinned,
+            "status": self.status.value,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<Superchat id={self.id} stream={self.stream_id} sender={self.sender_id} "
+            f"amount={self.amount} {self.currency} status={self.status.value}>"
+        )
+
+
+# ——— Daily aggregation (rollup) ———
+class SuperchatDaily(Base):
+    """
+    Per-(stream, day) rollup kwa leaderboards & payouts za haraka.
+    Jaza kupitia cron/job inayojumlisha Superchat kwa (stream_id, day_bucket).
+    """
+    __tablename__ = "superchat_daily"
+    __table_args__ = (
+        UniqueConstraint("stream_id", "day_bucket", name="uq_superchat_daily_stream_day"),
+        Index("ix_superchat_daily_hot", "day_bucket", "total_amount"),
+        CheckConstraint("total_count >= 0", name="ck_superchat_daily_count_nonneg"),
+        CheckConstraint("unique_senders >= 0", name="ck_superchat_daily_unique_nonneg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("live_streams.id", ondelete="CASCADE"),
+                                           nullable=False, index=True)
+    day_bucket: Mapped[dt.date] = mapped_column(Date, nullable=False, index=True)
+
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unique_senders: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(_DEC2, default=Decimal("0.00"), nullable=False)
+    total_net_amount: Mapped[Decimal] = mapped_column(_DEC2, default=Decimal("0.00"), nullable=False)
+
+    first_seen_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    stream: Mapped["LiveStream"] = relationship("LiveStream", lazy="selectin")
+
+    def bump(self, *, count: int = 1, amount: Decimal | float | int = 0, net: Decimal | float | int = 0,
+             uniques: int = 0) -> None:
+        self.total_count += max(0, int(count))
+        self.unique_senders += max(0, int(uniques))
+        self.total_amount += Decimal(str(amount))
+        self.total_net_amount += Decimal(str(net))
+
+
+# ——— Normalizers / listeners ———
+
+@listens_for(Superchat, "before_insert")
+def _superchat_before_insert(mapper, connection, target: Superchat) -> None:
+    # Currency uppercase + trim
+    if target.currency:
+        target.currency = target.currency.strip().upper()[:8]
+    # If fee present but net missing, compute net
+    if target.fee_amount is not None and target.net_amount is None:
+        target.net_amount = target.amount - target.fee_amount
+    # Ensure day_bucket from created_at (if set by app)
+    if target.created_at and isinstance(target.created_at, dt.datetime):
+        target.day_bucket = target.created_at.date()
+
+@listens_for(Superchat, "before_update")
+def _superchat_before_update(mapper, connection, target: Superchat) -> None:
+    if target.currency:
+        target.currency = target.currency.strip().upper()[:8]
+    if target.fee_amount is not None and target.net_amount is None:
+        target.net_amount = target.amount - target.fee_amount

@@ -1,0 +1,8 @@
+# USAGE in any route logic or background task:
+from backend.websocket.manager import manager
+
+await manager.send_personal_message(user_id, {
+    "type": "leaderboard_update",
+    "position": new_position,
+    "previous_position": old_position
+})

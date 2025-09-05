@@ -1,0 +1,1 @@
+andika model ya Python SQLAlchemy ya sarafu iitwayo SmartCoin inayokuwa na jina, thamani, na kiwango cha kubadilisha kuwa fedha

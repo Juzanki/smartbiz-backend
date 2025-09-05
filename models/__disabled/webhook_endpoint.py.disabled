@@ -1,0 +1,262 @@
+﻿# backend/models/withdraw_request.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import enum
+import datetime as dt
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional, Dict, Any
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Enum as SQLEnum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.event import listens_for
+
+from backend.db import Base
+
+# Prefer JSONB on Postgres; graceful fallback elsewhere
+try:
+    from sqlalchemy.dialects.postgresql import JSONB
+    JSON_TYPE = JSONB  # type: ignore
+except Exception:  # pragma: no cover
+    from sqlalchemy import JSON as JSON_TYPE  # type: ignore
+
+_DEC2 = Numeric(18, 2)
+
+
+class WithdrawStatus(str, enum.Enum):
+    pending      = "pending"
+    under_review = "under_review"
+    approved     = "approved"
+    rejected     = "rejected"
+    paid         = "paid"
+    failed       = "failed"
+    canceled     = "canceled"
+
+
+class PayoutMethod(str, enum.Enum):
+    mpesa    = "mpesa"
+    tigopesa = "tigopesa"
+    airtel   = "airtel"
+    paypal   = "paypal"
+    bank     = "bank"
+    crypto   = "crypto"
+    other    = "other"
+
+
+class WithdrawRequest(Base):
+    """
+    Ombi la kutoa fedha la mtumiaji (withdrawal).
+
+    • Decimal-safe money (amount/fee/net) + currency
+    • Lifecycle: pending → under_review → approved → paid | rejected/failed/canceled
+    • Method/destination (mpesa/bank/paypal/…)
+    • Idempotency + provider/external_ref uniqueness
+    • Day bucket + hot-path indexes
+    • Timestamps & audit fields
+    """
+__abstract__ = True  # disabled duplicate mapper for withdraw_requests
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_withdraw_idempotency"),
+        UniqueConstraint("provider", "external_ref", name="uq_withdraw_provider_ref"),
+        Index("ix_withdraw_user_status_time", "user_id", "status", "requested_at"),
+        Index("ix_withdraw_status_time", "status", "requested_at"),
+        Index("ix_withdraw_day", "day_bucket"),
+        CheckConstraint("amount > 0", name="ck_withdraw_amount_positive"),
+        CheckConstraint("fee_amount IS NULL OR fee_amount >= 0", name="ck_withdraw_fee_nonneg"),
+        CheckConstraint("net_amount IS NULL OR net_amount >= 0", name="ck_withdraw_net_nonneg"),
+        CheckConstraint("char_length(currency) BETWEEN 2 AND 8", name="ck_withdraw_currency_len"),
+        CheckConstraint("attempts >= 0", name="ck_withdraw_attempts_nonneg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+
+    # ——— Who ———
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user: Mapped["User"] = relationship(
+        "User", back_populates="withdraw_requests", foreign_keys=[user_id], lazy="selectin"
+    )
+
+    # ——— Money ———
+    amount: Mapped[Decimal] = mapped_column(_DEC2, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), default="TZS", nullable=False, index=True)
+    fee_amount: Mapped[Optional[Decimal]] = mapped_column(_DEC2)
+    net_amount: Mapped[Optional[Decimal]] = mapped_column(_DEC2)
+
+    # ——— Method & destination ———
+    method: Mapped[PayoutMethod] = mapped_column(
+        SQLEnum(PayoutMethod, name="withdraw_method"),
+        default=PayoutMethod.mpesa,
+        nullable=False,
+        index=True,
+    )
+    destination: Mapped[Optional[str]] = mapped_column(String(120))        # phone/account/wallet
+    destination_label: Mapped[Optional[str]] = mapped_column(String(80))   # e.g. "Main M-Pesa"
+    instructions: Mapped[Optional[str]] = mapped_column(Text)              # optional human notes
+
+    # ——— PSP / dedupe ———
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), unique=True, index=True)
+    provider: Mapped[Optional[str]] = mapped_column(String(24), index=True)   # mpesa/stripe/etc.
+    external_ref: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    payout_batch_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+    # ——— Status & moderation ———
+    status: Mapped[WithdrawStatus] = mapped_column(
+        SQLEnum(WithdrawStatus, name="withdraw_status"),
+        default=WithdrawStatus.pending,
+        nullable=False,
+        index=True,
+    )
+    reason: Mapped[Optional[str]] = mapped_column(String(160))  # rejection/failure/cancel reason
+    is_paid: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    is_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # avoid double-processing
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # ——— Analytics ———
+    day_bucket: Mapped[dt.date] = mapped_column(Date, server_default=func.current_date(), nullable=False, index=True)
+    platform: Mapped[Optional[str]] = mapped_column(String(24), index=True)  # web/android/ios
+    country: Mapped[Optional[str]] = mapped_column(String(2), index=True)   # ISO-3166 alpha-2
+    meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_TYPE)
+
+    # ——— Audit & timestamps ———
+    requested_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    reviewed_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    canceled_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+    reviewed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    approved_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    processed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+
+    reviewer: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reviewed_by], lazy="selectin")
+    approver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[approved_by], lazy="selectin")
+    processor: Mapped[Optional["User"]] = relationship("User", foreign_keys=[processed_by], lazy="selectin")
+
+    # ------------------------ Helpers (no DB I/O) ------------------------ #
+    @staticmethod
+    def _q2(val: Decimal | float | int | None) -> Optional[Decimal]:
+        if val is None:
+            return None
+        return Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def set_fee_amount(self, fee: Decimal | float | int | None) -> None:
+        qfee = self._q2(fee)
+        self.fee_amount = qfee
+        self.net_amount = None if qfee is None else (self.amount - qfee)
+        if self.net_amount is not None and self.net_amount < Decimal("0.00"):
+            raise ValueError("Fee cannot exceed amount")
+
+    def set_fee_percent(self, pct: float | Decimal) -> None:
+        p = Decimal(str(pct))
+        if p < 0 or p > 100:
+            raise ValueError("Fee percent must be between 0 and 100")
+        self.set_fee_amount(self.amount * p / Decimal("100"))
+
+    # ——— State machine ———
+    def lock(self) -> None: self.is_locked = True
+    def unlock(self) -> None: self.is_locked = False
+
+    def mark_under_review(self, reviewer_id: int | None = None) -> None:
+        self.status = WithdrawStatus.under_review
+        self.reviewed_at = dt.datetime.now(dt.timezone.utc)
+        if reviewer_id:
+            self.reviewed_by = reviewer_id
+
+    def approve(self, approver_id: int | None = None) -> None:
+        self.status = WithdrawStatus.approved
+        self.approved_at = dt.datetime.now(dt.timezone.utc)
+        if approver_id:
+            self.approved_by = approver_id
+
+    def reject(self, reviewer_id: int | None = None, reason: str | None = None) -> None:
+        self.status = WithdrawStatus.rejected
+        self.reviewed_at = dt.datetime.now(dt.timezone.utc)
+        if reviewer_id:
+            self.reviewed_by = reviewer_id
+        if reason:
+            self.reason = reason
+
+    def mark_paid(self, processor_id: int | None = None) -> None:
+        if self.status not in (WithdrawStatus.approved, WithdrawStatus.under_review):
+            raise ValueError("Cannot mark as paid unless approved/under_review.")
+        self.status = WithdrawStatus.paid
+        self.is_paid = True
+        self.paid_at = dt.datetime.now(dt.timezone.utc)
+        if processor_id:
+            self.processed_by = processor_id
+        self.unlock()
+
+    def fail(self, reason: str | None = None) -> None:
+        self.status = WithdrawStatus.failed
+        self.failed_at = dt.datetime.now(dt.timezone.utc)
+        if reason:
+            self.reason = reason
+        self.unlock()
+
+    def cancel(self, reason: str | None = None) -> None:
+        if self.status in (WithdrawStatus.paid, WithdrawStatus.failed):
+            raise ValueError("Cannot cancel a terminal withdrawal.")
+        self.status = WithdrawStatus.canceled
+        self.canceled_at = dt.datetime.now(dt.timezone.utc)
+        if reason:
+            self.reason = reason
+        self.unlock()
+
+    def bump_attempt(self) -> None:
+        self.attempts += 1
+
+    def set_destination(self, value: str, label: str | None = None) -> None:
+        self.destination = (value or "").strip()[:120]
+        if label:
+            self.destination_label = label.strip()[:80]
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            WithdrawStatus.paid,
+            WithdrawStatus.rejected,
+            WithdrawStatus.failed,
+            WithdrawStatus.canceled,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<WithdrawRequest id={self.id} user={self.user_id} {self.amount} {self.currency} status={self.status}>"
+
+# ——— Normalizers / listeners ———
+@listens_for(WithdrawRequest, "before_insert")
+def _withdraw_before_insert(mapper, connection, target: WithdrawRequest) -> None:
+    if target.currency:
+        target.currency = target.currency.strip().upper()[:8]
+    if target.fee_amount is not None and target.net_amount is None:
+        target.net_amount = target.amount - target.fee_amount
+    if target.requested_at and isinstance(target.requested_at, dt.datetime):
+        target.day_bucket = target.requested_at.date()
+
+@listens_for(WithdrawRequest, "before_update")
+def _withdraw_before_update(mapper, connection, target: WithdrawRequest) -> None:
+    if target.currency:
+        target.currency = target.currency.strip().upper()[:8]
+    if target.fee_amount is not None and target.net_amount is None:
+        target.net_amount = target.amount - target.fee_amount

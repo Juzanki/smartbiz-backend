@@ -1,0 +1,4 @@
+Ready to run migration:
+alembic revision --autogenerate -m "Add badge_level to users"
+alembic upgrade head
+

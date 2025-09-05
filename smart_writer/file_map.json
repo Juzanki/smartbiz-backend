@@ -1,0 +1,10 @@
+{
+  "login": "backend/routes/auth.py",
+  "register": "backend/routes/auth.py",
+  "payment": "backend/routes/payments.py",
+  "product": "backend/routes/products.py",
+  "live": "backend/routes/live.py",
+  "gift": "backend/routes/gifts.py",
+  "coin": "backend/models/coins.py",
+  "leaderboard": "backend/routes/gift_leaderboard.py"
+}

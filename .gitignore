@@ -1,0 +1,8 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+uploads/
+!uploads/.gitkeep
+write_env_production.ps1

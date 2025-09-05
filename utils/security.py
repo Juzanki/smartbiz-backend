@@ -1,0 +1,239 @@
+# backend/utils/security.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+"""
+Security helpers for SmartBiz.
+
+- Password hashing/verification (passlib[bcrypt])
+- JWT create/verify for access & refresh tokens (python-jose)
+- Strict defaults (issuer, audience, leeway)
+- Compatible whether your User model stores `password`, `password_hash`, or `hashed_password`.
+
+ENV / Settings expected (backend.config.settings):
+  SECRET_KEY (required in non-dev), ALGORITHM (default HS256),
+  ACCESS_TOKEN_EXPIRE_MINUTES (default 60),
+  REFRESH_TOKEN_EXPIRE_DAYS (default 14),
+  TOKEN_AUDIENCE (default "smartbiz-api"),
+  TOKEN_ISSUER (default "smartbiz"),
+  JWT_LEEWAY_SECONDS (default 10),
+  ENV ("development"/"production"/etc)
+"""
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+import secrets
+import warnings
+import uuid
+
+from jose import jwt, JWTError  # python-jose
+from passlib.context import CryptContext  # passlib[bcrypt]
+
+from backend.config import settings
+
+# -------------------------------------------------
+# Public exports from this module
+# -------------------------------------------------
+__all__ = [
+    "pwd_context",
+    "verify_password",
+    "get_password_hash",
+    "create_access_token",
+    "create_refresh_token",
+    "decode_token",
+    "is_access_token",
+    "is_refresh_token",
+    "token_expires_in_seconds",
+    "issue_session_tokens",
+    "create_reset_token",
+    "validate_reset_token",
+]
+
+# =========================
+# Password hashing
+# =========================
+# Internal context (private name)
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Public alias expected by the rest of the codebase
+pwd_context = _pwd_ctx
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Return True if password matches the hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Hash password using bcrypt (salted)."""
+    return pwd_context.hash(password)
+
+# =========================
+# SECRET / JWT config
+# =========================
+def _dev_secret() -> str:
+    key = secrets.token_urlsafe(64)
+    warnings.warn(
+        "[SECURITY] SECRET_KEY missing; using ephemeral DEV key. "
+        "Set SECRET_KEY in .env for stable tokens.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return key
+
+ENV = str(getattr(settings, "ENV", "development")).lower()
+
+if getattr(settings, "SECRET_KEY", None):
+    SECRET_KEY: str = settings.SECRET_KEY  # type: ignore[attr-defined]
+else:
+    if ENV in ("dev", "development", "local"):
+        SECRET_KEY = _dev_secret()
+    else:
+        raise RuntimeError("🔐 SECRET_KEY is required in non-development environments.")
+
+ALGORITHM: str = getattr(settings, "ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES: int = int(getattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+REFRESH_TOKEN_EXPIRE_DAYS: int = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 14))
+TOKEN_AUDIENCE: str = getattr(settings, "TOKEN_AUDIENCE", "smartbiz-api")
+ISSUER: str = getattr(settings, "TOKEN_ISSUER", "smartbiz")
+JWT_LEEWAY_SECONDS: int = int(getattr(settings, "JWT_LEEWAY_SECONDS", 10))
+
+# =========================
+# Time helpers
+# =========================
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _exp_in(minutes: float) -> datetime:
+    return _now_utc() + timedelta(minutes=minutes)
+
+def _exp_days(days: float) -> datetime:
+    return _now_utc() + timedelta(days=days)
+
+# =========================
+# JWT helpers
+# =========================
+def _base_claims(subject: str | int, token_type: str, audience: Optional[str]) -> Dict[str, Any]:
+    """Common claims for both access and refresh."""
+    return {
+        "sub": str(subject),
+        "aud": audience or TOKEN_AUDIENCE,
+        "iss": ISSUER,
+        "jti": uuid.uuid4().hex,
+        "type": token_type,             # "access" | "refresh"
+        "iat": int(_now_utc().timestamp()),
+    }
+
+def create_access_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None,
+    *,
+    subject: str | int | None = None,
+    audience: Optional[str] = None,
+) -> str:
+    """
+    Create a short-lived access token (default uses ACCESS_TOKEN_EXPIRE_MINUTES).
+    Either pass `subject=` or include `sub` inside `data`.
+    """
+    to_encode = dict(data or {})
+    sub = subject or to_encode.get("sub")
+    if not sub:
+        raise ValueError("subject (sub) is required for access token")
+
+    claims = _base_claims(sub, token_type="access", audience=audience)
+    expire = _now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update(claims)
+    to_encode["exp"] = expire
+
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token(
+    *,
+    subject: str | int,
+    audience: Optional[str] = None,
+    expires_days: Optional[int] = None,
+) -> str:
+    """Create a long-lived refresh token (default REFRESH_TOKEN_EXPIRE_DAYS)."""
+    claims = _base_claims(subject, token_type="refresh", audience=audience)
+    expire = _exp_days(float(expires_days or REFRESH_TOKEN_EXPIRE_DAYS))
+    payload = {**claims, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str, *, audience: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Decode & validate a JWT and return its claims.
+    Raises JWTError on invalid/expired token.
+    """
+    return jwt.decode(
+        token,
+        SECRET_KEY,
+        algorithms=[ALGORITHM],
+        audience=audience or TOKEN_AUDIENCE,
+        issuer=ISSUER,
+        options={"leeway": JWT_LEEWAY_SECONDS},
+    )
+
+def is_access_token(claims: Dict[str, Any]) -> bool:
+    return claims.get("type") == "access"
+
+def is_refresh_token(claims: Dict[str, Any]) -> bool:
+    return claims.get("type") == "refresh"
+
+def token_expires_in_seconds(claims: Dict[str, Any]) -> int:
+    """Return seconds until expiry (<=0 if expired or missing)."""
+    exp = claims.get("exp")
+    if not exp:
+        return 0
+    now = int(_now_utc().timestamp())  # python-jose uses seconds since epoch
+    return int(exp) - now
+
+def issue_session_tokens(
+    subject: str | int,
+    *,
+    audience: Optional[str] = None,
+    access_minutes: Optional[int] = None,
+    refresh_days: Optional[int] = None,
+) -> Tuple[str, str, int, int]:
+    """
+    Convenience: create both access & refresh tokens.
+    Returns (access_token, refresh_token, access_exp_seconds, refresh_exp_seconds).
+    """
+    access = create_access_token(
+        data={"sub": str(subject)},
+        expires_delta=timedelta(minutes=access_minutes or ACCESS_TOKEN_EXPIRE_MINUTES),
+        audience=audience,
+    )
+    refresh = create_refresh_token(
+        subject=str(subject),
+        audience=audience,
+        expires_days=refresh_days or REFRESH_TOKEN_EXPIRE_DAYS,
+    )
+
+    # decode once to compute TTLs (errors here mean config mismatch)
+    a_claims = decode_token(access, audience=audience)
+    r_claims = decode_token(refresh, audience=audience)
+
+    return (
+        access,
+        refresh,
+        token_expires_in_seconds(a_claims),
+        token_expires_in_seconds(r_claims),
+    )
+
+# =========================
+# Optional: reset-token helpers (simple)
+# =========================
+def create_reset_token(email: str, *, minutes: int = 30) -> str:
+    """
+    Create a short-lived password-reset token bound to email.
+    NOTE: Store a one-time nonce/jti if you want revocation.
+    """
+    return create_access_token(
+        data={"sub": email, "scope": "password_reset"},
+        expires_delta=timedelta(minutes=minutes),
+        audience=TOKEN_AUDIENCE,
+    )
+
+def validate_reset_token(token: str) -> str:
+    """Validate a reset token and return the email (sub) if valid."""
+    claims = decode_token(token, audience=TOKEN_AUDIENCE)
+    if claims.get("scope") != "password_reset":
+        raise JWTError("invalid_scope")
+    return str(claims["sub"])

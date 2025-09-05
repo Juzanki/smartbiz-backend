@@ -1,0 +1,258 @@
+﻿# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import enum
+import datetime as dt
+from decimal import Decimal
+from typing import Optional, TYPE_CHECKING, Dict, Any
+
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum as SQLEnum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.ext.hybrid import hybrid_property
+
+from backend.db import Base
+
+# -------- JSONB/NUMERIC fallback (PG -> JSONB/NUMERIC; others -> Text/Numeric)
+try:
+    from sqlalchemy.dialects.postgresql import JSONB, NUMERIC as PG_NUMERIC
+    JSON_TYPE = JSONB  # type: ignore
+except Exception:  # pragma: no cover
+    from sqlalchemy import Text as _Text, Numeric as _NUMERIC
+    JSON_TYPE = _Text  # type: ignore
+    PG_NUMERIC = _NUMERIC  # type: ignore
+
+if TYPE_CHECKING:
+    from .user import User
+    from .campaign import Campaign
+    from .order import Order
+    from .payment import Payment
+    from .product import Product
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+# --------------------- Enums ---------------------
+class ReferralStatus(str, enum.Enum):
+    pending    = "pending"
+    clicked    = "clicked"
+    signed_up  = "signed_up"
+    qualified  = "qualified"
+    approved   = "approved"
+    paid       = "paid"
+    rejected   = "rejected"
+    canceled   = "canceled"
+    expired    = "expired"
+
+
+class ReferralChannel(str, enum.Enum):
+    link   = "link"
+    code   = "code"
+    qr     = "qr"
+    social = "social"
+    email  = "email"
+    sms    = "sms"
+    other  = "other"
+
+
+class ReferralLog(Base):
+    """
+    Rekodi ya marejeleo (referrals) kati ya referrer → referred user,
+    ikihifadhi muktadha wa mauzo/kampeni na malipo ya commission.
+    """
+    __tablename__ = "referral_logs"
+    __mapper_args__ = {"eager_defaults": True}
+
+    # ---------- Columns ----------
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+
+    # Wahusika
+    referrer_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True
+    )
+    referred_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True
+    )
+
+    # Relationship definitions — note the explicit foreign_keys to avoid ambiguity
+    referrer: Mapped["User"] = relationship(
+        "User",
+        foreign_keys=[referrer_id],
+        back_populates="referrals",
+        passive_deletes=True,
+        lazy="selectin",
+    )
+    referred_user: Mapped["User"] = relationship(
+        "User",
+        foreign_keys=[referred_user_id],
+        back_populates="referrals_received",
+        passive_deletes=True,
+        lazy="selectin",
+    )
+
+    # Kampeni / bidhaa / agizo (hiari)
+    campaign_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="SET NULL"), index=True
+    )
+    campaign: Mapped[Optional["Campaign"]] = relationship("Campaign", lazy="selectin")
+
+    product_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"), index=True
+    )
+    product: Mapped[Optional["Product"]] = relationship("Product", lazy="selectin")
+    product_name: Mapped[Optional[str]] = mapped_column(String(120))
+
+    order_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("orders.id", ondelete="SET NULL"), index=True
+    )
+    order: Mapped[Optional["Order"]] = relationship("Order", lazy="selectin")
+
+    # NOTE: keep String if payments.id is String; change to Integer if your payments.id is int
+    payment_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("payments.id", ondelete="SET NULL"), index=True
+    )
+    payment: Mapped[Optional["Payment"]] = relationship("Payment", lazy="selectin")
+
+    # Channel & UTM
+    channel: Mapped[ReferralChannel] = mapped_column(
+        SQLEnum(ReferralChannel, name="referral_channel"),
+        default=ReferralChannel.link,
+        nullable=False,
+        index=True,
+    )
+    referral_code: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    utm_source:   Mapped[Optional[str]] = mapped_column(String(80))
+    utm_medium:   Mapped[Optional[str]] = mapped_column(String(80))
+    utm_campaign: Mapped[Optional[str]] = mapped_column(String(80))
+    utm_content:  Mapped[Optional[str]] = mapped_column(String(80))
+    landing_url:  Mapped[Optional[str]] = mapped_column(String(512))
+    ip_address:   Mapped[Optional[str]] = mapped_column(String(64))
+    user_agent:   Mapped[Optional[str]] = mapped_column(String(400))
+    country:      Mapped[Optional[str]] = mapped_column(String(2), index=True)  # ISO-3166 alpha-2
+
+    # Takwimu za muamala/mauzo (snapshots)
+    currency: Mapped[Optional[str]] = mapped_column(String(3), index=True)      # ISO-4217
+    purchase_amount:    Mapped[Decimal] = mapped_column(PG_NUMERIC(18, 2), nullable=False, server_default=text("0"))
+    commission_rate:    Mapped[Decimal] = mapped_column(PG_NUMERIC(5, 4),  nullable=False, server_default=text("0.0000"))
+    commission_amount:  Mapped[Decimal] = mapped_column(PG_NUMERIC(18, 2), nullable=False, server_default=text("0"))
+
+    # Hali
+    status: Mapped[ReferralStatus] = mapped_column(
+        SQLEnum(ReferralStatus, name="referral_status"),
+        default=ReferralStatus.pending,
+        nullable=False,
+        index=True,
+    )
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    suspected_fraud: Mapped[bool] = mapped_column(default=False, nullable=False, index=True)
+
+    # Dedupe/refs
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), unique=True, index=True)
+    external_ref:    Mapped[Optional[str]] = mapped_column(String(160), index=True)
+
+    # Ziada
+    meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_TYPE)
+
+    # Nyakati
+    created_at:   Mapped[dt.datetime]        = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False, index=True)
+    clicked_at:   Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    signed_up_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    qualified_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    approved_at:  Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    paid_at:      Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    rejected_at:  Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    canceled_at:  Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    expired_at:   Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+    # ---------- Hybrids ----------
+    @hybrid_property
+    def is_payable(self) -> bool:
+        return self.status == ReferralStatus.approved and self.paid_at is None
+
+    # ---------- Helpers ----------
+    def mark_clicked(self) -> None:
+        self.status = ReferralStatus.clicked
+        self.clicked_at = _utcnow()
+
+    def mark_signed_up(self) -> None:
+        self.status = ReferralStatus.signed_up
+        self.signed_up_at = _utcnow()
+
+    def qualify(self, *, purchase_amount: Decimal | int | float | str | None = None) -> None:
+        self.status = ReferralStatus.qualified
+        self.qualified_at = _utcnow()
+        if purchase_amount is not None:
+            amt = purchase_amount if isinstance(purchase_amount, Decimal) else Decimal(str(purchase_amount))
+            self.purchase_amount = max(Decimal("0"), amt)
+
+    def approve(self, *, rate: Decimal | int | float | str | None = None) -> None:
+        self.status = ReferralStatus.approved
+        self.approved_at = _utcnow()
+        if rate is not None:
+            r = rate if isinstance(rate, Decimal) else Decimal(str(rate))
+            self.commission_rate = max(Decimal("0"), r)
+
+    def mark_paid(self, *, commission: Decimal | int | float | str | None = None) -> None:
+        self.status = ReferralStatus.paid
+        self.paid_at = _utcnow()
+        if commission is not None:
+            c = commission if isinstance(commission, Decimal) else Decimal(str(commission))
+            self.commission_amount = max(Decimal("0"), c)
+
+    def reject(self, *, reason: str | None = None, suspected_fraud: bool = False) -> None:
+        self.status = ReferralStatus.rejected
+        self.rejected_at = _utcnow()
+        self.suspected_fraud = bool(suspected_fraud)
+        if reason:
+            self.reason = reason
+
+    def cancel(self, *, reason: str | None = None) -> None:
+        self.status = ReferralStatus.canceled
+        self.canceled_at = _utcnow()
+        if reason:
+            self.reason = reason
+
+    def expire(self) -> None:
+        self.status = ReferralStatus.expired
+        self.expired_at = _utcnow()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"<ReferralLog id={self.id} referrer={self.referrer_id} "
+            f"referred={self.referred_user_id} status={self.status} "
+            f"commission={self.commission_amount} {self.currency}>"
+        )
+
+    # ---------- Table-level constraints & indexes ----------
+    __table_args__ = (
+        # Guards
+        CheckConstraint("referrer_id <> referred_user_id", name="ck_referral_no_self"),
+        CheckConstraint("purchase_amount >= 0 AND commission_amount >= 0", name="ck_ref_purchase_comm_nonneg"),
+        CheckConstraint("commission_rate >= 0", name="ck_ref_commission_rate_nonneg"),
+        CheckConstraint("currency IS NULL OR char_length(currency) = 3", name="ck_ref_currency_iso3"),
+
+        # Dedupe
+        UniqueConstraint("idempotency_key", name="uq_referral_idem"),
+        UniqueConstraint("campaign_id", "referrer_id", "referred_user_id", name="uq_referral_campaign_triplet"),
+
+        # Helpful indexes
+        Index("ix_referral_referrer_created", "referrer_id", "created_at"),
+        Index("ix_referral_referred_created", "referred_user_id", "created_at"),
+        Index("ix_referral_status_time", "status", "created_at"),
+        Index("ix_referral_campaign", "campaign_id"),
+        Index("ix_referral_order_payment", "order_id", "payment_id"),
+    )

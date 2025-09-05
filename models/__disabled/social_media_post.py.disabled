@@ -1,0 +1,311 @@
+﻿# backend/models/social_post.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import re
+import datetime as dt
+from typing import Optional, Dict, Any, List
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from backend.db import Base
+
+
+_ALLOWED_STATUS = ("draft", "scheduled", "queued", "publishing", "published", "failed", "deleted", "archived")
+_ALLOWED_VISIBILITY = ("public", "followers", "private")
+_ALLOWED_PLATFORM = (
+    "x", "twitter", "instagram", "tiktok", "facebook", "youtube", "threads",
+    "linkedin", "telegram", "whatsapp", "pinterest", "reddit", "other"
+)
+
+
+class SocialMediaPost(Base):
+    """
+    SocialMediaPost — multi-platform, mobile-first social publishing model.
+
+    Highlights:
+    - Rich lifecycle (draft -> scheduled -> queued -> publishing -> published/failed)
+    - Per-post scheduling, retries, idempotency, provider refs
+    - Visibility, language, attachments, link preview, UTM/campaign
+    - Basic engagement metrics with fast indexes
+    - Threading (reply-to / parent) and soft-delete
+    """
+    __tablename__ = "social_posts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_social_post_idemp_per_user"),
+        Index("ix_social_posts_user_platform_status", "user_id", "platform", "status", "created_at"),
+        Index("ix_social_posts_scheduled", "status", "scheduled_for"),
+        Index("ix_social_posts_published", "platform", "published_at"),
+        Index("ix_social_posts_retry_queue", "status", "next_retry_at"),
+        Index("ix_social_posts_day", "day_bucket"),
+        CheckConstraint("char_length(platform) > 0", name="ck_social_post_platform_nonempty"),
+        CheckConstraint("char_length(content) > 0", name="ck_social_post_content_nonempty"),
+        CheckConstraint("status in ('draft','scheduled','queued','publishing','published','failed','deleted','archived')",
+                        name="ck_social_post_status_enum"),
+        CheckConstraint("visibility in ('public','followers','private')",
+                        name="ck_social_post_visibility_enum"),
+    )
+
+    # Identity
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Platform + content
+    platform: Mapped[str] = mapped_column(String(50), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[Optional[str]] = mapped_column(String(12), default="en")
+    visibility: Mapped[str] = mapped_column(String(16), default="public", nullable=False, index=True)
+
+    # Media & attachments
+    media_url: Mapped[Optional[str]] = mapped_column(String(255), default=None)
+    attachments: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, default=None)  # [{"url":..., "type":"image|video|audio|doc", ...}]
+
+    # Link preview (optional)
+    link_url: Mapped[Optional[str]] = mapped_column(String(512), default=None)
+    link_title: Mapped[Optional[str]] = mapped_column(String(160), default=None)
+    link_description: Mapped[Optional[str]] = mapped_column(String(300), default=None)
+    link_image: Mapped[Optional[str]] = mapped_column(String(512), default=None)
+    short_url: Mapped[Optional[str]] = mapped_column(String(160), default=None)
+
+    # Entities & tagging
+    hashtags: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
+    mentions: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
+    tags: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
+    campaign_id: Mapped[Optional[str]] = mapped_column(String(64), default=None)
+    utm_params: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, default=None)
+
+    # Threading
+    parent_post_id: Mapped[Optional[int]] = mapped_column(ForeignKey("social_posts.id", ondelete="SET NULL"), default=None, index=True)
+
+    # Lifecycle + scheduler
+    status: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
+    scheduled_for: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), default=None)
+    queued_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), default=None)
+    published_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), default=None)
+    deleted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), default=None)
+
+    # Retries
+    retries: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    backoff_seconds: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    next_retry_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), default=None)
+
+    # Provider / API integration
+    external_post_id: Mapped[Optional[str]] = mapped_column(String(128), default=None, index=True)
+    provider: Mapped[Optional[str]] = mapped_column(String(24), default=None)  # "meta","x","tiktok","telegram", etc.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), default=None, index=True)
+    fail_reason: Mapped[Optional[str]] = mapped_column(String(255), default=None)
+
+    # Engagement (lightweight counters for mobile UI)
+    likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    comments: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    shares: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Soft-delete flag (keeps row for audit even if removed upstream)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Analytics bucket
+    day_bucket: Mapped[dt.date] = mapped_column(Date, server_default=func.current_date(), nullable=False, index=True)
+
+    # Timestamps
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    # Relationships
+# AMBIGFIX:     user: Mapped["User"] = relationship("User", back_populates="posts", lazy="selectin")
+    parent: Mapped[Optional["SocialMediaPost"]] = relationship("SocialMediaPost", remote_side=[id], lazy="selectin")
+    replies: Mapped[List["SocialMediaPost"]] = relationship("SocialMediaPost", lazy="selectin")
+
+    # -------------------------------- Helpers --------------------------------
+
+    HASHTAG_RE = re.compile(r"#(\w{1,50})", re.UNICODE)
+    MENTION_RE = re.compile(r"@([A-Za-z0-9_\.]{1,50})")
+
+    def extract_entities(self) -> None:
+        """Populate hashtags & mentions from content (lowercased, deduped)."""
+        hs = {h.lower() for h in self.HASHTAG_RE.findall(self.content or "")}
+        ms = {m.strip() for m in self.MENTION_RE.findall(self.content or "")}
+        self.hashtags = sorted(hs)
+        self.mentions = sorted(ms)
+
+    def add_attachment(self, url: str, kind: str, **kv: Any) -> None:
+        files = list(self.attachments or [])
+        files.append({"url": url, "type": kind, **kv})
+        self.attachments = files
+
+    def add_tags(self, *items: str) -> None:
+        s = set(self.tags or [])
+        for t in items:
+            t = (t or "").strip().lower()
+            if t:
+                s.add(t)
+        self.tags = sorted(s)
+
+    def set_visibility(self, visibility: str) -> None:
+        v = (visibility or "public").lower()
+        if v not in _ALLOWED_VISIBILITY:
+            raise ValueError("Invalid visibility")
+        self.visibility = v
+
+    def set_platform(self, platform: str) -> None:
+        p = (platform or "other").lower()
+        if p not in _ALLOWED_PLATFORM:
+            p = "other"
+        self.platform = p
+
+    def schedule(self, when: dt.datetime) -> None:
+        """Schedule a post for future publishing."""
+        self.status = "scheduled"
+        self.scheduled_for = when
+
+    def queue(self) -> None:
+        """Move scheduled draft into queue for worker pickup."""
+        if self.status not in {"draft", "scheduled", "failed"}:
+            raise ValueError("Only draft/scheduled/failed posts can be queued")
+        self.status = "queued"
+        self.queued_at = dt.datetime.now(dt.timezone.utc)
+        self.fail_reason = None
+
+    def mark_publishing(self) -> None:
+        self.status = "publishing"
+
+    def mark_published(self, external_id: Optional[str] = None, short_url: Optional[str] = None) -> None:
+        self.status = "published"
+        self.published_at = dt.datetime.now(dt.timezone.utc)
+        if external_id:
+            self.external_post_id = external_id[:128]
+        if short_url:
+            self.short_url = short_url[:160]
+        self.fail_reason = None
+        self.retries = 0
+        self.next_retry_at = None
+
+    def mark_failed(self, reason: str, *, schedule_retry: bool = True) -> None:
+        self.status = "failed"
+        self.fail_reason = (reason or "")[:255]
+        if schedule_retry and self.retries < self.max_retries:
+            self.retries += 1
+            factor = 2 ** max(self.retries - 1, 0)
+            delay = (self.backoff_seconds or 0) * factor
+            self.next_retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)
+        else:
+            self.next_retry_at = None
+
+    def soft_delete(self) -> None:
+        self.is_deleted = True
+        self.status = "deleted"
+        self.deleted_at = dt.datetime.now(dt.timezone.utc)
+
+    def set_link_preview(self, *, url: str, title: Optional[str] = None, description: Optional[str] = None, image: Optional[str] = None) -> None:
+        self.link_url = url[:512]
+        self.link_title = (title or None)[:160] if title else None
+        self.link_description = (description or None)[:300] if description else None
+        self.link_image = (image or None)[:512] if image else None
+
+    def set_campaign(self, campaign_id: Optional[str], utm: Optional[Dict[str, Any]] = None) -> None:
+        self.campaign_id = campaign_id[:64] if campaign_id else None
+        if utm is not None:
+            self.utm_params = utm
+
+    def bump_metrics(self, *, likes: int = 0, comments: int = 0, shares: int = 0, views: int = 0, clicks: int = 0) -> None:
+        self.likes += max(0, int(likes))
+        self.comments += max(0, int(comments))
+        self.shares += max(0, int(shares))
+        self.views += max(0, int(views))
+        self.clicks += max(0, int(clicks))
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        """Compact, mobile-ready projection."""
+        return {
+            "id": self.id,
+            "platform": self.platform,
+            "content": self.content,
+            "media_url": self.media_url,
+            "attachments": self.attachments or [],
+            "visibility": self.visibility,
+            "language": self.language,
+            "hashtags": self.hashtags,
+            "mentions": self.mentions,
+            "tags": self.tags,
+            "link": {
+                "url": self.link_url,
+                "title": self.link_title,
+                "description": self.link_description,
+                "image": self.link_image,
+                "short_url": self.short_url,
+            },
+            "status": self.status,
+            "scheduled_for": self.scheduled_for.isoformat() if self.scheduled_for else None,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "metrics": {
+                "likes": self.likes,
+                "comments": self.comments,
+                "shares": self.shares,
+                "views": self.views,
+                "clicks": self.clicks,
+            },
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<SocialMediaPost id={self.id} user={self.user_id} platform={self.platform} status={self.status}>"
+
+
+# -------------------- Optional: Daily rollup for fast dashboards --------------------
+
+class SocialPostDaily(Base):
+    """
+    SocialPostDaily — per-user/day rollup for quick mobile analytics.
+    Maintain via a cron/job aggregating SocialMediaPost by (user_id, day_bucket).
+    """
+    __tablename__ = "social_post_daily"
+    __table_args__ = (
+        UniqueConstraint("user_id", "day_bucket", name="uq_social_post_daily_user_day"),
+        Index("ix_social_post_daily_hot", "day_bucket", "published_count"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    day_bucket: Mapped[dt.date] = mapped_column(Date, nullable=False, index=True)
+
+    drafted_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scheduled_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    published_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    comments: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    shares: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+# AMBIGFIX:     user: Mapped["User"] = relationship("User", lazy="selectin")
+
+    def bump(self, *, published: int = 0, likes: int = 0, comments: int = 0, shares: int = 0, views: int = 0, clicks: int = 0) -> None:
+        self.published_count += max(0, int(published))
+        self.likes += max(0, int(likes))
+        self.comments += max(0, int(comments))
+        self.shares += max(0, int(shares))
+        self.views += max(0, int(views))
+        self.clicks += max(0, int(clicks))
+
