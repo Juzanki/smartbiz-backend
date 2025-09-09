@@ -26,22 +26,17 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Load env files early
+# 1) Load envs ( .env → .env.local → .env.{environment} )
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_env() -> None:
     with suppress(Exception):
         from dotenv import load_dotenv
         root = Path(__file__).resolve().parents[1]
-        # Order: .env → .env.local → env by ENVIRONMENT
         load_dotenv(root / ".env", override=False)
         load_dotenv(root / ".env.local", override=False)
         env = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development").strip().lower()
-        fname = ".env.production" if env == "production" else ".env.development"
-        load_dotenv(root / fname, override=False)
-
-
+        load_dotenv(root / (".env.production" if env == "production" else ".env.development"), override=False)
 _load_env()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,25 +46,20 @@ def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-
 def env_list(key: str) -> list[str]:
     raw = os.getenv(key, "")
     return [x.strip() for x in raw.split(",") if x and x.strip()]
-
 
 def _uniq(items: Iterable[Optional[str]]) -> list[str]:
     out, seen = [], set()
     for x in items:
         if x and x not in seen:
-            out.append(x)
-            seen.add(x)
+            out.append(x); seen.add(x)
     return out
-
 
 def _sanitize_db_url(url: str) -> str:
     try:
         from urllib.parse import urlparse
-
         p = urlparse(url)
         host = (p.hostname or "localhost").replace("localhost", "127.0.0.1")
         port = f":{p.port}" if p.port else ""
@@ -78,9 +68,8 @@ def _sanitize_db_url(url: str) -> str:
     except Exception:
         return "hidden://****@db"
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 3) Paths, environment, database URL
+# 3) Paths & DB URL
 # ──────────────────────────────────────────────────────────────────────────────
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
@@ -89,22 +78,21 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development").lower()
 DATABASE_URL = (
-    os.getenv("DATABASE_URL") or os.getenv("RAILWAY_DATABASE_URL") or os.getenv("LOCAL_DATABASE_URL")
+    os.getenv("DATABASE_URL")
+    or os.getenv("RAILWAY_DATABASE_URL")
+    or os.getenv("LOCAL_DATABASE_URL")
 )
 if not DATABASE_URL:
     if ENVIRONMENT in {"dev", "development", "local"}:
         DATABASE_URL = "sqlite:///./smartbiz_dev.db"
     else:
-        raise RuntimeError(
-            "DATABASE_URL missing. Set DATABASE_URL/RAILWAY_DATABASE_URL/LOCAL_DATABASE_URL."
-        )
+        raise RuntimeError("DATABASE_URL missing. Set DATABASE_URL/RAILWAY_DATABASE_URL/LOCAL_DATABASE_URL.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4) Logging
+# 4) Logging (plain/JSON)
 # ──────────────────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = env_bool("LOG_JSON", False)
-
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -118,23 +106,20 @@ class _JsonFormatter(logging.Formatter):
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
-
 _handler = logging.StreamHandler()
-_handler.setFormatter(
-    _JsonFormatter()
-    if LOG_JSON
-    else logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
-)
+_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
 root_logger = logging.getLogger()
 root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5) DB engine/session – detect password column BEFORE importing models
+# 5) DB engine/session – “dual import” to be safe with layouts
 # ──────────────────────────────────────────────────────────────────────────────
-from db import Base, SessionLocal, engine  # now local package, not backend.db
-
+try:
+    from db import Base, SessionLocal, engine      # style: from db import …
+except Exception:  # pragma: no cover
+    from backend.db import Base, SessionLocal, engine  # fallback: from backend.db import …
 
 def _detect_pw_column_and_set_env() -> str:
     chosen = os.getenv("SMARTBIZ_PWHASH_COL", "").strip()
@@ -157,43 +142,55 @@ def _detect_pw_column_and_set_env() -> str:
         os.environ["SMARTBIZ_PWHASH_COL"] = chosen
         logger.warning("PW column detection failed, defaulting to %s (%s)", chosen, e)
     return chosen
-
-
 _detect_pw_column_and_set_env()
-import models  # noqa  (loads your models package)
 
-# Optional feature toggles (loaded lazily)
+# models
+with suppress(Exception):
+    import models
+with suppress(Exception):
+    import backend.models  # fallback
+
+# optional features
 _HAS_LANG = False
 with suppress(Exception):
     from middleware.language import language_middleware  # type: ignore
-
+    _HAS_LANG = True
+with suppress(Exception):
+    from backend.middleware.language import language_middleware  # type: ignore
     _HAS_LANG = True
 
 _HAS_BG = False
 with suppress(Exception):
     from background import start_background_tasks  # type: ignore
-
+    _HAS_BG = True
+with suppress(Exception):
+    from backend.background import start_background_tasks  # type: ignore
     _HAS_BG = True
 
 _HAS_SCHED = False
 with suppress(Exception):
     from tasks.scheduler import start_schedulers  # type: ignore
-
+    _HAS_SCHED = True
+with suppress(Exception):
+    from backend.tasks.scheduler import start_schedulers  # type: ignore
     _HAS_SCHED = True
 
 _HAS_WS = False
 with suppress(Exception):
     from websocket import ws_routes  # type: ignore
-
+    _HAS_WS = True
+with suppress(Exception):
+    from backend.websocket import ws_routes  # type: ignore
     _HAS_WS = True
 
-from routes.auth_routes import (  # type: ignore
-    router as auth_router,
-    legacy_router as auth_legacy_router,
-)
+# auth routers (both styles)
+try:
+    from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router  # type: ignore
+except Exception:  # pragma: no cover
+    from backend.routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6) Middlewares: Security headers + Request ID (guarding ClientDisconnect)
+# 6) Middlewares: Security headers + Request-ID
 # ──────────────────────────────────────────────────────────────────────────────
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -201,25 +198,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response: Response = await call_next(request)
             if response is None:
                 return JSONResponse(status_code=500, content={"detail": "No response returned"})
-        except ClientDisconnect:
-            return Response(status_code=499)
-        except anyio.EndOfStream:
+        except (ClientDisconnect, anyio.EndOfStream):
             return Response(status_code=499)
         except Exception as e:
             logger.exception("Security middleware error: %s", e)
-            return JSONResponse(
-                status_code=500, content={"detail": "Internal server error (security middleware)"}
-            )
-        # conservative defaults
+            return JSONResponse(status_code=500, content={"detail": "Internal server error"})
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer-when-downgrade")
         response.headers.setdefault("X-XSS-Protection", "1; mode=block")
-        response.headers.setdefault(
-            "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
-        )
+        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         return response
-
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -229,16 +218,13 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
             response: Response = await call_next(request)
             if response is None:
                 return JSONResponse(status_code=500, content={"detail": "No response returned"})
-        except ClientDisconnect:
-            response = Response(status_code=499)
-        except anyio.EndOfStream:
+        except (ClientDisconnect, anyio.EndOfStream):
             response = Response(status_code=499)
         except Exception as e:
             logger.exception("RequestID middleware error: %s", e)
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
         response.headers["x-request-id"] = rid
         return response
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) DB health helper
@@ -251,19 +237,16 @@ def _db_ping_fallback() -> bool:
     except Exception:
         return False
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 8) Lifespan
+# 8) Lifespan (start/stop background services safely)
 # ──────────────────────────────────────────────────────────────────────────────
 def _spawn_service(fn):
     result = fn()
     return asyncio.create_task(result) if _pyinspect.isawaitable(result) else None
 
-
 async def _maybe_await(fn):
     res = fn()
     return await res if _pyinspect.isawaitable(res) else res
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -296,10 +279,7 @@ async def lifespan(app: FastAPI):
         for t in getattr(app.state, "bg_tasks", []):
             if t and not t.done():
                 t.cancel()
-        await asyncio.gather(
-            *[t for t in getattr(app.state, "bg_tasks", []) if t], return_exceptions=True
-        )
-
+        await asyncio.gather(*[t for t in getattr(app.state, "bg_tasks", []) if t], return_exceptions=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 9) FastAPI app
@@ -316,40 +296,28 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10) CORS (modes: strict | dev-safe | allow-any)
+# 10) CORS (strict | dev-safe | allow-any)
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_cors_origins() -> list[str]:
+    # defaults: Netlify + domain yako
+    defaults = [
+        "https://smartbizsite.netlify.app",
+        "https://smartbiz.site",
+        "https://www.smartbiz.site",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:4173", "http://127.0.0.1:4173",
+    ]
     env_origins = env_list("CORS_ORIGINS")
-    dev = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
-    env_urls = [
-        os.getenv(k)
-        for k in (
-            "FRONTEND_URL",
-            "WEB_URL",
-            "VITE_WEB_URL",
-            "VITE_APP_URL",
-            "RAILWAY_PUBLIC_URL",
-            "RENDER_EXTERNAL_URL",
-            "NETLIFY_PUBLIC_URL",
-        )
-    ]
-    return _uniq([*dev, *env_origins, *env_urls])
+    env_urls = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "VITE_WEB_URL", "VITE_APP_URL",
+                                       "RENDER_EXTERNAL_URL", "NETLIFY_PUBLIC_URL")]
+    return _uniq([*env_origins, *env_urls, *defaults])
 
-
-CORS_MODE = os.getenv("CORS_MODE", "dev-safe").strip().lower()  # strict | dev-safe | allow-any
+CORS_MODE = os.getenv("CORS_MODE", "strict").strip().lower()  # strict | dev-safe | allow-any
 ALLOW_ORIGINS = _resolve_cors_origins()
 DEFAULT_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https?://([a-z0-9-]+\.)*(ngrok-free\.app|trycloudflare\.com)$"
-ALLOW_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX)
+ALLOW_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX if CORS_MODE != "strict" else "")
 
 if CORS_MODE == "allow-any":
-    # ⚠︎ DEV TU!
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[],
@@ -364,7 +332,7 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOW_ORIGINS,
-        allow_origin_regex=ALLOW_ORIGIN_REGEX if CORS_MODE != "strict" else None,
+        allow_origin_regex=(ALLOW_ORIGIN_REGEX or None),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -372,16 +340,14 @@ else:
         max_age=86400,
     )
 
-
+# Safety net kwa baadhi ya proxies
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
 
-
 # Proxy headers / Trusted hosts
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # type: ignore
-
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 trusted = env_list("TRUSTED_HOSTS")
@@ -392,17 +358,14 @@ if trusted:
 app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
-if "_HAS_LANG" in globals() and _HAS_LANG:
+if '_HAS_LANG' in globals() and _HAS_LANG:
     with suppress(Exception):
         app.add_middleware(language_middleware)  # type: ignore
-
 
 # Static uploads
 class _Uploads(StaticFiles):
     def is_not_modified(self, scope, request_headers, stat_result, etag=None):
         return super().is_not_modified(scope, request_headers, stat_result, etag)
-
-
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -411,14 +374,12 @@ app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT in {"dev", "development", "local"}):
     Base.metadata.create_all(bind=engine, checkfirst=True)
 
-
 def get_db() -> Session:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 12) Exception handlers
@@ -427,17 +388,14 @@ def get_db() -> Session:
 async def client_disconnect_handler(_: Request, __: ClientDisconnect):
     return Response(status_code=499)
 
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException):
     payload = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=payload)
-
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Request, exc: Exception):
@@ -446,13 +404,10 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("Unhandled error: %s", exc)
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 13) Routers
+# 13) Routers (na fallbacks)
 # ──────────────────────────────────────────────────────────────────────────────
-def _safe_include(
-    module_path: str, *, attr: str = "router", prefix: str | None = None, tags: list[str] | None = None
-):
+def _safe_include(module_path: str, *, attr: str = "router", prefix: str | None = None, tags: list[str] | None = None):
     try:
         mod = importlib.import_module(module_path)
         r = getattr(mod, attr, None)
@@ -464,12 +419,11 @@ def _safe_include(
     except Exception as e:
         logger.warning("Skipping router %s (%s)", module_path, e)
 
-
 # auth
 app.include_router(auth_router)
 app.include_router(auth_legacy_router)
 
-# other routes
+# other routes (both module styles)
 for mod, pref, tag in [
     ("routes.invoice", "/invoice", ["Invoice"]),
     ("routes.owner_routes", "/owner", ["Owner"]),
@@ -477,25 +431,27 @@ for mod, pref, tag in [
     ("routes.ai_responder", "/ai", ["AI"]),
 ]:
     _safe_include(mod, prefix=pref, tags=tag)
+for mod, pref, tag in [
+    ("backend.routes.invoice", "/invoice", ["Invoice"]),
+    ("backend.routes.owner_routes", "/owner", ["Owner"]),
+    ("backend.routes.order_notification", "/order-notify", ["Order Notifications"]),
+    ("backend.routes.ai_responder", "/ai", ["AI"]),
+]:
+    _safe_include(mod, prefix=pref, tags=tag)
 
 if _HAS_WS:
     _safe_include("websocket.ws_routes", prefix="", tags=["WebSocket"])
+    _safe_include("backend.websocket.ws_routes", prefix="", tags=["WebSocket"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 14) Health / Debug endpoints
+# 14) Health / Debug
 # ──────────────────────────────────────────────────────────────────────────────
 class WhatsAppMessage(BaseModel):
     message: str
 
-
 @app.post("/send-whatsapp/", tags=["WhatsApp"])
 async def send_whatsapp_message(payload: WhatsAppMessage):
-    return {
-        "status": "queued",
-        "to": os.getenv("RECIPIENT_PHONE", "N/A"),
-        "message": payload.message,
-    }
-
+    return {"status": "queued", "to": os.getenv("RECIPIENT_PHONE", "N/A"), "message": payload.message}
 
 @app.get("/", tags=["Root"])
 async def root():
@@ -507,21 +463,17 @@ async def root():
         "env": ENVIRONMENT,
     }
 
-
 @app.get("/healthz", tags=["Health"])
 async def healthz():
     return {"ok": True}
-
 
 @app.get("/readyz", tags=["Health"])
 async def readyz():
     return {"ready": bool(getattr(app.state, "services_started", False))}
 
-
 @app.get("/dbz", tags=["Health"])
 async def dbz():
     return {"db_ok": bool(_db_ping_fallback())}
-
 
 @app.get("/_cors", tags=["Debug"])
 async def cors_debug(request: Request):
@@ -533,9 +485,7 @@ async def cors_debug(request: Request):
         "SMARTBIZ_PWHASH_COL": os.getenv("SMARTBIZ_PWHASH_COL"),
     }
 
-
 if env_bool("DEBUG", False):
-
     @app.get("/_routes", tags=["Debug"])
     async def list_routes():
         return [
@@ -543,15 +493,13 @@ if env_bool("DEBUG", False):
             for r in app.routes
         ]
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 15) Entrypoint
+# 15) Entrypoint (local dev only)
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
-
     uvicorn.run(
-        "main:app",                      # <— important: no more "backend.main"
+        "main:app",   # tunakimbiza ukiwa ndani ya folder la backend
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=env_bool("RELOAD", ENVIRONMENT in {"dev", "development", "local"}),
