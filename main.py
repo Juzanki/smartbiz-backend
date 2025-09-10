@@ -27,7 +27,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Load envs ( .env → .env.local → .env.{environment} )
+# 1) Load envs (.env → .env.local → .env.{environment})
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_env() -> None:
     with suppress(Exception):
@@ -69,7 +69,7 @@ def _sanitize_db_url(url: str) -> str:
         return "hidden://****@db"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3) Paths & DB URL
+# 3) Paths & DB URL (Render + local)
 # ──────────────────────────────────────────────────────────────────────────────
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
@@ -77,19 +77,17 @@ UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", BACKEND_DIR / "uploads")).resolve()
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development").lower()
-DATABASE_URL = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("RAILWAY_DATABASE_URL")
-    or os.getenv("LOCAL_DATABASE_URL")
-)
+
+# Render hutumia DATABASE_URL; pia tunaruhusu LOCAL_DATABASE_URL kwa dev
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("LOCAL_DATABASE_URL")
 if not DATABASE_URL:
     if ENVIRONMENT in {"dev", "development", "local"}:
         DATABASE_URL = "sqlite:///./smartbiz_dev.db"
     else:
-        raise RuntimeError("DATABASE_URL missing. Set DATABASE_URL/RAILWAY_DATABASE_URL/LOCAL_DATABASE_URL.")
+        raise RuntimeError("DATABASE_URL missing. Set it in Render Environment.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4) Logging (plain/JSON)
+# 4) Logging (plain / JSON)
 # ──────────────────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = env_bool("LOG_JSON", False)
@@ -114,12 +112,12 @@ root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5) DB engine/session – “dual import” to be safe with layouts
+# 5) DB engine/session – layout-safe imports
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from db import Base, SessionLocal, engine      # style: from db import …
-except Exception:  # pragma: no cover
-    from backend.db import Base, SessionLocal, engine  # fallback: from backend.db import …
+    from db import Base, SessionLocal, engine
+except Exception:
+    from backend.db import Base, SessionLocal, engine  # fallback
 
 def _detect_pw_column_and_set_env() -> str:
     chosen = os.getenv("SMARTBIZ_PWHASH_COL", "").strip()
@@ -148,7 +146,7 @@ _detect_pw_column_and_set_env()
 with suppress(Exception):
     import models
 with suppress(Exception):
-    import backend.models  # fallback
+    import backend.models
 
 # optional features
 _HAS_LANG = False
@@ -186,7 +184,7 @@ with suppress(Exception):
 # auth routers (both styles)
 try:
     from routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     from backend.routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -296,14 +294,12 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10) CORS (strict | dev-safe | allow-any)
+# 10) CORS: Netlify (main + deploy previews) + env whitelist
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_cors_origins() -> list[str]:
-    # defaults: Netlify + domain yako
     defaults = [
-        "https://smartbizsite.netlify.app",
-        "https://smartbiz.site",
-        "https://www.smartbiz.site",
+        "https://smartbizsite.netlify.app",  # Netlify main
+        "https://smartbiz.site", "https://www.smartbiz.site",  # custom domain (kama ipo)
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
@@ -314,7 +310,12 @@ def _resolve_cors_origins() -> list[str]:
 
 CORS_MODE = os.getenv("CORS_MODE", "strict").strip().lower()  # strict | dev-safe | allow-any
 ALLOW_ORIGINS = _resolve_cors_origins()
-DEFAULT_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https?://([a-z0-9-]+\.)*(ngrok-free\.app|trycloudflare\.com)$"
+
+DEFAULT_REGEX = (
+    r"^https:\/\/([0-9a-z\-]+--)?smartbizsite\.netlify\.app$"   # Netlify previews + main
+    r"|^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"            # local dev
+    r"|^https?:\/\/([a-z0-9\-]+\.)*(ngrok-free\.app|trycloudflare\.com)$"  # tunnels
+)
 ALLOW_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX if CORS_MODE != "strict" else "")
 
 if CORS_MODE == "allow-any":
@@ -340,7 +341,7 @@ else:
         max_age=86400,
     )
 
-# Safety net kwa baadhi ya proxies
+# Preflight helper
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
@@ -479,8 +480,9 @@ async def dbz():
 async def cors_debug(request: Request):
     return {
         "origin_header": request.headers.get("origin"),
-        "allow_origins": ALLOW_ORIGINS,
-        "allow_origin_regex": ALLOW_ORIGIN_REGEX,
+        "allow_origins": _resolve_cors_origins(),
+        "allow_origin_regex": os.getenv("CORS_ORIGIN_REGEX", ""),
+        "effective_regex_default": DEFAULT_REGEX,
         "cors_mode": CORS_MODE,
         "SMARTBIZ_PWHASH_COL": os.getenv("SMARTBIZ_PWHASH_COL"),
     }
@@ -499,7 +501,7 @@ if env_bool("DEBUG", False):
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
     uvicorn.run(
-        "main:app",   # tunakimbiza ukiwa ndani ya folder la backend
+        "main:app",   # run ukiwa ndani ya folder la backend
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=env_bool("RELOAD", ENVIRONMENT in {"dev", "development", "local"}),
