@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, RedirectResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Load envs (.env → .env.local → .env.{environment})
@@ -78,7 +78,6 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development").lower()
 
-# Render hutumia DATABASE_URL; pia tunaruhusu LOCAL_DATABASE_URL kwa dev
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("LOCAL_DATABASE_URL")
 if not DATABASE_URL:
     if ENVIRONMENT in {"dev", "development", "local"}:
@@ -298,8 +297,8 @@ app = FastAPI(
 # ──────────────────────────────────────────────────────────────────────────────
 def _resolve_cors_origins() -> list[str]:
     defaults = [
-        "https://smartbizsite.netlify.app",  # Netlify main
-        "https://smartbiz.site", "https://www.smartbiz.site",  # custom domain (kama ipo)
+        "https://smartbizsite.netlify.app",
+        "https://smartbiz.site", "https://www.smartbiz.site",
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
@@ -312,9 +311,9 @@ CORS_MODE = os.getenv("CORS_MODE", "strict").strip().lower()  # strict | dev-saf
 ALLOW_ORIGINS = _resolve_cors_origins()
 
 DEFAULT_REGEX = (
-    r"^https:\/\/([0-9a-z\-]+--)?smartbizsite\.netlify\.app$"   # Netlify previews + main
-    r"|^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"            # local dev
-    r"|^https?:\/\/([a-z0-9\-]+\.)*(ngrok-free\.app|trycloudflare\.com)$"  # tunnels
+    r"^https:\/\/([0-9a-z\-]+--)?smartbizsite\.netlify\.app$"
+    r"|^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"
+    r"|^https?:\/\/([a-z0-9\-]+\.)*(ngrok-free\.app|trycloudflare\.com)$"
 )
 ALLOW_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX if CORS_MODE != "strict" else "")
 
@@ -445,6 +444,18 @@ if _HAS_WS:
     _safe_include("backend.websocket.ws_routes", prefix="", tags=["WebSocket"])
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 13.1) SIGNUP ALIASES → hushika '/signup' na '/register' na kupeleka '/auth/register'
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post("/signup", include_in_schema=False, tags=["Auth"])
+async def _signup_alias():
+    # 307 huhifadhi method (POST) na body; client atapiga tena '/auth/register'
+    return RedirectResponse(url="/auth/register", status_code=307)
+
+@app.post("/register", include_in_schema=False, tags=["Auth"])
+async def _register_alias():
+    return RedirectResponse(url="/auth/register", status_code=307)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 14) Health / Debug
 # ──────────────────────────────────────────────────────────────────────────────
 class WhatsAppMessage(BaseModel):
@@ -501,7 +512,7 @@ if env_bool("DEBUG", False):
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
     uvicorn.run(
-        "main:app",   # run ukiwa ndani ya folder la backend
+        "main:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=env_bool("RELOAD", ENVIRONMENT in {"dev", "development", "local"}),
