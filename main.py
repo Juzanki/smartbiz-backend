@@ -7,6 +7,7 @@ import inspect as _pyinspect
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -187,7 +188,7 @@ except Exception:
     from backend.routes.auth_routes import router as auth_router, legacy_router as auth_legacy_router  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6) Middlewares: Security headers + Request-ID
+# 6) Middlewares: Security headers + Request-ID + Timing
 # ──────────────────────────────────────────────────────────────────────────────
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -211,6 +212,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex
         request.state.request_id = rid
+        start = time.perf_counter()
         try:
             response: Response = await call_next(request)
             if response is None:
@@ -220,7 +222,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             logger.exception("RequestID middleware error: %s", e)
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        response.headers["x-request-id"] = rid
+        finally:
+            dur_ms = int((time.perf_counter() - start) * 1000)
+            # ongeza perf header kwa utatuzi
+            try:
+                response.headers["x-request-id"] = rid
+                response.headers["x-process-time-ms"] = str(dur_ms)
+            except Exception:
+                pass
         return response
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -444,11 +453,11 @@ if _HAS_WS:
     _safe_include("backend.websocket.ws_routes", prefix="", tags=["WebSocket"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 13.1) SIGNUP ALIASES → hushika '/signup' na '/register' na kupeleka '/auth/register'
+# 13.1) SIGNUP ALIASES → hushika '/signup' & '/register' na kupeleka '/auth/register'
 # ──────────────────────────────────────────────────────────────────────────────
 @app.post("/signup", include_in_schema=False, tags=["Auth"])
 async def _signup_alias():
-    # 307 huhifadhi method (POST) na body; client atapiga tena '/auth/register'
+    # 307 huhifadhi method (POST) + body
     return RedirectResponse(url="/auth/register", status_code=307)
 
 @app.post("/register", include_in_schema=False, tags=["Auth"])
@@ -473,6 +482,15 @@ async def root():
         "status": "running",
         "version": app.version,
         "env": ENVIRONMENT,
+    }
+
+@app.get("/_info", tags=["Debug"])
+async def info():
+    return {
+        "env": ENVIRONMENT,
+        "docs": app.docs_url,
+        "db": _sanitize_db_url(DATABASE_URL),
+        "cors_mode": os.getenv("CORS_MODE", "strict"),
     }
 
 @app.get("/healthz", tags=["Health"])
@@ -512,7 +530,7 @@ if env_bool("DEBUG", False):
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
     uvicorn.run(
-        "main:app",
+        "main:app",  # ukikimbiza ukiwa ndani ya 'backend'
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=env_bool("RELOAD", ENVIRONMENT in {"dev", "development", "local"}),
