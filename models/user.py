@@ -1,10 +1,11 @@
-﻿# backend/models/user.py
+# backend/models/user.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
 import hashlib
 import datetime as dt
+from importlib import import_module
 from typing import Optional, TYPE_CHECKING, List, Sequence
 
 from sqlalchemy import (
@@ -15,86 +16,33 @@ from sqlalchemy import (
     Integer,
     String,
     func,
+    text,
 )
 from sqlalchemy.orm import (
     Mapped,
     mapped_column,
     relationship,
-    validates,
     synonym,
+    validates,
 )
 from sqlalchemy.event import listens_for
 from sqlalchemy import inspect as _inspect
 
 from backend.db import Base, engine
 
-# ── Register a few core models early (avoid mapper import races)
+# ──────────────────────────────────────────────────────────────────────────────
+# Early lightweight imports to avoid mapper races
+# (just registering modules; attributes referenced lazily below)
 import backend.models.setting  # noqa: F401
 import backend.models.notification_preferences  # noqa: F401
 import backend.models.customer_feedback as _cf  # noqa: F401
-
-# Try import Support early (usipige crash kama haipo bado)
 try:
     import backend.models.support as _sup_mod  # noqa: F401
 except Exception:
     _sup_mod = None  # noqa: N816
 
-# ---------- Robust lazy import helpers ----------
-from importlib import import_module
-
-def _try_getattr(mod: str, name: str):
-    try:
-        return getattr(import_module(mod), name)
-    except Exception:
-        return None
-
-def _get_model(mod_candidates: Sequence[str], cls_name: str):
-    for m in mod_candidates:
-        obj = _try_getattr(m, cls_name)
-        if obj is not None:
-            return obj
-    raise ModuleNotFoundError(
-        f"Could not import {cls_name} from any of: {', '.join(mod_candidates)}"
-    )
-
-def _col(mod_candidates: Sequence[str], cls_name: str, col_name: str):
-    """Return a Column object (e.g., Guest.user_id) via robust lazy import."""
-    Model = _get_model(mod_candidates, cls_name)
-    return getattr(Model, col_name)
-
-def _fcol(mod_candidates: Sequence[str], cls_name: str, col_candidates: Sequence[str]):
-    """
-    Flexible column resolver: return the first existing column name on Model.
-    Useful when different codebases use different FK column names.
-    """
-    Model = _get_model(mod_candidates, cls_name)
-    for cname in col_candidates:
-        if hasattr(Model, cname):
-            return getattr(Model, cname)
-    raise AttributeError(
-        f"{cls_name} has none of the expected columns: {', '.join(col_candidates)}"
-    )
-
-# Optional shim: SupportTicket module might be support.py or support_ticket.py
-_SUPPORT_MODS = ["backend.models.support", "backend.models.support_ticket"]
-
-# Optional shim: Forgot password / password reset modules
-_AUTH_MODS = [
-    "backend.models.forgot_password",
-    "backend.models.password_reset",
-    "backend.models.password",
-    "backend.models.auth",
-    "backend.models.forgot_password_request",
-]
-
-# Optional shim: UserBot module names
-_BOT_MODS = [
-    "backend.models.user_bot",
-    "backend.models.bot",
-    "backend.models.bots",
-]
-
-# ---------- TYPE_CHECKING-only imports ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# TYPE_CHECKING-only imports (haziingii kwenye runtime import graph)
 if TYPE_CHECKING:
     from .wallet import Wallet
     from .activity_score import ActivityScore
@@ -168,8 +116,48 @@ if TYPE_CHECKING:
     from .message import Message
     from .share_activity import ShareActivity
 
-# ----------- Dynamic password column resolver -----------
-# SMARTBIZ_PWHASH_COL=hashed_password | password_hash
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers for resilient lazy imports
+def _try_getattr(mod: str, name: str):
+    try:
+        return getattr(import_module(mod), name)
+    except Exception:
+        return None
+
+def _get_model(mod_candidates: Sequence[str], cls_name: str):
+    for m in mod_candidates:
+        obj = _try_getattr(m, cls_name)
+        if obj is not None:
+            return obj
+    raise ModuleNotFoundError(
+        f"Could not import {cls_name} from any of: {', '.join(mod_candidates)}"
+    )
+
+def _col(mod_candidates: Sequence[str], cls_name: str, col_name: str):
+    Model = _get_model(mod_candidates, cls_name)
+    return getattr(Model, col_name)
+
+def _fcol(mod_candidates: Sequence[str], cls_name: str, col_candidates: Sequence[str]):
+    Model = _get_model(mod_candidates, cls_name)
+    for cname in col_candidates:
+        if hasattr(Model, cname):
+            return getattr(Model, cname)
+    raise AttributeError(
+        f"{cls_name} has none of the expected columns: {', '.join(col_candidates)}"
+    )
+
+_SUPPORT_MODS = ["backend.models.support", "backend.models.support_ticket"]
+_AUTH_MODS = [
+    "backend.models.forgot_password",
+    "backend.models.password_reset",
+    "backend.models.password",
+    "backend.models.auth",
+    "backend.models.forgot_password_request",
+]
+_BOT_MODS = ["backend.models.user_bot", "backend.models.bot", "backend.models.bots"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dynamic password column resolver
 _PWHASH_COL = os.getenv("SMARTBIZ_PWHASH_COL", "").strip()
 
 def _table_columns(table: str) -> set[str]:
@@ -187,7 +175,7 @@ def _table_exists(table: str) -> bool:
         return False
 
 if not _PWHASH_COL:
-    cols = _table_columns("users")
+    cols = _table_columns("users") if _table_exists("users") else set()
     if "password_hash" in cols:
         _PWHASH_COL = "password_hash"
     elif "hashed_password" in cols:
@@ -195,57 +183,75 @@ if not _PWHASH_COL:
     else:
         _PWHASH_COL = "password_hash"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Model
 class User(Base):
-    """Core user model."""
+    """Core user model with safe server defaults and normalized fields."""
     __tablename__ = "users"
     __mapper_args__ = {"eager_defaults": True}
 
     # Identity
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     username: Mapped[Optional[str]] = mapped_column(String(80), index=True, default=None)
-    full_name: Mapped[Optional[str]] = mapped_column(String(120), default=None)
+    full_name: Mapped[Optional[str]] = mapped_column(String(120), default=None, nullable=True)
 
-    # ── Auth / status
-    # Normalize hash column via synonym so code can use either name.
+    # Password hash (dynamic column aliasing)
     if _PWHASH_COL == "hashed_password":
-        hashed_password: Mapped[Optional[str]] = mapped_column("hashed_password", String(255), default=None)
+        hashed_password: Mapped[Optional[str]] = mapped_column(
+            "hashed_password", String(255), default=None
+        )
         password_hash = synonym("hashed_password")
     else:
-        password_hash: Mapped[Optional[str]] = mapped_column("password_hash", String(255), default=None)
+        password_hash: Mapped[Optional[str]] = mapped_column(
+            "password_hash", String(255), default=None
+        )
         hashed_password = synonym("password_hash")
 
-    role: Mapped[str] = mapped_column(String(32), default="user")
-    is_active:   Mapped[bool] = mapped_column(Boolean, default=True,  nullable=False)
-    is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    subscription_status: Mapped[Optional[str]] = mapped_column(String(32), default="free")
+    # Status/role with DB-side defaults (avoid NOT NULL errors)
+    role: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'user'"),
+        doc="User role: user/moderator/admin/owner",
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    subscription_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("'free'")
+    )
 
     # Timestamps
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),  # DB default
+        index=True,
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),  # DB default for initial insert
+        onupdate=func.now(),        # app-side update on UPDATE
+        index=True,
     )
 
     __table_args__ = (
         CheckConstraint("length(email) >= 3", name="ck_user_email_len"),
+        # Functional indexes - portable enough for Postgres/SQLite (SQLite will ignore func.lower index perf)
         Index("ix_users_email_lower", func.lower(email)),
         Index("ix_users_username_lower", func.lower(username)),
         Index("ix_users_is_active_created", "is_active", "created_at"),
     )
 
-    # ========= Relationships =========
-    # NB: To prevent login from accidentally querying heavy/optional tables,
-    # most collections below use lazy="noload".
-    # You can flip to "selectin" where you *intentionally* preload.
+    # ───── Relationships (default: lazy='noload' to keep auth light) ─────
 
-    # —— One-to-one / simple
+    # One-to-one / simple
     activity_score: Mapped[Optional["ActivityScore"]] = relationship(
-        "ActivityScore", back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="noload",
+        "ActivityScore", back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="noload"
     )
     ai_bot_settings: Mapped[Optional["AIBotSettings"]] = relationship(
-        "AIBotSettings", back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="noload",
+        "AIBotSettings", back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="noload"
     )
     balance: Mapped[Optional["Balance"]] = relationship(
         "Balance", back_populates="user", uselist=False, cascade="all, delete-orphan",
@@ -260,7 +266,7 @@ class User(Base):
         passive_deletes=True, lazy="noload", doc="Unified fiat/coin wallet",
     )
 
-    # —— Settings & prefs
+    # Settings & prefs
     settings: Mapped[Optional["UserSettings"]] = relationship(
         "UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -286,13 +292,11 @@ class User(Base):
         passive_deletes=True, lazy="noload",
     )
 
-    # ---------- Bots (AI assistants) ----------
+    # Bots
     bots: Mapped[List["UserBot"]] = relationship(
         "UserBot",
         back_populates="user",
-        foreign_keys=lambda: [
-            _col(_BOT_MODS, "UserBot", "user_id")
-        ],
+        foreign_keys=lambda: [_col(_BOT_MODS, "UserBot", "user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="noload",
@@ -350,27 +354,19 @@ class User(Base):
         passive_deletes=True, lazy="noload",
     )
 
-    # Guests / Co-hosts (two distinct FKs)
+    # Guests / Co-hosts
     guest_entries: Mapped[List["Guest"]] = relationship(
         "Guest",
-        primaryjoin=lambda: _col(
-            ["backend.models.guest", "backend.models.guests"], "Guest", "user_id"
-        ) == User.id,
-        foreign_keys=lambda: [
-            _col(["backend.models.guest", "backend.models.guests"], "Guest", "user_id")
-        ],
+        primaryjoin=lambda: _col(["backend.models.guest", "backend.models.guests"], "Guest", "user_id") == User.id,
+        foreign_keys=lambda: [_col(["backend.models.guest", "backend.models.guests"], "Guest", "user_id")],
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     guest_approvals: Mapped[List["Guest"]] = relationship(
         "Guest",
-        primaryjoin=lambda: _col(
-            ["backend.models.guest", "backend.models.guests"], "Guest", "approved_by_user_id"
-        ) == User.id,
-        foreign_keys=lambda: [
-            _col(["backend.models.guest", "backend.models.guests"], "Guest", "approved_by_user_id")
-        ],
+        primaryjoin=lambda: _col(["backend.models.guest", "backend.models.guests"], "Guest", "approved_by_user_id") == User.id,
+        foreign_keys=lambda: [_col(["backend.models.guest", "backend.models.guests"], "Guest", "approved_by_user_id")],
         back_populates="approved_by",
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -378,23 +374,19 @@ class User(Base):
     co_host_as_host: Mapped[List["CoHost"]] = relationship(
         "CoHost",
         back_populates="host",
-        foreign_keys=lambda: [
-            _col(["backend.models.co_host", "backend.models.cohost"], "CoHost", "host_user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.co_host", "backend.models.cohost"], "CoHost", "host_user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     co_host_as_cohost: Mapped[List["CoHost"]] = relationship(
         "CoHost",
         back_populates="cohost",
-        foreign_keys=lambda: [
-            _col(["backend.models.co_host", "backend.models.cohost"], "CoHost", "cohost_user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.co_host", "backend.models.cohost"], "CoHost", "cohost_user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
 
-    # Live sessions / history
+    # Live / history
     live_sessions: Mapped[List["LiveSession"]] = relationship(
         "LiveSession", back_populates="user", cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -468,21 +460,15 @@ class User(Base):
         passive_deletes=True, lazy="noload",
     )
 
-    # ------------ Withdraws (two FKs to users) -------------
+    # Withdraws (two FKs to users)
     withdraw_requests: Mapped[List["WithdrawRequest"]] = relationship(
         "WithdrawRequest",
         back_populates="user",
         primaryjoin=lambda: _col(
-            ["backend.models.withdraw_request", "backend.models.withdrawrequests"],
-            "WithdrawRequest",
-            "user_id",
+            ["backend.models.withdraw_request", "backend.models.withdrawrequests"], "WithdrawRequest", "user_id"
         ) == User.id,
         foreign_keys=lambda: [
-            _col(
-                ["backend.models.withdraw_request", "backend.models.withdrawrequests"],
-                "WithdrawRequest",
-                "user_id",
-            )
+            _col(["backend.models.withdraw_request", "backend.models.withdrawrequests"], "WithdrawRequest", "user_id")
         ],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -491,20 +477,13 @@ class User(Base):
         "WithdrawRequest",
         back_populates="approved_by",
         primaryjoin=lambda: _col(
-            ["backend.models.withdraw_request", "backend.models.withdrawrequests"],
-            "WithdrawRequest",
-            "approved_by_user_id",
+            ["backend.models.withdraw_request", "backend.models.withdrawrequests"], "WithdrawRequest", "approved_by_user_id"
         ) == User.id,
         foreign_keys=lambda: [
-            _col(
-                ["backend.models.withdraw_request", "backend.models.withdrawrequests"],
-                "WithdrawRequest",
-                "approved_by_user_id",
-            )
+            _col(["backend.models.withdraw_request", "backend.models.withdrawrequests"], "WithdrawRequest", "approved_by_user_id")
         ],
         lazy="noload",
     )
-    # -------------------------------------------------------
 
     # SmartCoin legacy
     smart_coin_transactions: Mapped[List["SmartCoinTransaction"]] = relationship(
@@ -513,13 +492,13 @@ class User(Base):
     )
     coin_transactions = synonym("smart_coin_transactions")
 
-    # CRM: Customers
+    # CRM
     customers: Mapped[List["Customer"]] = relationship(
         "Customer", back_populates="user", cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
 
-    # CRM: CustomerFeedback (two distinct FKs)
+    # CustomerFeedback (two FKs)
     customer_feedbacks: Mapped[List["CustomerFeedback"]] = relationship(
         "CustomerFeedback",
         back_populates="user",
@@ -568,18 +547,14 @@ class User(Base):
     following_hosts: Mapped[List["Fan"]] = relationship(
         "Fan",
         back_populates="fan",
-        foreign_keys=lambda: [
-            _col(["backend.models.fan", "backend.models.fans"], "Fan", "user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.fan", "backend.models.fans"], "Fan", "user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     host_followers: Mapped[List["Fan"]] = relationship(
         "Fan",
         back_populates="host",
-        foreign_keys=lambda: [
-            _col(["backend.models.fan", "backend.models.fans"], "Fan", "host_user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.fan", "backend.models.fans"], "Fan", "host_user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -591,36 +566,28 @@ class User(Base):
     gift_movements_sent: Mapped[List["GiftMovement"]] = relationship(
         "GiftMovement",
         back_populates="sender",
-        foreign_keys=lambda: [
-            _col(["backend.models.gift_movement", "backend.models.giftmovement"], "GiftMovement", "sender_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.gift_movement", "backend.models.giftmovement"], "GiftMovement", "sender_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     gift_movements_received: Mapped[List["GiftMovement"]] = relationship(
         "GiftMovement",
         back_populates="host",
-        foreign_keys=lambda: [
-            _col(["backend.models.gift_movement", "backend.models.giftmovement"], "GiftMovement", "host_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.gift_movement", "backend.models.giftmovement"], "GiftMovement", "host_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     gift_transactions_sent: Mapped[List["GiftTransaction"]] = relationship(
         "GiftTransaction",
         back_populates="sender",
-        foreign_keys=lambda: [
-            _col(["backend.models.gift_transaction", "backend.models.gifttransaction"], "GiftTransaction", "sender_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.gift_transaction", "backend.models.gifttransaction"], "GiftTransaction", "sender_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     gift_transactions_received: Mapped[List["GiftTransaction"]] = relationship(
         "GiftTransaction",
         back_populates="recipient",
-        foreign_keys=lambda: [
-            _col(["backend.models.gift_transaction", "backend.models.gifttransaction"], "GiftTransaction", "recipient_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.gift_transaction", "backend.models.gifttransaction"], "GiftTransaction", "recipient_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -638,11 +605,7 @@ class User(Base):
         "Goal",
         back_populates="creator",
         foreign_keys=lambda: [
-            _col(
-                ["backend.models.goal", "backend.models.goals", "backend.models.goal_model"],
-                "Goal",
-                "creator_id",
-            )
+            _col(["backend.models.goal", "backend.models.goals", "backend.models.goal_model"], "Goal", "creator_id")
         ],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -657,11 +620,7 @@ class User(Base):
         "LoyaltyPoint",
         back_populates="user",
         foreign_keys=lambda: [
-            _col(
-                ["backend.models.loyalty", "backend.models.loyalty_points", "backend.models.loyaltypoint"],
-                "LoyaltyPoint",
-                "user_id",
-            )
+            _col(["backend.models.loyalty", "backend.models.loyalty_points", "backend.models.loyaltypoint"], "LoyaltyPoint", "user_id")
         ],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
@@ -685,13 +644,11 @@ class User(Base):
         passive_deletes=True, lazy="noload",
     )
 
-    # ✅ SupportTicket relations (match support.py: assigned_to)
+    # SupportTicket relations
     support_tickets: Mapped[List["SupportTicket"]] = relationship(
         "SupportTicket",
         back_populates="user",
-        foreign_keys=lambda: [
-            _fcol(_SUPPORT_MODS, "SupportTicket", ["user_id"])
-        ],
+        foreign_keys=lambda: [_fcol(_SUPPORT_MODS, "SupportTicket", ["user_id"])],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -708,13 +665,11 @@ class User(Base):
         lazy="noload",
     )
 
-    # ✅ Forgot Password / Password Reset
+    # Forgot Password / Password Reset
     forgot_password_requests: Mapped[List["ForgotPasswordRequest"]] = relationship(
         "ForgotPasswordRequest",
         back_populates="user",
-        foreign_keys=lambda: [
-            _fcol(_AUTH_MODS, "ForgotPasswordRequest", ["user_id", "owner_user_id", "account_user_id"])
-        ],
+        foreign_keys=lambda: [_fcol(_AUTH_MODS, "ForgotPasswordRequest", ["user_id", "owner_user_id", "account_user_id"])],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -729,9 +684,7 @@ class User(Base):
     referrals_made: Mapped[List["ReferralLog"]] = relationship(
         "ReferralLog",
         back_populates="referrer",
-        foreign_keys=lambda: [
-            _col(["backend.models.referral_log", "backend.models.referrallog"], "ReferralLog", "referrer_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.referral_log", "backend.models.referrallog"], "ReferralLog", "referrer_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -739,27 +692,21 @@ class User(Base):
     referrals_received: Mapped[List["ReferralLog"]] = relationship(
         "ReferralLog",
         back_populates="referred_user",
-        foreign_keys=lambda: [
-            _col(["backend.models.referral_log", "backend.models.referrallog"], "ReferralLog", "referred_user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.referral_log", "backend.models.referrallog"], "ReferralLog", "referred_user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     referral_bonuses_made: Mapped[List["ReferralBonus"]] = relationship(
         "ReferralBonus",
         back_populates="referrer",
-        foreign_keys=lambda: [
-            _col(["backend.models.referral_bonus", "backend.models.referralbonus"], "ReferralBonus", "referrer_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.referral_bonus", "backend.models.referralbonus"], "ReferralBonus", "referrer_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
     referral_bonuses_received: Mapped[List["ReferralBonus"]] = relationship(
         "ReferralBonus",
         back_populates="referred_user",
-        foreign_keys=lambda: [
-            _col(["backend.models.referral_bonus", "backend.models.referralbonus"], "ReferralBonus", "referred_user_id")
-        ],
+        foreign_keys=lambda: [_col(["backend.models.referral_bonus", "backend.models.referralbonus"], "ReferralBonus", "referred_user_id")],
         cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
@@ -783,15 +730,12 @@ class User(Base):
         "WebhookEndpoint", back_populates="user", cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
-    webhooks = synonym("webhook_endpoints")
-
-    # ⚠️ Key change: set to noload to avoid accidental SELECTs during login
     webhook_delivery_logs: Mapped[List["WebhookDeliveryLog"]] = relationship(
         "WebhookDeliveryLog",
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
-        lazy="noload",  # ← this prevents implicit DB load (and avoids errors if table missing)
+        lazy="noload",
     )
 
     subscriptions: Mapped[List["UserSubscription"]] = relationship(
@@ -803,14 +747,14 @@ class User(Base):
         passive_deletes=True, lazy="noload",
     )
 
-    # Optional: share activities
     share_activities: Mapped[List["ShareActivity"]] = relationship(
         "ShareActivity", cascade="all, delete-orphan",
         passive_deletes=True, lazy="noload",
     )
 
-    # —— Helpers
+    # ───── Helpers ─────
     def set_password(self, raw: str) -> None:
+        """Hash and set password field using project security utils, fallback to SHA256."""
         try:
             from backend.utils.security import get_password_hash  # type: ignore
             h = get_password_hash(raw)
@@ -822,6 +766,7 @@ class User(Base):
             self.hashed_password = h
 
     def verify_password(self, raw: str) -> bool:
+        """Verify a raw password against stored hash."""
         hashed = None
         if hasattr(self, "password_hash"):
             hashed = self.password_hash
@@ -869,19 +814,22 @@ class User(Base):
     def __repr__(self) -> str:  # pragma: no cover
         return f"<User id={self.id} email={self.email} role={self.role} active={self.is_active}>"
 
-# —— Normalization hooks
-@validates("email")
-def _validate_email_lower(cls, value: str) -> str:  # type: ignore[override]
-    return (value or "").strip().lower()
+    # ───── Validators (class methods so SQLAlchemy yaheshimu) ─────
+    @validates("email")
+    def _validate_email_lower(self, key, value: str) -> str:
+        return (value or "").strip().lower()
 
-@validates("username")
-def _validate_username_lower(cls, value: Optional[str]) -> Optional[str]:  # type: ignore[override]
-    if value is None:
-        return None
-    v = (value or "").strip()
-    v = " ".join(v.split())
-    return v.lower() or None
+    @validates("username")
+    def _validate_username_lower(self, key, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        v = (value or "").strip()
+        v = " ".join(v.split())
+        return v.lower() or None
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalization hooks
 @listens_for(User, "before_insert")
 def _user_before_insert(_mapper, _connection, target: User) -> None:
     if target.email:
