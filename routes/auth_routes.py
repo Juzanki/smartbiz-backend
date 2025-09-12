@@ -37,7 +37,7 @@ except Exception:
 # ── Security helpers & token
 try:
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
-except Exception:  # dev fallback
+except Exception:  # dev fallback (simple sha256)
     import hashlib, hmac
 
     def get_password_hash(pw: str) -> str:
@@ -48,7 +48,7 @@ except Exception:  # dev fallback
 
 try:
     from backend.auth import create_access_token, get_current_user  # type: ignore
-except Exception:  # dev fallback
+except Exception:  # dev fallback (unsigned base64 "token")
     def create_access_token(data: dict, minutes: int = 60 * 24) -> str:
         payload = data.copy()
         payload["exp"] = int(time.time()) + minutes * 60
@@ -60,7 +60,7 @@ except Exception:  # dev fallback
 logger = logging.getLogger("smartbiz.auth")
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
-legacy_router = APIRouter(tags=["Auth"])  # /login-form only
+legacy_router = APIRouter(tags=["Auth"])  # e.g. /login-form
 
 # ── Config / Flags
 def _flag(name: str, default: str = "true") -> bool:
@@ -89,7 +89,7 @@ COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", "").strip() or None
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
 
-def _rate_ok(key: str) -> bool:
+def _rate_ok(key: string) -> bool:  # type: ignore[name-defined]
     now = time.time()
     q = _LOGIN_BUCKET.setdefault(key, [])
     while q and (now - q[0]) > _RATE_WIN:
@@ -155,7 +155,7 @@ def _model_col(model, name: str):
         return None
 
 def _first_existing_attr(candidates: List[str]) -> Tuple[Optional[Any], Optional[str]]:
-    """Pick the password column that is actually mapped on the model."""
+    """Pick the password column actually mapped on the model."""
     for n in candidates:
         if _col_exists(n) and hasattr(User, n):
             return getattr(User, n), n
@@ -439,7 +439,6 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
     try:
         exists = False
         if uniq_conds:
-            # with_entities(User.id) ensures only the PK is selected
             exists = db.query(User.id).options(noload("*")).filter(or_(*uniq_conds)).limit(1).first() is not None
         if exists:
             raise HTTPException(status_code=409, detail="User already exists")
@@ -530,3 +529,5 @@ def diag_columns(table: str, db: Session = Depends(get_db)):
       ORDER BY ordinal_position
     """), {"t": table}).mappings().all()
     return {"table": table, "columns": list(rows)}
+
+__all__ = ["router", "legacy_router"]
