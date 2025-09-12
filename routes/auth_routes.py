@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 """
-SmartBiz Auth Router (resilient)
---------------------------------
-- POST /auth/login         (email | username | phone)
-- POST /auth/register      (creates user)
-- POST /auth/signup        (alias)
-- GET  /auth/me            (requires get_current_user)
+SmartBiz Auth Router (resilient, extended)
+------------------------------------------
+Endpoints
+- POST /auth/login             (email | username | phone)
+- POST /auth/register          (creates user)
+- POST /auth/signup            (alias)
+- GET  /auth/me                (requires get_current_user)
+- POST /auth/logout            (clears cookie)
+- POST /auth/token/refresh     (rotates short-lived token)
+- POST /auth/change-password   (change own password)
 - GET  /auth/session/verify
-- GET  /auth/_diag         (lists users columns)
+- GET  /auth/_diag
 - GET  /auth/_diag/columns/{table}
-- GET  /auth/_diag/pwhash  (shows chosen password column)
+- GET  /auth/_diag/pwhash
 
-Design goals
-- Works even when ORM model != DB schema (uses SQL fallbacks).
-- Auto-detects password column; can be forced with SMARTBIZ_PWHASH_COL.
+Highlights
+- Works even when ORM model != DB schema (SQL fallbacks).
+- Auto-detects password column; override via SMARTBIZ_PWHASH_COL.
 - Cookie auth (SameSite=None; Secure) or bearer token.
 - Gentle rate limit per (identifier, IP).
 """
@@ -46,9 +50,9 @@ from sqlalchemy.orm import Session, load_only, noload
 # ──────────────────────────────────────────────────────────────────────
 # DB & Models (layout-safe imports)
 # ──────────────────────────────────────────────────────────────────────
-try:  # prefer top-level
+try:
     from db import get_db, engine  # type: ignore
-except Exception:  # fallback to package path
+except Exception:
     from backend.db import get_db, engine  # type: ignore
 
 try:
@@ -61,23 +65,25 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────
 try:
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
-except Exception:  # dev fallback (sha256) — switch to bcrypt in production
+except Exception:  # dev fallback (sha256) — switch to bcrypt/argon2 in production
     import hashlib, hmac
-
     def get_password_hash(pw: str) -> str:
         return hashlib.sha256(pw.encode("utf-8")).hexdigest()
-
     def verify_password(pw: str, hashed: str) -> bool:
         return hmac.compare_digest(get_password_hash(pw), hashed)
 
+# Token helpers (create + decode + dependency get_current_user)
 try:
-    from backend.auth import create_access_token, get_current_user  # type: ignore
-except Exception:  # dev fallback (unsigned base64 "token")
+    from backend.auth import create_access_token, decode_token, get_current_user  # type: ignore
+except Exception:  # dev fallback (unsigned base64 "token" w/o decode)
     def create_access_token(data: dict, minutes: int = 60 * 24) -> str:
         payload = data.copy()
         payload["exp"] = int(time.time()) + minutes * 60
         return base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode()
-
+    def decode_token(token: str) -> Dict[str, Any]:
+        body = token.split(".")[1] if "." in token else token
+        pad = "=" * ((4 - len(body) % 4) % 4)
+        return _json.loads(base64.urlsafe_b64decode(body + pad).decode())
     def get_current_user():
         raise RuntimeError("get_current_user not wired")
 
@@ -85,7 +91,6 @@ except Exception:  # dev fallback (unsigned base64 "token")
 # Setup
 # ──────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("smartbiz.auth")
-
 router = APIRouter(prefix="/auth", tags=["Auth"])
 legacy_router = APIRouter(tags=["Auth"])  # e.g. /login-form
 
@@ -111,11 +116,13 @@ COOKIE_SECURE = _flag("AUTH_COOKIE_SECURE", "true")
 COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
 COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", "").strip() or None
 
-# Rate limiter (identifier+IP) — simple token bucket
+# Optional: refresh policy (shorter access + refresh window)
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # default 1 day
+REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
+
+# Rate limiter (identifier+IP)
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
-
-
 def _rate_ok(key: str) -> bool:
     now = time.time()
     q = _LOGIN_BUCKET.setdefault(key, [])
@@ -126,31 +133,17 @@ def _rate_ok(key: str) -> bool:
     q.append(now)
     return True
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Normalizers
 # ──────────────────────────────────────────────────────────────────────
 _phone_digits = re.compile(r"\D+")
-
-
-def _norm(s: Optional[str]) -> str:
-    return (s or "").strip()
-
-
-def _norm_email(s: Optional[str]) -> str:
-    return _norm(s).lower()
-
-
-def _norm_username(s: Optional[str]) -> str:
-    return " ".join(_norm(s).split()).lower()
-
-
+def _norm(s: Optional[str]) -> str: return (s or "").strip()
+def _norm_email(s: Optional[str]) -> str: return _norm(s).lower()
+def _norm_username(s: Optional[str]) -> str: return " ".join(_norm(s).split()).lower()
 def _norm_phone(s: Optional[str]) -> str:
     s = _norm(s)
-    if not s:
-        return ""
+    if not s: return ""
     return "+" + _phone_digits.sub("", s) if s.startswith("+") else _phone_digits.sub("", s)
-
 
 # ──────────────────────────────────────────────────────────────────────
 # DB Inspection helpers
@@ -158,7 +151,6 @@ def _norm_phone(s: Optional[str]) -> str:
 @lru_cache(maxsize=1)
 def _users_columns() -> set[str]:
     from sqlalchemy import inspect as _inspect
-
     try:
         insp = _inspect(engine)
         cols = {c["name"] for c in insp.get_columns("users")}
@@ -168,17 +160,11 @@ def _users_columns() -> set[str]:
         logger.warning("Could not inspect users table: %s", e)
         return {"id", "email"}
 
-
-def _col_exists(name: str) -> bool:
-    return name in _users_columns()
-
-
-def _is_mapped(name: str) -> bool:
-    return hasattr(User, name)
-
+def _col_exists(name: str) -> bool: return name in _users_columns()
+def _is_mapped(name: str) -> bool: return hasattr(User, name)
 
 def _model_col(model, name: str):
-    """Prefer mapped attr; else fall back to raw table column if present on model.__table__."""
+    """Prefer mapped attr; else fallback to raw table column if present."""
     try:
         if hasattr(model, name):
             return getattr(model, name)
@@ -186,9 +172,8 @@ def _model_col(model, name: str):
     except Exception:
         return None
 
-
 def _first_existing_attr(candidates: List[str]) -> Tuple[Optional[Any], Optional[str]]:
-    """Pick the password column actually mapped on the model (env override supported)."""
+    """Pick the password column mapped on the model (env override supported)."""
     prefer = os.getenv("SMARTBIZ_PWHASH_COL")
     if prefer and _col_exists(prefer) and hasattr(User, prefer):
         return getattr(User, prefer), prefer
@@ -196,7 +181,6 @@ def _first_existing_attr(candidates: List[str]) -> Tuple[Optional[Any], Optional
         if _col_exists(n) and hasattr(User, n):
             return getattr(User, n), n
     return None, None
-
 
 def _pwd_col_name() -> Optional[str]:
     prefer = os.getenv("SMARTBIZ_PWHASH_COL")
@@ -207,7 +191,6 @@ def _pwd_col_name() -> Optional[str]:
             return n
     return None
 
-
 # ──────────────────────────────────────────────────────────────────────
 # Schemas
 # ──────────────────────────────────────────────────────────────────────
@@ -217,12 +200,10 @@ class LoginJSON(BaseModel):
     phone: Optional[str] = None
     password: str = Field(..., min_length=1, max_length=256)
 
-
 class LoginOutput(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: Dict[str, Any]
-
 
 class RegisterInput(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -230,14 +211,12 @@ class RegisterInput(BaseModel):
     full_name: Optional[str] = Field(None, max_length=120)
     password: str = Field(..., min_length=6, max_length=128)
     phone_number: Optional[str] = None
-
     @validator("username")
     def _u_norm(cls, v: str) -> str:
         v = _norm_username(v)
         if not v:
             raise ValueError("username required")
         return v
-
 
 class MeResponse(BaseModel):
     id: Any
@@ -246,39 +225,33 @@ class MeResponse(BaseModel):
     full_name: Optional[str] = None
     role: Optional[str] = None
     phone_number: Optional[str] = None
+    class Config:
+        orm_mode = True
 
+class ChangePasswordInput(BaseModel):
+    old_password: str = Field(..., min_length=1, max_length=256)
+    new_password: str = Field(..., min_length=6, max_length=128)
 
 # ──────────────────────────────────────────────────────────────────────
 # Small helpers
 # ──────────────────────────────────────────────────────────────────────
 def _safe_eq(col, value: str):
-    """citext/text-safe equality fallback."""
-    try:
-        return col == value
-    except Exception:
-        return func.lower(col) == value.lower()
-
+    try: return col == value
+    except Exception: return func.lower(col) == value.lower()
 
 def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
-    """Return a flat dict without touching relationships."""
-    def val(n: str):
-        return getattr(u, n) if n in names and hasattr(u, n) else None
-
+    def val(n: str): return getattr(u, n) if n in names and hasattr(u, n) else None
     phone = None
     for n in ("phone_number", "phone", "mobile", "msisdn"):
         if n in names:
             phone = val(n)
-            if phone:
-                break
-
+            if phone: break
     username = None
     for n in ("username", "user_name", "handle"):
         if n in names:
             username = val(n)
-            if username:
-                break
-
-    return {
+            if username: break
+    out = {
         "id": val("id"),
         "email": val("email"),
         "username": username,
@@ -286,7 +259,24 @@ def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
         "role": val("role"),
         "phone_number": phone,
     }
+    if out.get("id") is not None:
+        out["id"] = str(out["id"])
+    return out
 
+def _issue_tokens_for_user(user: Any) -> str:
+    # Single access token (you can extend to refresh pair if needed)
+    return create_access_token({"sub": str(getattr(user, "id", None)), "email": getattr(user, "email", None)})
+
+def _set_auth_cookie(response: Response, token: str) -> None:
+    if USE_COOKIE_AUTH:
+        response.set_cookie(
+            key=COOKIE_NAME, value=token,
+            max_age=COOKIE_MAX_AGE, expires=COOKIE_MAX_AGE, path=COOKIE_PATH,
+            domain=COOKIE_DOMAIN, secure=COOKIE_SECURE, httponly=True, samesite=COOKIE_SAMESITE,
+        )
+
+def _clear_auth_cookie(response: Response) -> None:
+    response.delete_cookie(key=COOKIE_NAME, path=COOKIE_PATH, domain=COOKIE_DOMAIN)
 
 # ──────────────────────────────────────────────────────────────────────
 # RAW SQL fallbacks — keep things running when ORM != DB
@@ -298,47 +288,31 @@ def _sql_fetch_user_by_ident(db: Session, ident: str) -> Optional[Dict[str, Any]
         raise HTTPException(status_code=500, detail="Password storage not configured")
 
     select_cols = ["id"]
-    for cand in (
-        "email",
-        "full_name",
-        "role",
-        "username",
-        "user_name",
-        "handle",
-        "phone_number",
-        "phone",
-        "mobile",
-        "msisdn",
-        pwcol,
-    ):
+    for cand in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn",pwcol):
         if cand in cols:
             select_cols.append(cand)
-
     sel = ", ".join(f'"{c}"' for c in select_cols)
 
     where_parts, params = [], {}
-
     if "email" in cols:
         where_parts.append('LOWER("email") = LOWER(:email)')
         params["email"] = ident
-    for cand in ("username", "user_name", "handle"):
+    for cand in ("username","user_name","handle"):
         if cand in cols:
             where_parts.append(f'LOWER("{cand}") = LOWER(:uname)')
             params.setdefault("uname", ident)
             break
-    for cand in ("phone_number", "phone", "mobile", "msisdn"):
+    for cand in ("phone_number","phone","mobile","msisdn"):
         if cand in cols:
             where_parts.append(f'"{cand}" = :phone')
             params.setdefault("phone", re.sub(r"\D+", "", ident))
             break
-
     if not where_parts:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     sql = f'SELECT {sel} FROM "users" WHERE ' + " OR ".join(where_parts) + " LIMIT 1"
     row = db.execute(text(sql), params).mappings().first()
     return dict(row) if row else None
-
 
 def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
     cols = _users_columns()
@@ -347,32 +321,18 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Password storage not configured")
 
     fields: Dict[str, Any] = {}
-    if "email" in cols:
-        fields["email"] = _norm_email(data.email)
-    if "full_name" in cols and data.full_name:
-        fields["full_name"] = _norm(data.full_name)
-
-    for cand in ("username", "user_name", "handle"):
-        if cand in cols:
-            fields[cand] = _norm_username(data.username)
-            break
-
+    if "email" in cols: fields["email"] = _norm_email(data.email)
+    if "full_name" in cols and data.full_name: fields["full_name"] = _norm(data.full_name)
+    for cand in ("username","user_name","handle"):
+        if cand in cols: fields[cand] = _norm_username(data.username); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
         ph = re.sub(r"\D+", "", data.phone_number)
-        for cand in ("phone_number", "phone", "mobile", "msisdn"):
-            if cand in cols:
-                fields[cand] = ph
-                break
-
-    if "is_active" in cols:
-        fields.setdefault("is_active", True)
-    if "is_verified" in cols:
-        fields.setdefault("is_verified", False)
-    if "subscription_status" in cols:
-        fields.setdefault("subscription_status", "free")
-    if "role" in cols:
-        fields.setdefault("role", "user")
-
+        for cand in ("phone_number","phone","mobile","msisdn"):
+            if cand in cols: fields[cand] = ph; break
+    if "is_active" in cols: fields.setdefault("is_active", True)
+    if "is_verified" in cols: fields.setdefault("is_verified", False)
+    if "subscription_status" in cols: fields.setdefault("subscription_status", "free")
+    if "role" in cols: fields.setdefault("role", "user")
     fields[pwcol] = get_password_hash(data.password)
 
     cols_sql = ", ".join(f'"{k}"' for k in fields.keys())
@@ -382,22 +342,9 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
     db.commit()
 
     out = {"id": new_id}
-    for k in (
-        "email",
-        "full_name",
-        "role",
-        "username",
-        "user_name",
-        "handle",
-        "phone_number",
-        "phone",
-        "mobile",
-        "msisdn",
-    ):
-        if k in fields:
-            out[k] = fields[k]
+    for k in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn"):
+        if k in fields: out[k] = fields[k]
     return {"message": "Registration successful", "user": out}
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Login (ORM first → SQL fallback)
@@ -405,7 +352,6 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
 class _LoginPayload(BaseModel):
     identifier: str
     password: str
-
 
 async def _parse_login(request: Request) -> _LoginPayload:
     ctype = (request.headers.get("content-type") or "").lower()
@@ -425,7 +371,6 @@ async def _parse_login(request: Request) -> _LoginPayload:
     if not ident_raw or not password:
         raise HTTPException(status_code=400, detail="missing_credentials")
     return _LoginPayload(identifier=ident_raw, password=password)
-
 
 async def _do_login(request: Request, db: Session, response: Response) -> LoginOutput:
     if LOGIN_MAINTENANCE:
@@ -448,69 +393,43 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
 
         if email and "email" in cols:
             col = _model_col(User, "email")
-            if col is not None:
-                conds.append(_safe_eq(col, email))
-
+            if col is not None: conds.append(_safe_eq(col, email))
         if uname:
-            for cand in ("username", "user_name", "handle"):
+            for cand in ("username","user_name","handle"):
                 if cand in cols:
                     col = _model_col(User, cand)
-                    if col is not None:
-                        conds.append(_safe_eq(col, uname))
-                        break
-
+                    if col is not None: conds.append(_safe_eq(col, uname)); break
         if ALLOW_PHONE_LOGIN and phone:
-            for cand in ("phone_number", "phone", "mobile", "msisdn"):
+            for cand in ("phone_number","phone","mobile","msisdn"):
                 if cand in cols:
                     col = _model_col(User, cand)
-                    if col is not None:
-                        conds.append(col == phone)
-                        break
+                    if col is not None: conds.append(col == phone); break
 
         if not conds:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        pwd_attr, pwd_name = _first_existing_attr(["hashed_password", "password_hash", "password"])
+        pwd_attr, pwd_name = _first_existing_attr(["hashed_password","password_hash","password"])
         if not pwd_attr:
             raise HTTPException(status_code=500, detail="Password storage not configured")
 
         load_names: List[str] = ["id", pwd_name]
-        for n in (
-            "email",
-            "full_name",
-            "role",
-            "username",
-            "user_name",
-            "handle",
-            "phone_number",
-            "phone",
-            "mobile",
-            "msisdn",
-            "is_active",
-        ):
-            if _col_exists(n) and _is_mapped(n):
-                load_names.append(n)
+        for n in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn","is_active"):
+            if _col_exists(n) and _is_mapped(n): load_names.append(n)
 
         seen, only_names = set(), []
         for n in load_names:
             if n not in seen and _is_mapped(n):
-                seen.add(n)
-                only_names.append(n)
+                seen.add(n); only_names.append(n)
         only_attrs = [getattr(User, n) for n in only_names]
 
         user = (
-            db.query(User)
-            .options(noload("*"), load_only(*only_attrs))
-            .filter(or_(*conds))
-            .limit(1)
-        ).first()
+            db.query(User).options(noload("*"), load_only(*only_attrs))
+            .filter(or_(*conds)).limit(1).first()
+        )
 
         if not user:
-            # constant-time burn
-            try:
-                verify_password("dummy", "x" * 60)
-            except Exception:
-                pass
+            try: verify_password("dummy", "x"*60)
+            except Exception: pass
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         hashed_value = getattr(user, pwd_name, None)
@@ -520,30 +439,16 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
         if hasattr(user, "is_active") and getattr(user, "is_active") is False:
             raise HTTPException(status_code=403, detail="Account disabled")
 
-        token = create_access_token({"sub": str(getattr(user, "id", None)), "email": getattr(user, "email", None)})
-
-        if USE_COOKIE_AUTH:
-            response.set_cookie(
-                key=COOKIE_NAME,
-                value=token,
-                max_age=COOKIE_MAX_AGE,
-                expires=COOKIE_MAX_AGE,
-                path=COOKIE_PATH,
-                domain=COOKIE_DOMAIN,
-                secure=COOKIE_SECURE,
-                httponly=True,
-                samesite=COOKIE_SAMESITE,
-            )
-
+        token = _issue_tokens_for_user(user)
+        _set_auth_cookie(response, token)
         return LoginOutput(access_token=token, user=_user_summary_loaded(user, set(only_names)))
 
     except (ProgrammingError, DBAPIError, OperationalError, SQLAlchemyError, StatementError) as e:
         logger.exception("ORM login failed; falling back to SQL: %s", e)
 
-    # RAW SQL fallback (schema-agnostic)
+    # RAW SQL fallback
     row = _sql_fetch_user_by_ident(db, data.identifier)
-    if not row:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not row: raise HTTPException(status_code=401, detail="Invalid credentials")
 
     pwcol = _pwd_col_name()
     hashed_value = row.get(pwcol) if pwcol else None
@@ -551,60 +456,30 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token({"sub": str(row.get("id")), "email": row.get("email")})
-    if USE_COOKIE_AUTH:
-        response.set_cookie(
-            key=COOKIE_NAME,
-            value=token,
-            max_age=COOKIE_MAX_AGE,
-            expires=COOKIE_MAX_AGE,
-            path=COOKIE_PATH,
-            domain=COOKIE_DOMAIN,
-            secure=COOKIE_SECURE,
-            httponly=True,
-            samesite=COOKIE_SAMESITE,
-        )
-
-    if pwcol and pwcol in row:
-        row.pop(pwcol, None)
+    _set_auth_cookie(response, token)
+    if pwcol and pwcol in row: row.pop(pwcol, None)
     names = set(row.keys())
     return LoginOutput(access_token=token, user={k: row.get(k) for k in names})
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Register (ORM first → SQL fallback)
 # ──────────────────────────────────────────────────────────────────────
 def _build_user_kwargs(data: RegisterInput, cols: set[str]) -> Dict[str, Any]:
     kw: Dict[str, Any] = {}
-
-    if "email" in cols and _is_mapped("email"):
-        kw["email"] = _norm_email(data.email)
-
-    if "full_name" in cols and _is_mapped("full_name"):
-        kw["full_name"] = _norm(data.full_name) or None
-
-    for cand in ("username", "user_name", "handle"):
+    if "email" in cols and _is_mapped("email"): kw["email"] = _norm_email(data.email)
+    if "full_name" in cols and _is_mapped("full_name"): kw["full_name"] = (_norm(data.full_name) or None)
+    for cand in ("username","user_name","handle"):
         if cand in cols and _is_mapped(cand) and data.username:
-            kw[cand] = _norm_username(data.username)
-            break
-
+            kw[cand] = _norm_username(data.username); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
-        ph = re.sub(r"\D+", "", data.phone_number)
-        for cand in ("phone_number", "phone", "mobile", "msisdn"):
-            if cand in cols and _is_mapped(cand):
-                kw[cand] = ph
-                break
-
-    if "is_active" in cols and _is_mapped("is_active"):
-        kw.setdefault("is_active", True)
-    if "is_verified" in cols and _is_mapped("is_verified"):
-        kw.setdefault("is_verified", False)
-    if "subscription_status" in cols and _is_mapped("subscription_status"):
-        kw.setdefault("subscription_status", "free")
-    if "role" in cols and _is_mapped("role"):
-        kw.setdefault("role", "user")
-
+        ph = re.sub(r"\D+","", data.phone_number)
+        for cand in ("phone_number","phone","mobile","msisdn"):
+            if cand in cols and _is_mapped(cand): kw[cand] = ph; break
+    if "is_active" in cols and _is_mapped("is_active"): kw.setdefault("is_active", True)
+    if "is_verified" in cols and _is_mapped("is_verified"): kw.setdefault("is_verified", False)
+    if "subscription_status" in cols and _is_mapped("subscription_status"): kw.setdefault("subscription_status", "free")
+    if "role" in cols and _is_mapped("role"): kw.setdefault("role", "user")
     return kw
-
 
 def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
     if not ALLOW_REG:
@@ -616,61 +491,43 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
     uniq_conds: List[Any] = []
     if "email" in cols:
         col = _model_col(User, "email")
-        if col is not None:
-            uniq_conds.append(_safe_eq(col, _norm_email(data.email)))
-
+        if col is not None: uniq_conds.append(_safe_eq(col, _norm_email(data.email)))
     if data.username:
-        for cand in ("username", "user_name", "handle"):
+        for cand in ("username","user_name","handle"):
             if cand in cols:
                 col = _model_col(User, cand)
-                if col is not None:
-                    uniq_conds.append(_safe_eq(col, _norm_username(data.username)))
-                    break
-
+                if col is not None: uniq_conds.append(_safe_eq(col, _norm_username(data.username))); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
-        ph = re.sub(r"\D+", "", data.phone_number)
-        for cand in ("phone_number", "phone", "mobile", "msisdn"):
+        ph = re.sub(r"\D+","", data.phone_number)
+        for cand in ("phone_number","phone","mobile","msisdn"):
             if cand in cols:
                 col = _model_col(User, cand)
-                if col is not None:
-                    uniq_conds.append(col == ph)
-                    break
+                if col is not None: uniq_conds.append(col == ph); break
 
     try:
         if uniq_conds:
-            exists = (
-                db.query(User.id).options(noload("*")).filter(or_(*uniq_conds)).limit(1).first() is not None
-            )
-            if exists:
-                raise HTTPException(status_code=409, detail="User already exists")
-    except HTTPException:
-        raise
+            exists = db.query(User.id).options(noload("*")).filter(or_(*uniq_conds)).limit(1).first() is not None
+            if exists: raise HTTPException(status_code=409, detail="User already exists")
+    except HTTPException: raise
     except Exception as e:
         logger.exception("register.unique_checks(ORM) failed: %s", e)
-        # continue: SQL fallback will also fail if duplicates exist due to DB constraints
+        # continue; DB constraints will still guard
 
     # ORM create
     try:
         user_kwargs = _build_user_kwargs(data, cols)
-
-        _, pwd_name = _first_existing_attr(["hashed_password", "password_hash", "password"])
-        if not pwd_name:
-            raise HTTPException(status_code=500, detail="Password storage not configured")
+        _, pwd_name = _first_existing_attr(["hashed_password","password_hash","password"])
+        if not pwd_name: raise HTTPException(status_code=500, detail="Password storage not configured")
         user_kwargs[pwd_name] = get_password_hash(data.password)
 
         new_user = User(**user_kwargs)
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-
+        db.add(new_user); db.commit(); db.refresh(new_user)
         names_loaded = {n for n in user_kwargs.keys() if _is_mapped(n)} | {"id"}
         return {"message": "Registration successful", "user": _user_summary_loaded(new_user, names_loaded)}
 
     except (ProgrammingError, IntegrityError, DBAPIError, OperationalError, SQLAlchemyError, StatementError) as e:
         logger.exception("ORM register failed; falling back to SQL: %s", e)
-        # SQL fallback insert
         return _sql_insert_user(db, data)
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Routes
@@ -681,11 +538,9 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
         raise HTTPException(status_code=503, detail="Login temporarily unavailable")
     return await _do_login(request, db, response)
 
-
 @legacy_router.post("/login-form", response_model=LoginOutput, summary="Legacy form login")
 async def login_form_legacy(request: Request, response: Response, db: Session = Depends(get_db)):
     return await _do_login(request, db, response)
-
 
 @router.post("/register", status_code=status.HTTP_201_CREATED, summary="Register a new user")
 def register(data: RegisterInput, db: Session = Depends(get_db)):
@@ -693,51 +548,96 @@ def register(data: RegisterInput, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Registration disabled")
     return _register_core(data, db)
 
-
 @router.post("/signup", status_code=status.HTTP_201_CREATED, summary="Signup (alias of register)")
 def signup(data: RegisterInput, db: Session = Depends(get_db)):
     if not _flag("ALLOW_REGISTRATION", "true"):
         raise HTTPException(status_code=403, detail="Registration disabled")
     return _register_core(data, db)
 
-
-@router.get("/me", response_model=MeResponse, summary="Get current user")
+@router.get("/me", response_model=MeResponse, response_model_exclude_none=True, summary="Get current user")
 def me(current_user: Any = Depends(get_current_user)):
     cols = _users_columns()
-    fields = ("id", "email", "username", "full_name", "role", "phone_number", "phone", "mobile", "msisdn")
+    fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
     loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
     return _user_summary_loaded(current_user, loaded)
 
-
 @router.get("/session/verify", summary="Verify current session")
 def verify_session(current_user: Any = Depends(get_current_user)):
-    return {"valid": True, "user": {"id": getattr(current_user, "id", None), "email": getattr(current_user, "email", None)}}
+    return {"valid": True, "user": {"id": str(getattr(current_user, "id", "")), "email": getattr(current_user, "email", None)}}
 
+@router.post("/logout", status_code=204, summary="Logout (clear cookie)")
+def logout(response: Response):
+    _clear_auth_cookie(response)
+    return Response(status_code=204)
+
+@router.post("/token/refresh", summary="Rotate token")
+def token_refresh(request: Request, response: Response):
+    # Accept Bearer or cookie token; decode then mint a new one with fresh exp
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    token = None
+    if auth and auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token:
+        token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    try:
+        claims = decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    sub = str(claims.get("sub") or "")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+
+    new_token = create_access_token({"sub": sub, "email": claims.get("email")})
+    _set_auth_cookie(response, new_token)
+    return {"access_token": new_token, "token_type": "bearer"}
+
+@router.post("/change-password", status_code=204, summary="Change current account password")
+def change_password(data: ChangePasswordInput, db: Session = Depends(get_db), current_user: Any = Depends(get_current_user)):
+    cols = _users_columns()
+    _, pwd_name = _first_existing_attr(["hashed_password","password_hash","password"])
+    if not pwd_name:
+        raise HTTPException(status_code=500, detail="Password storage not configured")
+
+    # Fetch fresh user row with only password column
+    only_attrs = []
+    if hasattr(User, "id"): only_attrs.append(getattr(User, "id"))
+    if hasattr(User, pwd_name): only_attrs.append(getattr(User, pwd_name))
+    user = db.query(User).options(noload("*"), load_only(*only_attrs)).filter(User.id == getattr(current_user, "id")).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    hashed = getattr(user, pwd_name, None)
+    # dummy verify to keep timing consistent
+    ok = bool(hashed and verify_password(data.old_password, hashed))
+    if not ok:
+        try: verify_password("dummy", str(hashed or "x"*60))
+        except Exception: pass
+        raise HTTPException(status_code=401, detail="Old password is incorrect")
+
+    setattr(user, pwd_name, get_password_hash(data.new_password))
+    db.add(user); db.commit()
+    return Response(status_code=204)
 
 @router.get("/_diag", tags=["Auth"], summary="Auth diagnostics")
 def auth_diag():
     return {"users_columns": sorted(list(_users_columns()))}
 
-
 @router.get("/_diag/columns/{table}", tags=["Auth"], include_in_schema=False)
 def diag_columns(table: str, db: Session = Depends(get_db)):
-    rows = db.execute(
-        text(
-            """
+    rows = db.execute(text("""
       SELECT column_name, data_type, is_nullable
       FROM information_schema.columns
       WHERE table_name = :t
       ORDER BY ordinal_position
-    """
-        ),
-        {"t": table},
-    ).mappings().all()
+    """), {"t": table}).mappings().all()
     return {"table": table, "columns": list(rows)}
-
 
 @router.get("/_diag/pwhash", tags=["Auth"], summary="Which password column is used")
 def diag_pwhash():
     return {"password_column": _pwd_col_name()}
-
 
 __all__ = ["router", "legacy_router"]
