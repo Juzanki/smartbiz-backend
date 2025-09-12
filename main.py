@@ -1,7 +1,6 @@
 # backend/main.py
 from __future__ import annotations
 
-import asyncio
 import importlib
 import json
 import logging
@@ -28,7 +27,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Environment helpers
+# Env helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -47,13 +46,12 @@ def _uniq(items: Iterable[Optional[str]]) -> list[str]:
     return out
 
 def _sanitize_db_url(url: str) -> str:
-    # Hide password; show host/db for diagnostics only
     if not url:
         return ""
     return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paths & basic env
+# Paths & base env
 # ──────────────────────────────────────────────────────────────────────────────
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -63,11 +61,11 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
 
-# DB wiring comes from your db module
+# DB wiring (support both relative and package import layouts)
 try:
-    from db import Base, SessionLocal, engine
+    from db import Base, SessionLocal, engine  # type: ignore
 except Exception:
-    from backend.db import Base, SessionLocal, engine  # fallback for some layouts
+    from backend.db import Base, SessionLocal, engine  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -96,7 +94,7 @@ root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional: auto-detect password column (hashed_password vs password_hash)
+# Optional: detect password column name once
 # ──────────────────────────────────────────────────────────────────────────────
 with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
@@ -119,6 +117,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             logger.exception("security-mw: %s", e)
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        # Conservative, FE uses fetch; CSP left to CDN
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer-when-downgrade")
@@ -147,7 +146,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB quick ping
+# DB ping
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _db_ping() -> bool:
@@ -170,8 +169,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Add graceful cleanup if you spawn background tasks
-        pass
+        pass  # add graceful cleanup if you spawn tasks
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
@@ -188,12 +186,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Proxy headers (Render)
+# Honor X-Forwarded-* from Render proxy
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-# Trusted hosts (optional)
+# Trusted hosts
 trusted = env_list("TRUSTED_HOSTS")
 if trusted:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted)
@@ -204,22 +202,19 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS for Netlify + custom domain + previews
+# CORS (Netlify + custom domain + localhost + deploy previews)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _resolve_cors_origins() -> list[str]:
     defaults = [
-        # Your custom domain(s)
         "https://smartbiz.site",
         "https://www.smartbiz.site",
-        # Netlify main site
         "https://smartbizsite.netlify.app",
-        # Local dev
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
     env_origins = env_list("ALLOWED_ORIGINS") + env_list("CORS_ORIGINS")
-    env_urls = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "VITE_WEB_URL", "VITE_APP_URL", "NETLIFY_PUBLIC_URL")]
+    env_urls = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "VITE_API_BASE_URL", "NETLIFY_PUBLIC_URL")]
     return _uniq([*env_origins, *env_urls, *defaults])
 
 ALLOW_ORIGINS = _resolve_cors_origins()
@@ -253,7 +248,7 @@ else:
         max_age=86400,
     )
 
-# Preflight catch-all (helps when proxies are in front)
+# OPTIONS catch-all (preflight must succeed even if auth guards exist)
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
@@ -269,7 +264,7 @@ class _Uploads(StaticFiles):
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB init (dev-only auto create)
+# DB init (dev only)
 # ──────────────────────────────────────────────────────────────────────────────
 
 if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
@@ -284,7 +279,7 @@ def get_db() -> Session:
         db.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exception handlers
+# Exceptions
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.exception_handler(ClientDisconnect)
@@ -308,7 +303,7 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Include routers (twice: "" and "/api" prefixes)
+# Include routers (both "" and "/api" if configured)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _safe_include(module_path: str, *, attr: str = "router", prefixes: list[str] = [""]) -> None:
@@ -321,44 +316,32 @@ def _safe_include(module_path: str, *, attr: str = "router", prefixes: list[str]
         for p in prefixes:
             app.include_router(r, prefix=p)
 
-# Primary routers
 prefixes = _uniq(["", *([p.strip() for p in os.getenv("API_PREFIXES", "/api").split(",") if p.strip()])])
 
-# Auth
-with suppress(Exception):
-    from routes.auth_routes import router as auth_router
-    _safe_include("routes.auth_routes", prefixes=prefixes)
-with suppress(Exception):
-    from backend.routes.auth_routes import router as auth_router2
-    _safe_include("backend.routes.auth_routes", prefixes=prefixes)
-
-# Optional routes (add as you have them)
+# Known routers (optional presence)
 for mod in [
+    "routes.auth_routes",
     "routes.invoice",
     "routes.owner_routes",
     "routes.order_notification",
     "routes.ai_responder",
+    "backend.routes.auth_routes",
     "backend.routes.invoice",
     "backend.routes.owner_routes",
     "backend.routes.order_notification",
     "backend.routes.ai_responder",
+    "api.health",
+    "backend.api.health",
+    "websocket.ws_routes",
+    "backend.websocket.ws_routes",
 ]:
-    _safe_include(mod, prefixes=prefixes)
-
-# Health (from backend/api/health.py created earlier)
-_safe_include("api.health", prefixes=prefixes)
-_safe_include("backend.api.health", prefixes=prefixes)
-
-# WebSocket (if exists)
-_safe_include("websocket.ws_routes", prefixes=[""])
-_safe_include("backend.websocket.ws_routes", prefixes=[""])
+    _safe_include(mod, prefixes=prefixes if not mod.endswith(("ws_routes",)) else [""])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AUTH ALIASES: handle /signup, /register, /login WITH and WITHOUT /api
+# Auth aliases (/signup, /register, /login) with and without /api
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _register_auth_aliases(pref: str):
-    # Bind current prefix in default arg to avoid late-binding in loops
     p = pref
 
     @app.post(f"{p}/signup", include_in_schema=False, tags=["Auth"])
@@ -377,7 +360,7 @@ for pref in prefixes:
     _register_auth_aliases(pref)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Root & debug
+# Diagnostics & health
 # ──────────────────────────────────────────────────────────────────────────────
 
 class WhatsAppMessage(BaseModel):
@@ -402,11 +385,16 @@ async def info():
     return {
         "env": ENVIRONMENT,
         "db": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-        "cors_mode": CORS_MODE,
+        "cors_mode": os.getenv("CORS_MODE", "strict"),
         "allow_origins": ALLOW_ORIGINS,
-        "allow_origin_regex": ALLOW_ORIGIN_REGEX,
+        "allow_origin_regex": os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX),
         "api_prefixes": prefixes,
     }
+
+# Super-light health (no DB)
+@app.get("/health", include_in_schema=False)
+async def health():
+    return {"ok": True}
 
 @app.get("/healthz", tags=["Health"])
 async def healthz():
@@ -419,6 +407,11 @@ async def readyz():
 @app.get("/dbz", tags=["Health"])
 async def dbz():
     return {"db_ok": _db_ping()}
+
+# Public POST echo for CORS test (no JWT)
+@app.post("/echo", include_in_schema=False)
+async def echo(payload: dict):
+    return {"ok": True, "you_sent": payload}
 
 if env_bool("DEBUG", False):
     @app.get("/_routes", tags=["Debug"])
