@@ -9,7 +9,8 @@ Endpoints
 - POST /auth/login             (email | username | phone)
 - POST /auth/register          (creates user)
 - POST /auth/signup            (alias)
-- GET  /auth/me                (requires get_current_user)
+- GET  /auth/me                (claims or ORM User; resilient)
+- GET  /auth/_whoami           (debug: raw current user/claims)
 - POST /auth/logout            (clears cookie)
 - POST /auth/token/refresh     (rotates short-lived token)
 - POST /auth/change-password   (change own password)
@@ -75,7 +76,7 @@ except Exception:  # dev fallback (sha256) — switch to bcrypt/argon2 in produc
 # Token helpers (create + decode + dependency get_current_user)
 try:
     from backend.auth import create_access_token, decode_token, get_current_user  # type: ignore
-except Exception:  # dev fallback (unsigned base64 "token" w/o decode)
+except Exception:  # dev fallback (unsigned base64 "token")
     def create_access_token(data: dict, minutes: int = 60 * 24) -> str:
         payload = data.copy()
         payload["exp"] = int(time.time()) + minutes * 60
@@ -117,7 +118,7 @@ COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
 COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", "").strip() or None
 
 # Optional: refresh policy (shorter access + refresh window)
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # default 1 day
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))   # 1 day
 REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
 
 # Rate limiter (identifier+IP)
@@ -220,7 +221,7 @@ class RegisterInput(BaseModel):
 
 class MeResponse(BaseModel):
     id: Any
-    email: EmailStr
+    email: Optional[EmailStr] = None          # ← hiari ili kuepuka 500 kama claims haina email
     username: Optional[str] = None
     full_name: Optional[str] = None
     role: Optional[str] = None
@@ -264,8 +265,8 @@ def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
     return out
 
 def _issue_tokens_for_user(user: Any) -> str:
-    # Single access token (you can extend to refresh pair if needed)
-    return create_access_token({"sub": str(getattr(user, "id", None)), "email": getattr(user, "email", None)})
+    return create_access_token({"sub": str(getattr(user, "id", None)),
+                                "email": getattr(user, "email", None)})
 
 def _set_auth_cookie(response: Response, token: str) -> None:
     if USE_COOKIE_AUTH:
@@ -288,7 +289,8 @@ def _sql_fetch_user_by_ident(db: Session, ident: str) -> Optional[Dict[str, Any]
         raise HTTPException(status_code=500, detail="Password storage not configured")
 
     select_cols = ["id"]
-    for cand in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn",pwcol):
+    for cand in ("email","full_name","role","username","user_name","handle",
+                 "phone_number","phone","mobile","msisdn",pwcol):
         if cand in cols:
             select_cols.append(cand)
     sel = ", ".join(f'"{c}"' for c in select_cols)
@@ -326,7 +328,7 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
     for cand in ("username","user_name","handle"):
         if cand in cols: fields[cand] = _norm_username(data.username); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
-        ph = re.sub(r"\D+", "", data.phone_number)
+        ph = re.sub(r"\D+","", data.phone_number)
         for cand in ("phone_number","phone","mobile","msisdn"):
             if cand in cols: fields[cand] = ph; break
     if "is_active" in cols: fields.setdefault("is_active", True)
@@ -511,7 +513,6 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
     except HTTPException: raise
     except Exception as e:
         logger.exception("register.unique_checks(ORM) failed: %s", e)
-        # continue; DB constraints will still guard
 
     # ORM create
     try:
@@ -554,16 +555,42 @@ def signup(data: RegisterInput, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Registration disabled")
     return _register_core(data, db)
 
+# ── ME (resilient: claims or ORM User) + WHOAMI (debug)
 @router.get("/me", response_model=MeResponse, response_model_exclude_none=True, summary="Get current user")
 def me(current_user: Any = Depends(get_current_user)):
+    # 1) If dependency returned dict claims
+    if isinstance(current_user, dict):
+        return {
+            "id": str(current_user.get("sub") or ""),
+            "email": current_user.get("email") or None,
+            "username": None,
+            "full_name": current_user.get("name") or None,
+            "role": current_user.get("role") or None,
+            "phone_number": None,
+        }
+    # 2) ORM user path (no relationships)
     cols = _users_columns()
     fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
     loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
     return _user_summary_loaded(current_user, loaded)
 
+@router.get("/_whoami", tags=["Auth"], summary="Debug: raw current user/claims")
+def whoami_raw(current_user: Any = Depends(get_current_user)):
+    try:
+        from pydantic.json import pydantic_encoder
+        import json
+        return json.loads(json.dumps(current_user, default=pydantic_encoder))
+    except Exception:
+        if isinstance(current_user, dict):
+            return current_user
+        return {"id": str(getattr(current_user, "id", "")),
+                "email": getattr(current_user, "email", None)}
+
 @router.get("/session/verify", summary="Verify current session")
 def verify_session(current_user: Any = Depends(get_current_user)):
-    return {"valid": True, "user": {"id": str(getattr(current_user, "id", "")), "email": getattr(current_user, "email", None)}}
+    uid = getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("sub")
+    email = getattr(current_user, "email", None) if not isinstance(current_user, dict) else current_user.get("email")
+    return {"valid": True, "user": {"id": str(uid or ""), "email": email}}
 
 @router.post("/logout", status_code=204, summary="Logout (clear cookie)")
 def logout(response: Response):
@@ -572,7 +599,6 @@ def logout(response: Response):
 
 @router.post("/token/refresh", summary="Rotate token")
 def token_refresh(request: Request, response: Response):
-    # Accept Bearer or cookie token; decode then mint a new one with fresh exp
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     token = None
     if auth and auth.lower().startswith("bearer "):
@@ -596,22 +622,28 @@ def token_refresh(request: Request, response: Response):
     return {"access_token": new_token, "token_type": "bearer"}
 
 @router.post("/change-password", status_code=204, summary="Change current account password")
-def change_password(data: ChangePasswordInput, db: Session = Depends(get_db), current_user: Any = Depends(get_current_user)):
+def change_password(
+    data: ChangePasswordInput,
+    db: Session = Depends(get_db),
+    current_user: Any = Depends(get_current_user),
+):
     cols = _users_columns()
     _, pwd_name = _first_existing_attr(["hashed_password","password_hash","password"])
     if not pwd_name:
         raise HTTPException(status_code=500, detail="Password storage not configured")
 
-    # Fetch fresh user row with only password column
     only_attrs = []
     if hasattr(User, "id"): only_attrs.append(getattr(User, "id"))
     if hasattr(User, pwd_name): only_attrs.append(getattr(User, pwd_name))
-    user = db.query(User).options(noload("*"), load_only(*only_attrs)).filter(User.id == getattr(current_user, "id")).first()
+    uid = getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("sub")
+    user = (
+        db.query(User).options(noload("*"), load_only(*only_attrs))
+        .filter(User.id == uid).first()
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     hashed = getattr(user, pwd_name, None)
-    # dummy verify to keep timing consistent
     ok = bool(hashed and verify_password(data.old_password, hashed))
     if not ok:
         try: verify_password("dummy", str(hashed or "x"*60))
