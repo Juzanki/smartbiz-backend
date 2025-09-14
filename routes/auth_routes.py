@@ -3,27 +3,28 @@
 from __future__ import annotations
 
 """
-SmartBiz Auth Router (resilient, extended)
-------------------------------------------
+SmartBiz Auth Router (production-ready)
+--------------------------------------
 Endpoints
-- POST /auth/login             (email | username | phone)
-- POST /auth/register          (creates user)
-- POST /auth/signup            (alias)
-- GET  /auth/me                (claims or ORM User; resilient)
-- GET  /auth/_whoami           (debug: raw current user/claims)
-- POST /auth/logout            (clears cookie)
-- POST /auth/token/refresh     (rotates short-lived token)
+- POST /auth/login             (email | username | phone; JSON or form)
+- POST /auth/register          (creates user)       [201 Created]
+- POST /auth/signup            (alias of register)  [201 Created]
+- GET  /auth/me                (current user from token/cookie)
+- GET  /auth/_whoami           (debug: raw current claims/user)
+- POST /auth/logout            (clear cookie)
+- POST /auth/token/refresh     (rotate short-lived token)
 - POST /auth/change-password   (change own password)
-- GET  /auth/session/verify
-- GET  /auth/_diag
+- GET  /auth/session/verify    (true/false)
+- GET  /auth/_diag             (columns)
 - GET  /auth/_diag/columns/{table}
 - GET  /auth/_diag/pwhash
 
 Highlights
+- Flexible identifier (email/username/phone) + JSON/form support.
 - Works even when ORM model != DB schema (SQL fallbacks).
-- Auto-detects password column; override via SMARTBIZ_PWHASH_COL.
-- Cookie auth (SameSite=None; Secure) or bearer token.
-- Gentle rate limit per (identifier, IP).
+- Password column auto-detect (override: SMARTBIZ_PWHASH_COL).
+- JWT (HS256, PyJWT), HttpOnly cookie (SameSite=None; Secure).
+- Gentle in-memory rate-limit per (identifier, IP).
 """
 
 import base64
@@ -32,9 +33,11 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, validator
 from sqlalchemy import func, or_, text
@@ -53,49 +56,100 @@ from sqlalchemy.orm import Session, load_only, noload
 # ──────────────────────────────────────────────────────────────────────
 try:
     from db import get_db, engine  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     from backend.db import get_db, engine  # type: ignore
 
 try:
     from models.user import User  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     from backend.models.user import User  # type: ignore
 
 # ──────────────────────────────────────────────────────────────────────
-# Security helpers & token
+# Security helpers (hash/verify)
 # ──────────────────────────────────────────────────────────────────────
 try:
+    # recommended: passlib/bcrypt helpers
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
-except Exception:  # dev fallback (sha256) — switch to bcrypt/argon2 in production
-    import hashlib, hmac
-    def get_password_hash(pw: str) -> str:
-        return hashlib.sha256(pw.encode("utf-8")).hexdigest()
-    def verify_password(pw: str, hashed: str) -> bool:
-        return hmac.compare_digest(get_password_hash(pw), hashed)
+except Exception:  # secure fallback if helper missing (bcrypt preferred in prod)
+    from passlib.hash import bcrypt
 
-# Token helpers (create + decode + dependency get_current_user)
-try:
-    from backend.auth import create_access_token, decode_token, get_current_user  # type: ignore
-except Exception:  # dev fallback (unsigned base64 "token")
-    def create_access_token(data: dict, minutes: int = 60 * 24) -> str:
-        payload = data.copy()
-        payload["exp"] = int(time.time()) + minutes * 60
-        return base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode()
-    def decode_token(token: str) -> Dict[str, Any]:
-        body = token.split(".")[1] if "." in token else token
-        pad = "=" * ((4 - len(body) % 4) % 4)
-        return _json.loads(base64.urlsafe_b64decode(body + pad).decode())
-    def get_current_user():
-        raise RuntimeError("get_current_user not wired")
+    def get_password_hash(pw: str) -> str:
+        return bcrypt.hash(pw)
+
+    def verify_password(pw: str, hashed: str) -> bool:
+        try:
+            return bcrypt.verify(pw, hashed)
+        except Exception:
+            return False
+
+# ──────────────────────────────────────────────────────────────────────
+# JWT (PyJWT)
+# ──────────────────────────────────────────────────────────────────────
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    # fail-safe for first boot; strongly advise setting SECRET_KEY in prod
+    SECRET_KEY = base64.urlsafe_b64encode(os.urandom(48)).decode()
+
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))      # 1 day
+REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))   # 30 days
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> str:
+    now = _now()
+    payload = {
+        "typ": "access",
+        "iss": "smartbiz-api",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=minutes)).timestamp()),
+        **claims,
+    }
+    # normalize UUID/datetime-like
+    if "sub" in payload:
+        payload["sub"] = str(payload["sub"])
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
+
+def decode_token(token: str) -> Dict[str, Any]:
+    return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+
+def _extract_token(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    cookie_name = os.getenv("AUTH_COOKIE_NAME", "sb_access")
+    return request.cookies.get(cookie_name)
+
+def get_current_user_from_token(request: Request) -> Dict[str, Any]:
+    token = _extract_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        return decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 # ──────────────────────────────────────────────────────────────────────
 # Setup
 # ──────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("smartbiz.auth")
 router = APIRouter(prefix="/auth", tags=["Auth"])
-legacy_router = APIRouter(tags=["Auth"])  # e.g. /login-form
+legacy_router = APIRouter(tags=["Auth"])  # optional legacy aliases
 
-# Flags / config
+# Cookie settings
+USE_COOKIE_AUTH = os.getenv("USE_COOKIE_AUTH", "true").lower() in {"1", "true", "yes", "on", "y"}
+COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
+COOKIE_MAX_AGE = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))
+COOKIE_PATH = os.getenv("AUTH_COOKIE_PATH", "/")
+COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() in {"1", "true", "yes", "on", "y"}
+COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
+COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
+
+# Allow phone login?
+ALLOW_PHONE_LOGIN = os.getenv("AUTH_LOGIN_ALLOW_PHONE", "false").lower() in {"1", "true", "yes", "on", "y"}
+
+# Registration
 def _flag(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on", "y"}
 
@@ -105,23 +159,9 @@ ALLOW_REG = (
     or _flag("SIGNUP_ENABLED", "true")
     or _flag("SMARTBIZ_ALLOW_SIGNUP", "true")
 )
-ALLOW_PHONE_LOGIN = _flag("AUTH_LOGIN_ALLOW_PHONE", "false")
-LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
-LOGIN_MAINTENANCE = _flag("AUTH_LOGIN_MAINTENANCE", "0")
-
-USE_COOKIE_AUTH = _flag("USE_COOKIE_AUTH", "true")
-COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
-COOKIE_MAX_AGE = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))
-COOKIE_PATH = os.getenv("AUTH_COOKIE_PATH", "/")
-COOKIE_SECURE = _flag("AUTH_COOKIE_SECURE", "true")
-COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
-COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", "").strip() or None
-
-# Optional: refresh policy (shorter access + refresh window)
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))   # 1 day
-REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days
 
 # Rate limiter (identifier+IP)
+LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
 def _rate_ok(key: str) -> bool:
@@ -154,9 +194,7 @@ def _users_columns() -> set[str]:
     from sqlalchemy import inspect as _inspect
     try:
         insp = _inspect(engine)
-        cols = {c["name"] for c in insp.get_columns("users")}
-        logger.info("auth._users_columns = %s", sorted(cols))
-        return cols
+        return {c["name"] for c in insp.get_columns("users")}
     except Exception as e:
         logger.warning("Could not inspect users table: %s", e)
         return {"id", "email"}
@@ -165,7 +203,6 @@ def _col_exists(name: str) -> bool: return name in _users_columns()
 def _is_mapped(name: str) -> bool: return hasattr(User, name)
 
 def _model_col(model, name: str):
-    """Prefer mapped attr; else fallback to raw table column if present."""
     try:
         if hasattr(model, name):
             return getattr(model, name)
@@ -174,7 +211,6 @@ def _model_col(model, name: str):
         return None
 
 def _first_existing_attr(candidates: List[str]) -> Tuple[Optional[Any], Optional[str]]:
-    """Pick the password column mapped on the model (env override supported)."""
     prefer = os.getenv("SMARTBIZ_PWHASH_COL")
     if prefer and _col_exists(prefer) and hasattr(User, prefer):
         return getattr(User, prefer), prefer
@@ -221,7 +257,7 @@ class RegisterInput(BaseModel):
 
 class MeResponse(BaseModel):
     id: Any
-    email: Optional[EmailStr] = None          # ← hiari ili kuepuka 500 kama claims haina email
+    email: Optional[EmailStr] = None
     username: Optional[str] = None
     full_name: Optional[str] = None
     role: Optional[str] = None
@@ -375,12 +411,9 @@ async def _parse_login(request: Request) -> _LoginPayload:
     return _LoginPayload(identifier=ident_raw, password=password)
 
 async def _do_login(request: Request, db: Session, response: Response) -> LoginOutput:
-    if LOGIN_MAINTENANCE:
-        raise HTTPException(status_code=503, detail="Login temporarily unavailable")
-
     data = await _parse_login(request)
 
-    # Rate limit
+    # rate limit
     ip = request.client.host if request.client else "0.0.0.0"
     if not _rate_ok(f"{data.identifier}|{ip}"):
         raise HTTPException(status_code=429, detail="too_many_attempts")
@@ -428,7 +461,6 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
             db.query(User).options(noload("*"), load_only(*only_attrs))
             .filter(or_(*conds)).limit(1).first()
         )
-
         if not user:
             try: verify_password("dummy", "x"*60)
             except Exception: pass
@@ -510,7 +542,8 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
         if uniq_conds:
             exists = db.query(User.id).options(noload("*")).filter(or_(*uniq_conds)).limit(1).first() is not None
             if exists: raise HTTPException(status_code=409, detail="User already exists")
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("register.unique_checks(ORM) failed: %s", e)
 
@@ -535,8 +568,6 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────
 @router.post("/login", response_model=LoginOutput, summary="Login (email/username/phone)")
 async def login(request: Request, response: Response, db: Session = Depends(get_db)):
-    if _flag("AUTH_LOGIN_MAINTENANCE", "0"):
-        raise HTTPException(status_code=503, detail="Login temporarily unavailable")
     return await _do_login(request, db, response)
 
 @legacy_router.post("/login-form", response_model=LoginOutput, summary="Legacy form login")
@@ -545,52 +576,52 @@ async def login_form_legacy(request: Request, response: Response, db: Session = 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED, summary="Register a new user")
 def register(data: RegisterInput, db: Session = Depends(get_db)):
-    if not _flag("ALLOW_REGISTRATION", "true"):
-        raise HTTPException(status_code=403, detail="Registration disabled")
     return _register_core(data, db)
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED, summary="Signup (alias of register)")
 def signup(data: RegisterInput, db: Session = Depends(get_db)):
-    if not _flag("ALLOW_REGISTRATION", "true"):
-        raise HTTPException(status_code=403, detail="Registration disabled")
     return _register_core(data, db)
 
-# ── ME (resilient: claims or ORM User) + WHOAMI (debug)
 @router.get("/me", response_model=MeResponse, response_model_exclude_none=True, summary="Get current user")
-def me(current_user: Any = Depends(get_current_user)):
-    # 1) If dependency returned dict claims
-    if isinstance(current_user, dict):
-        return {
-            "id": str(current_user.get("sub") or ""),
-            "email": current_user.get("email") or None,
-            "username": None,
-            "full_name": current_user.get("name") or None,
-            "role": current_user.get("role") or None,
-            "phone_number": None,
-        }
-    # 2) ORM user path (no relationships)
-    cols = _users_columns()
-    fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
-    loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
-    return _user_summary_loaded(current_user, loaded)
+def me(request: Request, db: Session = Depends(get_db)):
+    claims = get_current_user_from_token(request)
+    # Try ORM fetch (optional)
+    uid = claims.get("sub")
+    u = None
+    try:
+        if hasattr(User, "id") and uid:
+            u = db.query(User).options(noload("*")).filter(User.id == uid).first()
+    except Exception:
+        u = None
+    if u:
+        cols = _users_columns()
+        fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
+        loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
+        return _user_summary_loaded(u, loaded)
+    # fallback to claims
+    return {
+        "id": str(claims.get("sub") or ""),
+        "email": claims.get("email") or None,
+        "username": None,
+        "full_name": claims.get("name") or None,
+        "role": claims.get("role") or None,
+        "phone_number": None,
+    }
 
 @router.get("/_whoami", tags=["Auth"], summary="Debug: raw current user/claims")
-def whoami_raw(current_user: Any = Depends(get_current_user)):
+def whoami_raw(request: Request):
     try:
-        from pydantic.json import pydantic_encoder
-        import json
-        return json.loads(json.dumps(current_user, default=pydantic_encoder))
-    except Exception:
-        if isinstance(current_user, dict):
-            return current_user
-        return {"id": str(getattr(current_user, "id", "")),
-                "email": getattr(current_user, "email", None)}
+        return get_current_user_from_token(request)
+    except HTTPException as e:
+        return {"error": e.detail}
 
 @router.get("/session/verify", summary="Verify current session")
-def verify_session(current_user: Any = Depends(get_current_user)):
-    uid = getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("sub")
-    email = getattr(current_user, "email", None) if not isinstance(current_user, dict) else current_user.get("email")
-    return {"valid": True, "user": {"id": str(uid or ""), "email": email}}
+def verify_session(request: Request):
+    try:
+        claims = get_current_user_from_token(request)
+        return {"valid": True, "user": {"id": str(claims.get("sub") or ""), "email": claims.get("email")}}
+    except HTTPException:
+        return {"valid": False}
 
 @router.post("/logout", status_code=204, summary="Logout (clear cookie)")
 def logout(response: Response):
@@ -599,24 +630,16 @@ def logout(response: Response):
 
 @router.post("/token/refresh", summary="Rotate token")
 def token_refresh(request: Request, response: Response):
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    token = None
-    if auth and auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-    if not token:
-        token = request.cookies.get(COOKIE_NAME)
+    token = _extract_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="Missing token")
-
     try:
         claims = decode_token(token)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
     sub = str(claims.get("sub") or "")
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token subject")
-
     new_token = create_access_token({"sub": sub, "email": claims.get("email")})
     _set_auth_cookie(response, new_token)
     return {"access_token": new_token, "token_type": "bearer"}
@@ -625,8 +648,10 @@ def token_refresh(request: Request, response: Response):
 def change_password(
     data: ChangePasswordInput,
     db: Session = Depends(get_db),
-    current_user: Any = Depends(get_current_user),
+    request: Request = None,
 ):
+    claims = get_current_user_from_token(request)
+    uid = claims.get("sub")
     cols = _users_columns()
     _, pwd_name = _first_existing_attr(["hashed_password","password_hash","password"])
     if not pwd_name:
@@ -635,7 +660,6 @@ def change_password(
     only_attrs = []
     if hasattr(User, "id"): only_attrs.append(getattr(User, "id"))
     if hasattr(User, pwd_name): only_attrs.append(getattr(User, pwd_name))
-    uid = getattr(current_user, "id", None) if not isinstance(current_user, dict) else current_user.get("sub")
     user = (
         db.query(User).options(noload("*"), load_only(*only_attrs))
         .filter(User.id == uid).first()
