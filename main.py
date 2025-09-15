@@ -1,4 +1,3 @@
-# backend/main.py
 from __future__ import annotations
 
 import importlib
@@ -117,12 +116,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             logger.exception("security-mw: %s", e)
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # Conservative, FE uses fetch; CSP left to CDN
+        # Security headers for production
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "no-referrer-when-downgrade")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("X-XSS-Protection", "1; mode=block")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        # Content Security Policy for enhanced security
+        csp_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;"
+        response.headers.setdefault("Content-Security-Policy", csp_policy)
         return response
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -163,13 +165,28 @@ def _db_ping() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Backend starting (env=%s, db=%s)", ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL", "")))
+    logger.info("SmartBiz Backend starting (env=%s, db=%s)", ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL", "")))
+    logger.info("Render deployment detected - configuring for production")
+    
+    # Database health check
     if not _db_ping():
-        logger.warning("Database ping failed at startup.")
+        logger.error("Database connection failed at startup!")
+        # Don't crash, but log heavily
+    else:
+        logger.info("Database connection successful")
+    
+    # Auto-create tables in development only
+    if ENVIRONMENT != "production" and env_bool("AUTO_CREATE_TABLES", True):
+        try:
+            Base.metadata.create_all(bind=engine, checkfirst=True)
+            logger.info("Database tables verified/created")
+        except Exception as e:
+            logger.warning("Could not auto-create tables: %s", e)
+    
     try:
         yield
     finally:
-        pass  # add graceful cleanup if you spawn tasks
+        logger.info("SmartBiz Backend shutting down")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
@@ -178,7 +195,7 @@ async def lifespan(app: FastAPI):
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
-    description="SmartBiz Assistance backend",
+    description="SmartBiz Assistance Backend for Render + Netlify Deployment",
     version=os.getenv("APP_VERSION", "1.0.0"),
     docs_url="/docs" if _docs_enabled else None,
     redoc_url="/redoc" if _docs_enabled else None,
@@ -186,15 +203,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Honor X-Forwarded-* from Render proxy
+# Render proxy headers configuration
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
-# Trusted hosts
-trusted = env_list("TRUSTED_HOSTS")
-if trusted:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted)
+# Trusted hosts for Render
+trusted_hosts = env_list("TRUSTED_HOSTS") or [
+    ".onrender.com",
+    ".smartbiz.site",
+    "localhost",
+    "127.0.0.1"
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
 # Compression + security + request-id
 app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -202,59 +223,63 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS (Netlify + custom domain + localhost + deploy previews)
+# CORS Configuration for Netlify Frontend
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _resolve_cors_origins() -> list[str]:
+    # Netlify URLs
+    netlify_default = "sprightly-naiad-bcfd2a.netlify.app"
+    netlify_custom = "smartbiz.site"
+    
     defaults = [
-        "https://smartbiz.site",
-        "https://www.smartbiz.site",
-        "https://smartbizsite.netlify.app",
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:4173", "http://127.0.0.1:4173",
+        f"https://{netlify_default}",
+        f"https://{netlify_custom}",
+        f"https://www.{netlify_custom}",
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "http://localhost:4173", 
+        "http://127.0.0.1:4173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ]
+    
+    # Environment variables
     env_origins = env_list("ALLOWED_ORIGINS") + env_list("CORS_ORIGINS")
-    env_urls = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "VITE_API_BASE_URL", "NETLIFY_PUBLIC_URL")]
-    return _uniq([*env_origins, *env_urls, *defaults])
+    env_urls = [
+        os.getenv("FRONTEND_URL"), 
+        os.getenv("WEB_URL"), 
+        os.getenv("VITE_API_BASE_URL"), 
+        os.getenv("NETLIFY_PUBLIC_URL"),
+        os.getenv("RENDER_PUBLIC_URL")
+    ]
+    
+    return _uniq([*env_origins, *[url for url in env_urls if url], *defaults])
 
 ALLOW_ORIGINS = _resolve_cors_origins()
 DEFAULT_REGEX = (
-    r"^https:\/\/([0-9a-z\-]+--)?smartbizsite\.netlify\.app$"  # Netlify deploy previews
-    r"|^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"
+    r"^https:\/\/([0-9a-z\-]+--)?sprightly-naiad-bcfd2a\.netlify\.app$|"  # Netlify deploy previews
+    r"^https:\/\/([a-zA-Z0-9\-]+\.)?smartbiz\.site$|"  # Custom domain
+    r"^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"  # Local development
 )
-ALLOW_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX)
 
-CORS_MODE = os.getenv("CORS_MODE", "strict").strip().lower()  # strict|allow-any|dev-safe
-if CORS_MODE == "allow-any":
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[],
-        allow_origin_regex=r".*",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-        max_age=86400,
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOW_ORIGINS,
-        allow_origin_regex=ALLOW_ORIGIN_REGEX if CORS_MODE != "strict" else None,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-        max_age=86400,
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,
+    allow_origin_regex=DEFAULT_REGEX,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
+)
 
-# OPTIONS catch-all (preflight must succeed even if auth guards exist)
+# OPTIONS catch-all for preflight requests
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Static /uploads
+# Static files serving
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _Uploads(StaticFiles):
@@ -264,12 +289,8 @@ class _Uploads(StaticFiles):
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB init (dev only)
+# Database session dependency
 # ──────────────────────────────────────────────────────────────────────────────
-
-if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
-    with suppress(Exception):
-        Base.metadata.create_all(bind=engine, checkfirst=True)
 
 def get_db() -> Session:
     db = SessionLocal()
@@ -279,7 +300,7 @@ def get_db() -> Session:
         db.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exceptions
+# Exception handlers
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.exception_handler(ClientDisconnect)
@@ -299,46 +320,74 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 async def unhandled_exception_handler(_: Request, exc: Exception):
     if isinstance(exc, anyio.EndOfStream):
         return Response(status_code=499)
-    logger.exception("unhandled: %s", exc)
+    logger.exception("Unhandled exception: %s", exc)
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Include routers (both "" and "/api" if configured)
+# Router imports
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _safe_include(module_path: str, *, attr: str = "router", prefixes: list[str] = [""]) -> None:
-    with suppress(Exception):
+    try:
         mod = importlib.import_module(module_path)
         r = getattr(mod, attr, None)
         if r is None:
-            logger.warning("Router attr '%s' missing in %s", attr, module_path)
+            logger.warning("Router attribute '%s' missing in %s", attr, module_path)
             return
         for p in prefixes:
             app.include_router(r, prefix=p)
+            logger.debug("Included router %s with prefix %s", module_path, p)
+    except ImportError as e:
+        logger.debug("Module %s not available: %s", module_path, e)
+    except Exception as e:
+        logger.error("Failed to include router %s: %s", module_path, e)
 
+# Configure API prefixes
 prefixes = _uniq(["", *([p.strip() for p in os.getenv("API_PREFIXES", "/api").split(",") if p.strip()])])
 
-# Known routers (optional presence)
-for mod in [
+# Import all available routers
+routers_to_try = [
+    "routes.auth",
     "routes.auth_routes",
     "routes.invoice",
+    "routes.owner",
     "routes.owner_routes",
+    "routes.order",
     "routes.order_notification",
+    "routes.ai",
     "routes.ai_responder",
+    "routes.chat",
+    "routes.payments",
+    "routes.wallet",
+    "api.health",
+    "api.status",
+    "websocket.ws",
+    "websocket.ws_routes",
+    
+    # Backend package paths
+    "backend.routes.auth",
     "backend.routes.auth_routes",
     "backend.routes.invoice",
+    "backend.routes.owner",
     "backend.routes.owner_routes",
+    "backend.routes.order",
     "backend.routes.order_notification",
+    "backend.routes.ai",
     "backend.routes.ai_responder",
-    "api.health",
+    "backend.routes.chat",
+    "backend.routes.payments",
+    "backend.routes.wallet",
     "backend.api.health",
-    "websocket.ws_routes",
+    "backend.api.status",
+    "backend.websocket.ws",
     "backend.websocket.ws_routes",
-]:
-    _safe_include(mod, prefixes=prefixes if not mod.endswith(("ws_routes",)) else [""])
+]
+
+for router_module in routers_to_try:
+    _safe_include(router_module, prefixes=prefixes)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Auth aliases (/signup, /register, /login) with and without /api
+# Auth aliases for convenience
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _register_auth_aliases(pref: str):
@@ -360,7 +409,7 @@ for pref in prefixes:
     _register_auth_aliases(pref)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Diagnostics & health
+# Core API endpoints
 # ──────────────────────────────────────────────────────────────────────────────
 
 class WhatsAppMessage(BaseModel):
@@ -376,53 +425,71 @@ async def root():
         "message": "SmartBiz Assistance API",
         "status": "running",
         "version": app.version,
-        "env": ENVIRONMENT,
-        "api_prefixes": prefixes,
+        "environment": ENVIRONMENT,
+        "deployment": "Render + Netlify",
+        "database": "connected" if _db_ping() else "disconnected",
+        "documentation": "/docs" if _docs_enabled else "disabled",
     }
 
-@app.get("/_info", tags=["Debug"])
+@app.get("/_info", tags=["Debug"], include_in_schema=_docs_enabled)
 async def info():
     return {
-        "env": ENVIRONMENT,
-        "db": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-        "cors_mode": os.getenv("CORS_MODE", "strict"),
-        "allow_origins": ALLOW_ORIGINS,
-        "allow_origin_regex": os.getenv("CORS_ORIGIN_REGEX", DEFAULT_REGEX),
+        "environment": ENVIRONMENT,
+        "database": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
+        "cors_origins": ALLOW_ORIGINS,
         "api_prefixes": prefixes,
+        "render_url": os.getenv("RENDER_PUBLIC_URL", "Not set"),
+        "netlify_url": os.getenv("NETLIFY_PUBLIC_URL", "Not set"),
     }
 
-# Super-light health (no DB)
+# Health endpoints
 @app.get("/health", include_in_schema=False)
 async def health():
-    return {"ok": True}
+    return {"ok": True, "timestamp": time.time()}
 
 @app.get("/healthz", tags=["Health"])
 async def healthz():
-    return {"ok": True}
+    db_status = _db_ping()
+    return {
+        "status": "healthy" if db_status else "degraded",
+        "database": "connected" if db_status else "disconnected",
+        "timestamp": time.time()
+    }
 
 @app.get("/readyz", tags=["Health"])
 async def readyz():
-    return {"ready": True, "db_ok": _db_ping()}
+    db_status = _db_ping()
+    return {
+        "ready": db_status,
+        "database": "connected" if db_status else "disconnected",
+        "timestamp": time.time()
+    }
 
 @app.get("/dbz", tags=["Health"])
 async def dbz():
-    return {"db_ok": _db_ping()}
+    return {"db_ok": _db_ping(), "timestamp": time.time()}
 
-# Public POST echo for CORS test (no JWT)
+# Public echo endpoint for testing
 @app.post("/echo", include_in_schema=False)
 async def echo(payload: dict):
-    return {"ok": True, "you_sent": payload}
+    return {"ok": True, "echo": payload, "timestamp": time.time()}
 
+# Debug endpoint to list all routes
 if env_bool("DEBUG", False):
     @app.get("/_routes", tags=["Debug"])
     async def list_routes():
-        return [
-            {"methods": sorted(list(getattr(r, "methods", []) or [])), "path": getattr(r, "path", None)}
-            for r in app.routes
-        ]
+        routes = []
+        for route in app.routes:
+            route_info = {
+                "path": getattr(route, "path", None),
+                "methods": sorted(list(getattr(route, "methods", []) or [])),
+                "name": getattr(route, "name", None)
+            }
+            routes.append(route_info)
+        return routes
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint (local dev)
+# Entrypoint for local development
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":  # pragma: no cover
