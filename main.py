@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, List
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -151,7 +152,11 @@ def _db_ping() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("SmartBiz starting (env=%s, db=%s)", ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL", "")))
+    logger.info(
+        "SmartBiz starting (env=%s, db=%s)",
+        ENVIRONMENT,
+        _sanitize_db_url(os.getenv("DATABASE_URL", "")),
+    )
     if not _db_ping():
         logger.error("Database connection failed at startup!")
     else:
@@ -196,16 +201,31 @@ def _resolve_cors_origins() -> List[str]:
     return _uniq([*env_origins, *[x for x in extra if x], *hardcoded])
 
 ALLOW_ORIGINS = _resolve_cors_origins()
+CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,      # explicit allow-list
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["set-cookie"],
-    max_age=600,
-)
+if CORS_ALLOW_ALL:
+    # Mode ya uchunguzi: ruhusu origin yoyote bila credentials
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=600,
+    )
+    logger.warning("CORS_ALLOW_ALL=1 (dev/diagnostic mode) — do NOT use in production.")
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOW_ORIGINS,      # explicit allow-list
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["set-cookie"],
+        max_age=600,
+    )
+    logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
 
 # Preflight catch-all, just in case
 @app.options("/{rest_of_path:path}", include_in_schema=False)
@@ -303,39 +323,35 @@ for router_module in routers_to_try:
 # Hii huepuka 307 redirect (ambayo mara nyingine huvuruga CORS) kwa
 # kupokea /api/auth/signup na kuipeleka ndani ya ASGI kwenda /api/auth/register.
 
-try:
-    import httpx
-    _HAVE_HTTPX = True
-except Exception:
-    _HAVE_HTTPX = False
-
 @app.post("/api/auth/signup", tags=["Auth"], include_in_schema=False)
 async def _compat_signup(request: Request):
     """
     Accepts legacy /api/auth/signup and forwards internally to /api/auth/register
     without external redirect (fixes CORS/preflight on some clients).
     """
-    data = None
     ctype = request.headers.get("content-type", "")
     try:
         if "application/json" in ctype:
-            data = await request.json()
+            payload = await request.json()
+            send_kwargs = dict(json=payload)
+            headers = {}
         elif "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
             form = await request.form()
-            data = dict(form)
+            payload = dict(form)
+            send_kwargs = dict(json=payload)
+            headers = {}
+        else:
+            # raw body
+            raw = await request.body()
+            send_kwargs = dict(content=raw)
+            headers = {"content-type": ctype or "application/json"}
     except Exception:
-        data = None
-
-    if not _HAVE_HTTPX:
-        # fallback (still works, but less ideal)
-        return RedirectResponse(url="/api/auth/register", status_code=307)
+        raw = await request.body()
+        send_kwargs = dict(content=raw)
+        headers = {"content-type": ctype or "application/json"}
 
     async with httpx.AsyncClient(app=app, base_url="http://internal") as ac:
-        if data is None:
-            raw = await request.body()
-            resp = await ac.post("/api/auth/register", content=raw, headers={"content-type": ctype or "application/json"})
-        else:
-            resp = await ac.post("/api/auth/register", json=data)
+        resp = await ac.post("/api/auth/register", headers=headers, **send_kwargs)
 
     mt = resp.headers.get("content-type", "application/json")
     if "application/json" in mt:
@@ -345,14 +361,10 @@ async def _compat_signup(request: Request):
             return Response(resp.content, status_code=resp.status_code, media_type=mt)
     return Response(resp.content, status_code=resp.status_code, media_type=mt)
 
-# ────────────────────────── Legacy convenient aliases (still kept) ──────────────────────────
+# ────────────────────────── Legacy convenient aliases (keep only if needed) ──────────────────────────
 
 def _register_auth_aliases(pref: str):
     p = pref
-
-    @app.post(f"{p}/signup", include_in_schema=False, tags=["Auth"])
-    async def _signup_alias():
-        return RedirectResponse(url=f"{p}/auth/register", status_code=307)
 
     @app.post(f"{p}/register", include_in_schema=False, tags=["Auth"])
     async def _register_alias():
@@ -364,6 +376,24 @@ def _register_auth_aliases(pref: str):
 
 for pref in prefixes:
     _register_auth_aliases(pref)
+
+# ────────────────────────── Debug utilities ──────────────────────────
+
+@app.get("/debug/cors-ping", tags=["Debug"])
+async def cors_ping():
+    return {"ok": True, "ts": time.time()}
+
+@app.get("/debug/echo-headers", tags=["Debug"])
+async def echo_headers(request: Request, origin: str | None = Header(default=None)):
+    return {
+        "method": request.method,
+        "path": request.url.path,
+        "origin_header": origin,
+        "host_header": request.headers.get("host"),
+        "referer": request.headers.get("referer"),
+        "allowed_cors_origins": ALLOW_ORIGINS,
+        "ts": time.time(),
+    }
 
 # ────────────────────────── Core endpoints ──────────────────────────
 
@@ -425,4 +455,4 @@ if __name__ == "__main__":  # pragma: no cover
         reload=env_bool("RELOAD", ENVIRONMENT != "production"),
         proxy_headers=True,
         forwarded_allow_ips="*",
-)
+        )
