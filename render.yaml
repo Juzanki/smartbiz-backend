@@ -1,27 +1,114 @@
+# render.yaml — SmartBiz backend (Render)
+# - Hutumia database resource: smartbiz-db-01
+# - Huchukua DATABASE_URL moja kwa moja kutoka Render (connectionString)
+# - Hufanya migrations (kama Alembic ipo)
+# - Hutumia $PORT ya Render (usiweke 10000)
+# - Health check kwa /health
+
+databases:
+  - name: smartbiz-db-01
+    plan: free         # badilisha kama unaupgrade
+    databaseName: smartbiz_db_rcfg
+    user: smartbiz_db_rcfg_user
+    region: oregon
+
 services:
   - type: web
     name: smartbiz-backend
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
+    plan: free
+    autoDeploy: true
     pythonVersion: 3.11
+    buildCommand: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      bash -lc '
+        # Normalize postgres:// -> postgresql+psycopg2:// kwa SQLAlchemy
+        export DATABASE_URL="${DATABASE_URL/postgres:\/\//postgresql+psycopg2:\/\/}"
+
+        # Run migrations kama Alembic ipo
+        if command -v alembic >/dev/null 2>&1; then
+          echo "[start] Alembic upgrade head..."
+          alembic upgrade head || echo "[warn] Alembic failed or none; continuing"
+        fi
+
+        # Start app on Render $PORT
+        exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
+      '
+    healthCheckPath: /health
+
     envVars:
+      # ---- Main DB URL moja kwa moja kutoka resource yako: smartbiz-db-01 ----
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smartbiz-db-01
+          property: connectionString
+
+      # (OPTIONAL) Kama code yako bado inategemea DB_* fallbacks, weka pia:
       - key: DB_HOST
         fromDatabase:
-          name: smartbiz-db
+          name: smartbiz-db-01
           property: host
       - key: DB_NAME
         fromDatabase:
-          name: smartbiz-db
+          name: smartbiz-db-01
           property: database
       - key: DB_USER
         fromDatabase:
-          name: smartbiz-db
+          name: smartbiz-db-01
           property: user
       - key: DB_PASSWORD
         fromDatabase:
-          name: smartbiz-db
+          name: smartbiz-db-01
           property: password
+      - key: DB_PORT
+        value: "5432"
+
+      # ---- JWT / Security ----
       - key: SECRET_KEY
         value: pK179z2QQzIyIVge415C0e7kvdIX6p4y9d7_AQ1HTcU_hh35U4dO5guT0eKTSgj5IunErK1byXqUz5O5ysh6cQ
+      - key: JWT_ALG
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "1440"
+      - key: REFRESH_TOKEN_EXPIRE_MINUTES
+        value: "43200"
 
+      # ---- CORS (weka domains zako za frontend) ----
+      - key: CORS_ORIGINS
+        value: https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site
+
+      # ---- Cookies ----
+      - key: USE_COOKIE_AUTH
+        value: "true"
+      - key: AUTH_COOKIE_NAME
+        value: sb_access
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
+      - key: AUTH_COOKIE_SAMESITE
+        value: none
+      - key: AUTH_COOKIE_PATH
+        value: "/"
+
+      # ---- App toggles / logging ----
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: AUTO_CREATE_TABLES
+        value: "true"
+
+      # ---- Auth options (hiari) ----
+      - key: AUTH_LOGIN_ALLOW_PHONE
+        value: "false"
+      - key: LOGIN_RATE_LIMIT_PER_MIN
+        value: "20"
+
+      # ---- Runtime hygiene ----
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "2"
