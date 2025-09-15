@@ -26,9 +26,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Env helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Env helpers ──────────────────────────
 
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
@@ -50,9 +48,7 @@ def _sanitize_db_url(url: str) -> str:
         return ""
     return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Paths & base env
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Paths & base env ──────────────────────────
 
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
@@ -67,9 +63,7 @@ try:
 except Exception:
     from backend.db import Base, SessionLocal, engine  # type: ignore
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Logging ──────────────────────────
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = env_bool("LOG_JSON", False)
@@ -93,9 +87,7 @@ root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional: detect password column name once
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Optional DB column autodetect ──────────────────────────
 with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
     insp = _sa_inspect(engine)
@@ -104,9 +96,7 @@ with suppress(Exception):
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     logger.info("PW column = %s (users cols: %s)", chosen, sorted(cols))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Middlewares (security + request id)
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Middlewares (security + req id) ──────────────────────────
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -117,12 +107,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw")
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # Security headers for production
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # Relaxed CSP enough for most SPAs
+        # CSP relaxed enough for SPA assets; adjust if needed
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
@@ -141,7 +130,6 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("reqid-mw")
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        # timing headers
         try:
             response.headers["x-request-id"] = rid
             response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
@@ -149,9 +137,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
             pass
         return response
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DB ping
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── DB ping ──────────────────────────
 
 def _db_ping() -> bool:
     try:
@@ -161,9 +147,7 @@ def _db_ping() -> bool:
     except Exception:
         return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lifespan
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Lifespan ──────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -173,7 +157,6 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Database connection successful")
 
-    # Auto-create tables only in dev
     if ENVIRONMENT != "production" and env_bool("AUTO_CREATE_TABLES", True):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -184,9 +167,7 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("SmartBiz shutting down")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI app
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── FastAPI app ──────────────────────────
 
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
@@ -199,16 +180,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ───────────── CORS MUST BE FIRST (before any other middleware) ───────────────
+# ───────────── CORS (must be BEFORE other middleware) ─────────────
+
 def _resolve_cors_origins() -> List[str]:
+    # Hardcoded + env union
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
         "https://www.smartbiz.site",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:4173", "http://127.0.0.1:4173",
     ]
     env_origins = env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS")
     extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL", "RENDER_PUBLIC_URL")]
@@ -218,7 +199,7 @@ ALLOW_ORIGINS = _resolve_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,   # ✅ NO regex; explicit list
+    allow_origins=ALLOW_ORIGINS,      # explicit allow-list
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -226,12 +207,13 @@ app.add_middleware(
     max_age=600,
 )
 
-# Preflight catch-all
+# Preflight catch-all, just in case
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
 
-# ───────────── Other middlewares AFTER CORS ───────────────────────────────────
+# ───────────── Other middlewares AFTER CORS ─────────────
+
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -243,9 +225,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Static files (uploads)
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Static files ──────────────────────────
 
 class _Uploads(StaticFiles):
     def is_not_modified(self, scope, request_headers, stat_result, etag=None):
@@ -253,9 +233,7 @@ class _Uploads(StaticFiles):
 
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DB session dependency
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── DB dependency ──────────────────────────
 
 def get_db() -> Session:
     db = SessionLocal()
@@ -264,9 +242,7 @@ def get_db() -> Session:
     finally:
         db.close()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Exception handlers
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Exception handlers ──────────────────────────
 
 @app.exception_handler(ClientDisconnect)
 async def client_disconnect_handler(_: Request, __: ClientDisconnect):
@@ -288,9 +264,7 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("unhandled")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Router imports (include what exists)
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Routers ──────────────────────────
 
 def _safe_include(module_path: str, *, attr: str = "router", prefixes: List[str] = [""]) -> None:
     try:
@@ -325,9 +299,53 @@ routers_to_try = [
 for router_module in routers_to_try:
     _safe_include(router_module, prefixes=prefixes)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Auth aliases
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Auth: NO-REDIRECT signup shim ──────────────────────────
+# Hii huepuka 307 redirect (ambayo mara nyingine huvuruga CORS) kwa
+# kupokea /api/auth/signup na kuipeleka ndani ya ASGI kwenda /api/auth/register.
+
+try:
+    import httpx
+    _HAVE_HTTPX = True
+except Exception:
+    _HAVE_HTTPX = False
+
+@app.post("/api/auth/signup", tags=["Auth"], include_in_schema=False)
+async def _compat_signup(request: Request):
+    """
+    Accepts legacy /api/auth/signup and forwards internally to /api/auth/register
+    without external redirect (fixes CORS/preflight on some clients).
+    """
+    data = None
+    ctype = request.headers.get("content-type", "")
+    try:
+        if "application/json" in ctype:
+            data = await request.json()
+        elif "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
+            form = await request.form()
+            data = dict(form)
+    except Exception:
+        data = None
+
+    if not _HAVE_HTTPX:
+        # fallback (still works, but less ideal)
+        return RedirectResponse(url="/api/auth/register", status_code=307)
+
+    async with httpx.AsyncClient(app=app, base_url="http://internal") as ac:
+        if data is None:
+            raw = await request.body()
+            resp = await ac.post("/api/auth/register", content=raw, headers={"content-type": ctype or "application/json"})
+        else:
+            resp = await ac.post("/api/auth/register", json=data)
+
+    mt = resp.headers.get("content-type", "application/json")
+    if "application/json" in mt:
+        try:
+            return JSONResponse(resp.json(), status_code=resp.status_code)
+        except Exception:
+            return Response(resp.content, status_code=resp.status_code, media_type=mt)
+    return Response(resp.content, status_code=resp.status_code, media_type=mt)
+
+# ────────────────────────── Legacy convenient aliases (still kept) ──────────────────────────
 
 def _register_auth_aliases(pref: str):
     p = pref
@@ -347,9 +365,7 @@ def _register_auth_aliases(pref: str):
 for pref in prefixes:
     _register_auth_aliases(pref)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core endpoints
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Core endpoints ──────────────────────────
 
 class WhatsAppMessage(BaseModel):
     message: str
@@ -398,9 +414,7 @@ async def readyz():
 async def echo(payload: dict):
     return {"ok": True, "echo": payload, "ts": time.time()}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint (local dev)
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────── Entrypoint (local dev) ──────────────────────────
 
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
@@ -411,4 +425,4 @@ if __name__ == "__main__":  # pragma: no cover
         reload=env_bool("RELOAD", ENVIRONMENT != "production"),
         proxy_headers=True,
         forwarded_allow_ips="*",
-    )
+)
