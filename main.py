@@ -251,17 +251,17 @@ ALLOW_ORIGINS = _resolve_cors_origins()
 CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
 
 if CORS_ALLOW_ALL:
-    # Diagnostic mode: DO NOT use in production. Note: credentials disabled in this branch.
+    # Diagnostic/dev mode: echoes back any Origin and allows credentials (dangerous for prod).
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=".*",
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["*"],
+        expose_headers=["set-cookie"],
         max_age=600,
     )
-    logger.warning("CORS_ALLOW_ALL=1 (dev/diagnostic mode) — do NOT use in production.")
+    logger.warning("CORS_ALLOW_ALL=1 (dev/diagnostic mode) — DO NOT use in production.")
 else:
     app.add_middleware(
         CORSMiddleware,
@@ -273,6 +273,21 @@ else:
         max_age=600,
     )
     logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
+
+# ── Ensure 'Access-Control-Allow-Credentials: true' is always present for allowed origins ──
+class EnsureCorsCredentialsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        response: Response = await call_next(request)
+        origin = request.headers.get("origin")
+        if not origin:
+            return response
+        if CORS_ALLOW_ALL or origin in ALLOW_ORIGINS:
+            # CORSMiddleware already sets ACAO/Vary; we add ACC
+            response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+        return response
+
+# must come immediately AFTER CORSMiddleware
+app.add_middleware(EnsureCorsCredentialsMiddleware)
 
 # Preflight catch-all (OPTIONS) — CORS middleware will decorate the response
 @app.options("/{rest_of_path:path}", include_in_schema=False)
@@ -345,7 +360,7 @@ def _safe_include(module_path: str, *, attr: str = "router", prefixes: List[str]
             app.include_router(r, prefix=p)
             logger.debug("Included router %s with prefix %s", module_path, p)
     except ImportError:
-        logger.debug("Module %s not available", module_path)
+        logger.debug("Module %s not available")
     except Exception as e:
         logger.error("Failed to include router %s: %s", module_path, e)
 
