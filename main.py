@@ -26,6 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
+from starlette.datastructures import MutableHeaders
 
 # ────────────────────────── Env helpers ──────────────────────────
 
@@ -108,6 +109,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw")
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        # Basic hardening
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -136,6 +138,52 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
             response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
         except Exception:
             pass
+        return response
+
+# ────────────────────────── Cookie policy (SameSite=None; Secure; HttpOnly) ──────────────────────────
+
+FORCE_SAMESITE_NONE = env_bool("COOKIE_SAMESITE_NONE", True)
+FORCE_HTTPONLY = env_bool("COOKIE_HTTPONLY_DEFAULT", True)
+
+class CookiePolicyMiddleware(BaseHTTPMiddleware):
+    """
+    Ensures Set-Cookie headers are cross-site compatible for SPA on Netlify (frontend) + Render (backend).
+    Adds/normalizes: SameSite=None; Secure; HttpOnly (configurable by env).
+    """
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        response: Response = await call_next(request)
+        if not (FORCE_SAMESITE_NONE or FORCE_HTTPONLY):
+            return response
+
+        # Collect all Set-Cookie headers from raw_headers
+        raw = list(response.raw_headers)
+        cookie_values: List[str] = []
+        mutated = False
+        for name, value in raw:
+            if name.lower() == b"set-cookie":
+                s = value.decode("latin-1")
+                # Normalize SameSite
+                if FORCE_SAMESITE_NONE:
+                    if "samesite=" in s.lower():
+                        s = re.sub(r"(?i)SameSite=\w+", "SameSite=None", s)
+                    else:
+                        s += "; SameSite=None"
+                    if "secure" not in s.lower():
+                        s += "; Secure"
+                # Ensure HttpOnly if requested
+                if FORCE_HTTPONLY and "httponly" not in s.lower():
+                    s += "; HttpOnly"
+                cookie_values.append(s)
+                mutated = True
+
+        if mutated:
+            headers = MutableHeaders(response.headers)
+            try:
+                del headers["set-cookie"]
+            except KeyError:
+                pass
+            for cv in cookie_values:
+                headers.append("set-cookie", cv)
         return response
 
 # ────────────────────────── DB ping ──────────────────────────
@@ -185,10 +233,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ───────────── CORS (must be BEFORE other middleware) ─────────────
+# ───────────── CORS (must be BEFORE other middleware & routers) ─────────────
 
 def _resolve_cors_origins() -> List[str]:
-    # Hardcoded + env union
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
@@ -204,7 +251,7 @@ ALLOW_ORIGINS = _resolve_cors_origins()
 CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
 
 if CORS_ALLOW_ALL:
-    # Mode ya uchunguzi: ruhusu origin yoyote bila credentials
+    # Diagnostic mode: DO NOT use in production. Note: credentials disabled in this branch.
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=".*",
@@ -219,7 +266,7 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOW_ORIGINS,      # explicit allow-list
-        allow_credentials=True,
+        allow_credentials=True,           # 👈 muhimu kwa cookies/withCredentials
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["set-cookie"],
@@ -227,7 +274,7 @@ else:
     )
     logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
 
-# Preflight catch-all, just in case
+# Preflight catch-all (OPTIONS) — CORS middleware will decorate the response
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
@@ -244,6 +291,7 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
+app.add_middleware(CookiePolicyMiddleware)  # 👈 ensure cookies are cross-site compatible
 
 # ────────────────────────── Static files ──────────────────────────
 
@@ -320,8 +368,7 @@ for router_module in routers_to_try:
     _safe_include(router_module, prefixes=prefixes)
 
 # ────────────────────────── Auth: NO-REDIRECT signup shim ──────────────────────────
-# Hii huepuka 307 redirect (ambayo mara nyingine huvuruga CORS) kwa
-# kupokea /api/auth/signup na kuipeleka ndani ya ASGI kwenda /api/auth/register.
+# Huepuka 307 redirect ambayo wakati mwingine huvuruga CORS (preflight)
 
 @app.post("/api/auth/signup", tags=["Auth"], include_in_schema=False)
 async def _compat_signup(request: Request):
@@ -341,7 +388,6 @@ async def _compat_signup(request: Request):
             send_kwargs = dict(json=payload)
             headers = {}
         else:
-            # raw body
             raw = await request.body()
             send_kwargs = dict(content=raw)
             headers = {"content-type": ctype or "application/json"}
@@ -394,6 +440,24 @@ async def echo_headers(request: Request, origin: str | None = Header(default=Non
         "allowed_cors_origins": ALLOW_ORIGINS,
         "ts": time.time(),
     }
+
+@app.get("/debug/set-cookie", tags=["Debug"], include_in_schema=False)
+async def debug_set_cookie():
+    """
+    Quick test: emits a cookie with proper attributes for cross-site.
+    """
+    r = JSONResponse({"ok": True, "note": "cookie issued"})
+    # Even if you forget attributes elsewhere, CookiePolicyMiddleware will harden them.
+    r.set_cookie(
+        key="smartbiz_session",
+        value=uuid.uuid4().hex,
+        max_age=3600,
+        secure=True,
+        httponly=True,
+        samesite="none",
+        path="/",
+    )
+    return r
 
 # ────────────────────────── Core endpoints ──────────────────────────
 
@@ -455,4 +519,4 @@ if __name__ == "__main__":  # pragma: no cover
         reload=env_bool("RELOAD", ENVIRONMENT != "production"),
         proxy_headers=True,
         forwarded_allow_ips="*",
-        )
+    )
