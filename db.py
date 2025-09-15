@@ -1,22 +1,24 @@
-﻿# backend/db.py
+# backend/db.py
 # -*- coding: utf-8 -*-
 """
-SmartBiz Assistance – Database bootstrap (SQLAlchemy sync)
-(PostgreSQL ONLY – no SQLite fallback)
+SmartBiz Assistance – SQLAlchemy (sync) for PostgreSQL on Render
 
-Priority for DB URL:
-  1) DATABASE_URL
-  2) (prod) RAILWAY_DATABASE_URL / RENDER_DATABASE_URL / PROD_DATABASE_URL
-  3) (dev)  LOCAL_DATABASE_URL
-  4) Compose from DB_* pieces (user, pass, host, port, name)
-If nothing valid is found, raise a clear RuntimeError.
+Env vars (yenye kipaumbele):
+  - DATABASE_URL                 # <— Render Postgres; huenda ikawa "postgres://" au "postgresql://"
+  - RENDER_DATABASE_URL          # (hiari) jina mbadala ukipenda
+  - LOCAL_DATABASE_URL           # (dev)
+  - DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME  # (fallback compose)
 
-Extras:
-- Coerces 'postgres://' → 'postgresql+psycopg2://'
-- Optional SSL (DATABASE_SSLMODE, DATABASE_SSLROOTCERT)
-- Sensible pools for PostgreSQL
-- Self-check (DB_SELF_CHECK=true)
+Vingine:
+  - ENVIRONMENT                  # production | staging | development (default: development)
+  - DB_ECHO=true|false           # print SQL
+  - DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_TIMEOUT, DB_POOL_RECYCLE
+  - DB_REQUIRE_PASSWORD=true     # lazimisha password kwenye URL iliyokomaa
+  - DB_SELF_CHECK=true           # fanya SELECT 1 wakati wa import
+  - DATABASE_SSLMODE             # default 'require' kwenye production
+  - DATABASE_SSLROOTCERT         # path ya CA kama unahitaji
 """
+
 from __future__ import annotations
 
 import os
@@ -24,33 +26,26 @@ from contextlib import contextmanager
 from typing import Iterator, Dict, Any
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-# ─────────────── Env & flags ───────────────
+# ───────────────────────────── Env & flags ─────────────────────────────
+
 ENV_MODE = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "development").strip().lower()
-IS_PROD = ENV_MODE in {"production", "prod", "staging"} or any(
-    os.getenv(k) for k in (
-        "RAILWAY_ENVIRONMENT", "RENDER_SERVICE_ID", "FLY_APP_NAME", "DYNO"  # Railway/Render/Fly/Heroku
-    )
-)
+IS_PROD = ENV_MODE in {"production", "prod", "staging"} or bool(os.getenv("RENDER_SERVICE_ID"))
 DEBUG = (os.getenv("DEBUG", "false").lower() == "true") or (ENV_MODE == "development")
 ECHO_SQL = os.getenv("DB_ECHO", "false").lower() == "true" or DEBUG
 SELF_CHECK = os.getenv("DB_SELF_CHECK", "false").lower() == "true"
+REQUIRE_PG_PASSWORD = os.getenv("DB_REQUIRE_PASSWORD", "false").lower() == "true"
 
-# Pool defaults (Postgres)
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))
 POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))  # 30 min
+POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))  # sekunde (30min)
 
-# Optional stricter check for password
-REQUIRE_PG_PASSWORD = os.getenv("DB_REQUIRE_PASSWORD", "false").lower() == "true"
+# ───────────────────────────── Helpers ─────────────────────────────
 
-
-# ─────────────── Helpers ───────────────
 def _mask_url(url: str) -> str:
-    """Mask password section for safe logging."""
     try:
         if "://" not in url or "@" not in url:
             return url
@@ -63,14 +58,13 @@ def _mask_url(url: str) -> str:
     except Exception:
         return url
 
-
 def _coerce_postgres(url: str) -> str:
+    # Badilisha kuwa driver wa psycopg2 waziwazi
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg2://", 1)
-    if url.startswith("postgresql://"):  # add driver hint
+    if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return url
-
 
 def _compose_from_parts() -> str:
     user = os.getenv("DB_USER", "postgres")
@@ -78,51 +72,49 @@ def _compose_from_parts() -> str:
     host = os.getenv("DB_HOST", "localhost")
     port = os.getenv("DB_PORT", "5432")
     name = os.getenv("DB_NAME", "smartbiz_db")
-
     if not (user and name):
         raise RuntimeError(
-            "DB ERROR: No DATABASE_URL and incomplete DB_* parts. "
-            "Provide DATABASE_URL or set DB_USER/DB_PASSWORD/DB_NAME."
+            "DB ERROR: Hakuna DATABASE_URL na DB_* hazijatosha. "
+            "Weka DATABASE_URL au DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME."
         )
     return f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{name}"
 
-
 def _choose_database_url() -> str:
-    # 1) Direct env
+    # 1) Render/Generic
     url = os.getenv("DATABASE_URL")
-
-    # 2) Production fallbacks
-    if not url and IS_PROD:
-        url = (
-            os.getenv("RAILWAY_DATABASE_URL")
-            or os.getenv("RENDER_DATABASE_URL")
-            or os.getenv("PROD_DATABASE_URL")
-        )
-
-    # 3) Dev override
+    # 2) Mbinu mbadala ya jina (kama hutumii DATABASE_URL)
+    if not url:
+        url = os.getenv("RENDER_DATABASE_URL")
+    # 3) Dev
     if not url:
         url = os.getenv("LOCAL_DATABASE_URL")
-
-    # 4) Compose (Postgres only)
+    # 4) Compose
     if not url:
         url = _compose_from_parts()
-
-    if not url:
-        raise RuntimeError(
-            "DATABASE_URL is missing. Provide a PostgreSQL URL via "
-            "DATABASE_URL/LOCAL_DATABASE_URL/RAILWAY_DATABASE_URL/etc., "
-            "or set DB_* pieces."
-        )
-
     return _coerce_postgres(url.strip())
 
+def _validate_url(url: str) -> str:
+    try:
+        u = make_url(url)
+    except Exception as e:
+        raise RuntimeError(f"Invalid DATABASE_URL: {url!r} ({e})")
+    if not u.drivername.startswith("postgresql"):
+        raise RuntimeError(
+            f"Driver '{u.drivername}' si PostgreSQL. "
+            "Tumia 'postgresql+psycopg2://...'"
+        )
+    if not u.host or not u.database:
+        raise RuntimeError("URL lazima iwe na host na database.")
+    if REQUIRE_PG_PASSWORD and (u.password in (None, "")):
+        raise RuntimeError("Password ni lazima (DB_REQUIRE_PASSWORD=true).")
+    return url
 
 def _ssl_connect_args(url: str) -> Dict[str, Any]:
-    """Return connect_args for drivers that accept SSL params (psycopg2)."""
+    # psycopg2 inasoma 'sslmode' n.k. kupitia connect_args
     if not url.startswith("postgresql+psycopg2://"):
         return {}
-    sslmode = os.getenv("DATABASE_SSLMODE")      # e.g. "require"
-    sslrootcert = os.getenv("DATABASE_SSLROOTCERT")  # path to CA cert
+    sslmode = os.getenv("DATABASE_SSLMODE") or ("require" if IS_PROD else None)
+    sslrootcert = os.getenv("DATABASE_SSLROOTCERT")
     args: Dict[str, Any] = {}
     if sslmode:
         args["sslmode"] = sslmode
@@ -130,36 +122,14 @@ def _ssl_connect_args(url: str) -> Dict[str, Any]:
         args["sslrootcert"] = sslrootcert
     return args
 
+# ───────────────────────────── Engine & Session ─────────────────────────────
 
-def _validate_url(url: str) -> str:
-    """Validate that the URL is PostgreSQL and structurally correct."""
-    try:
-        u = make_url(url)
-    except Exception as e:
-        raise RuntimeError(f"Invalid DATABASE_URL: {url!r} ({e})")
-
-    if not u.drivername.startswith("postgresql"):
-        raise RuntimeError(
-            f"Only PostgreSQL is allowed. Got driver '{u.drivername}'. "
-            "Use postgresql+psycopg2:// or postgresql+psycopg://"
-        )
-
-    if not u.host or not u.database:
-        raise RuntimeError("PostgreSQL URL must include host and database name.")
-
-    if REQUIRE_PG_PASSWORD and (u.password in (None, "")):
-        raise RuntimeError("PostgreSQL URL must include a password (DB_REQUIRE_PASSWORD=true).")
-
-    return url
-
-
-# ─────────────── Engine & Session setup ───────────────
 DB_URL = _validate_url(_choose_database_url())
 
 _engine_kwargs: Dict[str, Any] = dict(
+    future=True,
     pool_pre_ping=True,
     echo=ECHO_SQL,
-    future=True,
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,
     pool_timeout=POOL_TIMEOUT,
@@ -171,30 +141,32 @@ engine = create_engine(DB_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
-print(f" Using DB: {_mask_url(DB_URL)}  (env: {ENV_MODE}, prod={IS_PROD}, echo_sql={ECHO_SQL})")
+print(f"[DB] Using: {_mask_url(DB_URL)}  (env={ENV_MODE}, prod={IS_PROD}, echo={ECHO_SQL})")
 
-# Optional connection self-check
+# Self-check (hiari)
 if SELF_CHECK:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print(" DB self-check: OK")
+        print("[DB] self-check: OK")
     except Exception as exc:
-        print(f" DB self-check: FAILED -> {exc}")
+        print(f"[DB] self-check: FAILED -> {exc}")
 
+# ───────────────────────────── FastAPI dependency ─────────────────────────────
 
-# ─────────────── FastAPI dependency ───────────────
 def get_db() -> Iterator:
+    """FastAPI dependency: with SessionLocal() as db: yield db"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+# ───────────────────────────── Convenience context ─────────────────────────────
 
-# ─────────────── Convenience API ───────────────
 @contextmanager
 def session_scope() -> Iterator:
+    """Context manager kwa matumizi ya nje ya FastAPI (scripts, jobs)."""
     db = SessionLocal()
     try:
         yield db
