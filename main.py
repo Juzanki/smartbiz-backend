@@ -122,7 +122,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # Relaxed CSP enough for most SPAs (adjust if needed)
+        # Relaxed CSP enough for most SPAs
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
@@ -199,26 +199,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Render proxy headers
-with suppress(Exception):
-    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-
-# Trusted hosts
-trusted_hosts = env_list("TRUSTED_HOSTS") or ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1"]
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
-
-# Compression + security + request-id
-app.add_middleware(GZipMiddleware, minimum_size=512)
-app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestIDMiddleware)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CORS (Netlify + custom domain + local)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ───────────── CORS MUST BE FIRST (before any other middleware) ───────────────
 def _resolve_cors_origins() -> List[str]:
-    # your live Netlify site
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
@@ -234,28 +216,32 @@ def _resolve_cors_origins() -> List[str]:
 
 ALLOW_ORIGINS = _resolve_cors_origins()
 
-# Regex: allow deploy previews on Netlify and subdomains of smartbiz.site
-ALLOW_ORIGIN_REGEX = (
-    r"^https:\/\/([0-9a-z\-]+--)?smartbizsite\.netlify\.app$|"   # deploy previews & main site
-    r"^https:\/\/([a-zA-Z0-9\-]+\.)?smartbiz\.site$|"            # custom domain + subdomains
-    r"^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$"              # local dev
-)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,          # explicit allow-list
-    allow_origin_regex=ALLOW_ORIGIN_REGEX, # plus regex for previews
+    allow_origins=ALLOW_ORIGINS,   # ✅ NO regex; explicit list
     allow_credentials=True,
-    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["set-cookie"],
     max_age=600,
 )
 
-# OPTIONS catch-all (handles preflight cleanly)
+# Preflight catch-all
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
     return Response(status_code=204)
+
+# ───────────── Other middlewares AFTER CORS ───────────────────────────────────
+with suppress(Exception):
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+trusted_hosts = env_list("TRUSTED_HOSTS") or ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1"]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+
+app.add_middleware(GZipMiddleware, minimum_size=512)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestIDMiddleware)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Static files (uploads)
@@ -321,7 +307,6 @@ def _safe_include(module_path: str, *, attr: str = "router", prefixes: List[str]
     except Exception as e:
         logger.error("Failed to include router %s: %s", module_path, e)
 
-# API prefixes (default /api)
 prefixes = _uniq([p.strip() for p in os.getenv("API_PREFIXES", "/api").split(",") if p.strip()])
 
 routers_to_try = [
@@ -341,7 +326,7 @@ for router_module in routers_to_try:
     _safe_include(router_module, prefixes=prefixes)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Auth aliases (helpful for frontend)
+# Auth aliases
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _register_auth_aliases(pref: str):
