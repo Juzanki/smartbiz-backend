@@ -1,6 +1,9 @@
 # backend/main.py
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -9,29 +12,61 @@ import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Callable, Iterable, Optional, List, Tuple, Dict, Any
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import anyio
 from fastapi import (
-    FastAPI, HTTPException, Request, Depends, status, Body, Form
+    Body,
+    Depends,
+    FastAPI,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    status,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.docs import (
-    get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, Response
-from starlette.datastructures import MutableHeaders
+from starlette.responses import JSONResponse
 
-# ─────────────────────── Paths & base env ───────────────────────
+# ────────────────────────── Env helpers ──────────────────────────
+
+def env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def env_list(key: str) -> List[str]:
+    raw = os.getenv(key, "")
+    return [x.strip() for x in raw.split(",") if x and x.strip()]
+
+def _uniq(items: Iterable[Optional[str]]) -> List[str]:
+    out, seen = [], set()
+    for x in items:
+        if x and x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+def _sanitize_db_url(url: str) -> str:
+    if not url:
+        return ""
+    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
+
+# ────────────────────────── Paths & base env ──────────────────────────
+
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", BACKEND_DIR / "uploads")).resolve()
@@ -45,12 +80,10 @@ try:
 except Exception:
     from backend.db import Base, SessionLocal, engine  # type: ignore
 
-USER_TABLE = os.getenv("USER_TABLE", "users")
-PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+# ────────────────────────── Logging ──────────────────────────
 
-# ─────────────────────── Logging ───────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_JSON = (os.getenv("LOG_JSON", "false").lower() in {"1", "true", "yes", "on"})
+LOG_JSON = env_bool("LOG_JSON", False)
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -71,37 +104,23 @@ root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
-# ─────────────────────── Helpers ───────────────────────
-def env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def env_list(key: str) -> List[str]:
-    raw = os.getenv(key, "")
-    return [x.strip() for x in raw.split(",") if x and x.strip()]
-
-def _uniq(items: Iterable[Optional[str]]) -> List[str]:
-    out, seen = [], set()
-    for x in items:
-        if x and x not in seen:
-            out.append(x); seen.add(x)
-    return out
-
-def _sanitize_db_url(url: str) -> str:
-    if not url:
-        return ""
-    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
-
-# ─────────────────────── Optional DB inspection ───────────────────────
+# ────────────────────────── Optional DB column autodetect ──────────────────────────
 _USERS_COLS: Optional[set[str]] = None
+PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+USER_TABLE = os.getenv("USER_TABLE", "users")
+
 with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
     insp = _sa_inspect(engine)
     _USERS_COLS = {c["name"] for c in insp.get_columns(USER_TABLE)}
-    chosen = "hashed_password" if "hashed_password" in _USERS_COLS else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
+    chosen = (
+        "hashed_password"
+        if "hashed_password" in _USERS_COLS
+        else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
+    )
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
-    logger.info("PW column = %s (users cols: %s)", chosen, sorted(_USERS_COLS or []))
+    logger.info("PW column = %s (users cols: %s)", chosen, sorted(_USERS_COLS))
 
 def _users_columns() -> set[str]:
     global _USERS_COLS
@@ -113,7 +132,8 @@ def _users_columns() -> set[str]:
         _USERS_COLS = {c["name"] for c in insp.get_columns(USER_TABLE)}
     return _USERS_COLS or set()
 
-# ─────────────────────── Middlewares ───────────────────────
+# ────────────────────────── Middlewares (security + req id) ──────────────────────────
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         try:
@@ -123,17 +143,19 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw")
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # Basic hardening
+        # Basic hardening (+ allow Swagger CDN)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # CSP relaxed for Swagger CDN + SPA assets
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: https:; "
-            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+            "default-src 'self' https: data: blob:;"
+            "img-src 'self' https: data:;"
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net;"
+            "connect-src 'self' https: wss:;"
+            "frame-ancestors 'self'; base-uri 'self';",
         )
         return response
 
@@ -149,9 +171,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("reqid-mw")
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        response.headers["x-request-id"] = rid
-        response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
+        try:
+            response.headers["x-request-id"] = rid
+            response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
+        except Exception:
+            pass
         return response
+
+# ────────────────────────── Cookie policy (SameSite=None; Secure; HttpOnly) ──────────────────────────
 
 FORCE_SAMESITE_NONE = env_bool("COOKIE_SAMESITE_NONE", True)
 FORCE_HTTPONLY = env_bool("COOKIE_HTTPONLY_DEFAULT", True)
@@ -162,6 +189,7 @@ class CookiePolicyMiddleware(BaseHTTPMiddleware):
         response: Response = await call_next(request)
         if not (FORCE_SAMESITE_NONE or FORCE_HTTPONLY):
             return response
+
         raw = list(response.raw_headers)
         cookie_values: List[str] = []
         mutated = False
@@ -179,14 +207,19 @@ class CookiePolicyMiddleware(BaseHTTPMiddleware):
                     s += "; HttpOnly"
                 cookie_values.append(s)
                 mutated = True
+
         if mutated:
             headers = MutableHeaders(response.headers)
-            headers.pop("set-cookie", None)
+            try:
+                del headers["set-cookie"]
+            except KeyError:
+                pass
             for cv in cookie_values:
                 headers.append("set-cookie", cv)
         return response
 
-# ─────────────────────── DB ping & lifespan ───────────────────────
+# ────────────────────────── DB ping ──────────────────────────
+
 def _db_ping() -> bool:
     try:
         with engine.connect() as conn:
@@ -194,6 +227,8 @@ def _db_ping() -> bool:
         return True
     except Exception:
         return False
+
+# ────────────────────────── Lifespan ──────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -211,18 +246,20 @@ async def lifespan(app: FastAPI):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("DB tables verified/created")
+
     try:
         yield
     finally:
         logger.info("SmartBiz shutting down")
 
-# ─────────────────────── FastAPI app + Docs via CDN ───────────────────────
+# ────────────────────────── FastAPI app ──────────────────────────
+
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
     version=os.getenv("APP_VERSION", "1.0.0"),
-    docs_url=None,            # custom /docs below
+    docs_url=None,                         # tutatumia custom /docs hapa chini
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan,
@@ -243,14 +280,17 @@ if _docs_enabled:
     def swagger_ui_redirect():
         return get_swagger_ui_oauth2_redirect_html()
 
-# ─────────────────────── CORS (kwa Netlify proxy + dev) ───────────────────────
+# ───────────── CORS (must be BEFORE other middleware & routers) ─────────────
+
 def _resolve_cors_origins() -> List[str]:
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
         "https://www.smartbiz.site",
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:4173", "http://127.0.0.1:4173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
     ]
     env_origins = env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS")
     extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL", "RENDER_PUBLIC_URL")]
@@ -286,11 +326,18 @@ class EnsureCorsCredentialsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response: Response = await call_next(request)
         origin = request.headers.get("origin")
-        if origin and (CORS_ALLOW_ALL or origin in ALLOW_ORIGINS):
+        if not origin:
+            return response
+        if CORS_ALLOW_ALL or origin in ALLOW_ORIGINS:
             response.headers.setdefault("Access-Control-Allow-Credentials", "true")
         return response
 
 app.add_middleware(EnsureCorsCredentialsMiddleware)
+
+@app.options("/{rest_of_path:path}", include_in_schema=False)
+async def any_options(_: Request, rest_of_path: str):
+    return Response(status_code=204)
+
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -303,14 +350,16 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(CookiePolicyMiddleware)
 
-# ─────────────────────── Static files ───────────────────────
+# ────────────────────────── Static files ──────────────────────────
+
 class _Uploads(StaticFiles):
     def is_not_modified(self, scope, request_headers, stat_result, etag=None):
         return super().is_not_modified(scope, request_headers, stat_result, etag)
 
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
-# ─────────────────────── DB dependency ───────────────────────
+# ────────────────────────── DB dependency ──────────────────────────
+
 def get_db() -> Session:
     db = SessionLocal()
     try:
@@ -318,7 +367,8 @@ def get_db() -> Session:
     finally:
         db.close()
 
-# ─────────────────────── Exceptions ───────────────────────
+# ────────────────────────── Exception handlers ──────────────────────────
+
 @app.exception_handler(ClientDisconnect)
 async def client_disconnect_handler(_: Request, __: ClientDisconnect):
     return Response(status_code=499)
@@ -339,38 +389,54 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("unhandled")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# ─────────────────────── Auth helpers (from backend/auth.py) ───────────────────────
-from backend.auth import (
-    issue_user_token, set_auth_cookie, clear_auth_cookie,
-    get_current_user, get_current_claims
-)
+# ────────────────────────── Token & cookie utils (lightweight) ──────────────────────────
 
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 1 day
+SECRET = (os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or "dev-secret").encode("utf-8")
+ACCESS_TTL = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600"))
+COOKIE_NAME = os.getenv("ACCESS_COOKIE", os.getenv("AUTH_COOKIE_NAME", "sb_access"))
 
-# ─────────────────────── Minimal CRUD helpers for auth fallback ───────────────────────
-def _get_user_by_email(db: Session, email: str) -> Optional[dict]:
-    sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER(email) = LOWER(:email) LIMIT 1')
-    row = db.execute(sql, {"email": email}).mappings().first()
-    return dict(row) if row else None
+def _sign(payload: str) -> str:
+    sig = hmac.new(SECRET, payload.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
 
-def _get_user_by_username(db: Session, uname: str) -> Optional[dict]:
-    cols = _users_columns()
-    for cand in ("username", "user_name", "handle"):
-        if cand in cols:
-            sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER("{cand}") = LOWER(:u) LIMIT 1')
-            row = db.execute(sql, {"u": uname}).mappings().first()
-            if row:
-                d = dict(row)
-                d["username"] = d.get("username") or d.get("user_name") or d.get("handle")
-                return d
-    return None
+def _mint_token(user_id: str, ttl: int = ACCESS_TTL) -> str:
+    now = int(time.time())
+    raw = f"{user_id}.{now}.{ttl}.{uuid.uuid4().hex}"
+    return raw + "." + _sign(raw)
+
+def _verify_token(token: str) -> Tuple[bool, Optional[str]]:
+    try:
+        p, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(_sign(p), sig):
+            return False, None
+        user_id, ts, ttl, _rnd = p.split(".", 3)
+        if int(time.time()) > int(ts) + int(ttl):
+            return False, None
+        return True, user_id
+    except Exception:
+        return False, None
+
+def _set_access_cookie(resp: Response, token: str, ttl: int = ACCESS_TTL) -> None:
+    resp.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=ttl,
+        secure=True,
+        httponly=True,
+        samesite="none",
+        path="/",
+    )
+
+def _clear_access_cookie(resp: Response) -> None:
+    resp.delete_cookie(key=COOKIE_NAME, path="/")
+
+# ────────────────────────── Password hashing helpers ──────────────────────────
 
 def _hash_password(pw: str) -> str:
     try:
         from passlib.hash import bcrypt  # type: ignore
         return bcrypt.using(rounds=12).hash(pw)
     except Exception:
-        import base64, hashlib, os
         salt = os.urandom(16)
         dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120_000)
         return "pbkdf2$" + base64.b64encode(salt + dk).decode()
@@ -384,24 +450,45 @@ def _verify_password(pw: str, stored: str) -> bool:
             return False
     if stored.startswith("pbkdf2$"):
         try:
-            import base64, hashlib
             blob = base64.b64decode(stored.split("$", 1)[1].encode())
             salt, dk = blob[:16], blob[16:]
             cand = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120_000)
-            return cand == dk
+            return hmac.compare_digest(dk, cand)
         except Exception:
             return False
     return stored == pw
 
+# ────────────────────────── Minimal user table access (RAW SQL) ──────────────────────────
+
+def _get_user_by_email(db: Session, email: str) -> Optional[dict]:
+    sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER(email) = LOWER(:email) LIMIT 1')
+    row = db.execute(sql, {"email": email}).mappings().first()
+    return dict(row) if row else None
+
+def _get_user_by_username(db: Session, uname: str) -> Optional[dict]:
+    cols = _users_columns()
+    for cand in ("username", "user_name", "handle"):
+        if cand in cols:
+            sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER("{cand}") = LOWER(:u) LIMIT 1')
+            row = db.execute(sql, {"u": uname}).mappings().first()
+            if row:
+                return dict(row)
+    return None
+
+def _get_user_by_id(db: Session, user_id: str) -> Optional[dict]:
+    sql = text(f'SELECT * FROM {USER_TABLE} WHERE id::text = :id LIMIT 1')
+    row = db.execute(sql, {"id": user_id}).mappings().first()
+    return dict(row) if row else None
+
 def _create_user(db: Session, email: str, username: str, password: str) -> dict:
     hpw = _hash_password(password)
     cols = _users_columns()
-    uname_col = next((c for c in ("username","user_name","handle") if c in cols), "username")
-    sql = text(f"""
-        INSERT INTO {USER_TABLE} (email, "{uname_col}", {PW_COL})
-        VALUES (:email, :username, :hpw)
-        RETURNING id, email, "{uname_col}" AS username
-    """)
+    uname_col = next((c for c in ("username", "user_name", "handle") if c in cols), "username")
+    sql = text(
+        f'INSERT INTO {USER_TABLE} (email, "{uname_col}", {PW_COL}) '
+        f'VALUES (:email, :username, :hpw) '
+        f'RETURNING id, email, "{uname_col}" AS username'
+    )
     try:
         row = db.execute(sql, {"email": email, "username": username, "hpw": hpw}).mappings().first()
         db.commit()
@@ -421,78 +508,23 @@ def _verify_login_identifier(db: Session, identifier: str, password: str) -> Opt
     if not u:
         return None
     stored = u.get(PW_COL) or u.get("hashed_password") or u.get("password") or ""
-    if stored and _verify_password(password, stored):
-        return {"id": str(u.get("id")), "email": u.get("email"), "username": u.get("username")}
+    if not stored:
+        return None
+    if _verify_password(password, stored):
+        return {
+            "id": str(u.get("id")),
+            "email": u.get("email"),
+            "username": u.get("username") or u.get("user_name") or u.get("handle"),
+        }
     return None
 
-# ─────────────────────── Schemas ───────────────────────
+# ────────────────────────── Auth schemas ──────────────────────────
+
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=6)
     username: constr(min_length=2)
 
 class LoginIn(BaseModel):
-    identifier: str
-    password: constr(min_length=1)
-
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: Optional[dict] = None
-
-# ─────────────────────── Health / Ready / Diag ───────────────────────
-@app.get("/health", tags=["Health"])
-@app.get("/api/health", tags=["Health"])
-def health():
-    return {"status": "healthy", "database": _db_ping(), "ts": time.time()}
-
-@app.get("/ready", tags=["Health"])
-def ready():
-    return {"status": "ready"}
-
-@app.get("/api/_info", tags=["Debug"])
-def info():
-    return {
-        "environment": ENVIRONMENT,
-        "database": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-        "cors_origins": ALLOW_ORIGINS,
-        "api_prefixes": ["/api"],
-        "render_url": os.getenv("RENDER_EXTERNAL_URL"),
-        "netlify_url": os.getenv("NETLIFY_PUBLIC_URL") or os.getenv("FRONTEND_URL"),
-    }
-
-# Echo route: itakubali GET/POST/PUT/PATCH/DELETE kwa majaribio ya proxy/CORS
-@app.api_route("/api/echo/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], tags=["Debug"])
-async def echo(path: str, request: Request):
-    try:
-        body = await request.body()
-        try:
-            j = json.loads(body.decode() or "{}")
-        except Exception:
-            j = None
-    except Exception:
-        j = None
-    return {
-        "ok": True,
-        "method": request.method,
-        "path": path,
-        "query": dict(request.query_params),
-        "json": j,
-        "length": request.headers.get("content-length"),
-        "origin": request.headers.get("origin"),
-    }
-
-# ─────────────────────── Auth (fallback endpoints) ───────────────────────
-# Kwanza jaribu ku-include router kamili kama ipo:
-_INCLUDED_AUTH_ROUTER = False
-with suppress(Exception):
-    from backend.routes.auth_routes import router as _auth_router  # type: ignore
-    app.include_router(_auth_router, prefix="/api")
-    _INCLUDED_AUTH_ROUTER = True
-    logger.info("Included backend.routes.auth_routes under /api")
-
-if not _INCLUDED_AUTH_ROUTER:
-    # Fallback ndogo: register/login/me/logout/refresh
-    @app.post("/api/auth/register", response_model=TokenOut, tags=["Auth"], status_code=status.HTTP_201_CREATED)
-    def register(payload: SignupIn, db: Session = Depends(get_db)):
-        if _get_user_by_email(db, payload
+    email: Optional[EmailStr] = None
+    us
