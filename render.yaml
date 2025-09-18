@@ -1,13 +1,8 @@
-# render.yaml — SmartBiz backend (Render)
-# - Hutumia database resource: smartbiz-db-01
-# - Huchukua DATABASE_URL moja kwa moja kutoka Render (connectionString)
-# - Hufanya migrations (kama Alembic ipo)
-# - Hutumia $PORT ya Render (usiweke 10000)
-# - Health check kwa /health
+# render.yaml — SmartBiz Backend (FastAPI on Render)
 
 databases:
   - name: smartbiz-db-01
-    plan: free         # badilisha kama unaupgrade
+    plan: free                        # badilisha ukihitaji
     databaseName: smartbiz_db_rcfg
     user: smartbiz_db_rcfg_user
     region: oregon
@@ -19,33 +14,52 @@ services:
     plan: free
     autoDeploy: true
     pythonVersion: 3.11
+
+    # Install step
     buildCommand: |
       python -m pip install --upgrade pip
-      pip install -r requirements.txt
+      pip install --no-cache-dir -r requirements.txt
+
+    # Start step
     startCommand: |
       bash -lc '
         # Normalize postgres:// -> postgresql+psycopg2:// kwa SQLAlchemy
         export DATABASE_URL="${DATABASE_URL/postgres:\/\//postgresql+psycopg2:\/\/}"
 
-        # Run migrations kama Alembic ipo
+        # Render huongeza sslmode=require kwenye connectionString,
+        # lakini tukihakikisha ni salama pia ikiwa haipo:
+        case "$DATABASE_URL" in
+          *"sslmode="*) : ;;  # iko tayari
+          *) export DATABASE_URL="${DATABASE_URL}?sslmode=require" ;;
+        esac
+
+        # Alembic migrations (kama ipo)
         if command -v alembic >/dev/null 2>&1; then
-          echo "[start] Alembic upgrade head..."
-          alembic upgrade head || echo "[warn] Alembic failed or none; continuing"
+          echo "[start] Alembic upgrade head…"
+          alembic upgrade head || echo "[warn] Alembic failed/absent; continuing"
         fi
 
-        # Start app on Render $PORT
-        exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
+        # Anzisha FastAPI (module iko backend/main.py => backend.main:app)
+        exec uvicorn backend.main:app \
+          --host 0.0.0.0 --port "$PORT" \
+          --proxy-headers --forwarded-allow-ips="*" \
+          --http httptools --log-level info
       '
+
+    # Healthcheck ya Render (inzii na haraka)
     healthCheckPath: /health
+    # (Optional) badilisha timeout/retry kama instance ni polepole kuamka
+    healthCheckTimeout: 10
+    healthCheckInterval: 15
 
     envVars:
-      # ---- Main DB URL moja kwa moja kutoka resource yako: smartbiz-db-01 ----
+      # ---- DB: tumia moja kwa moja connectionString kutoka resource ya juu ----
       - key: DATABASE_URL
         fromDatabase:
           name: smartbiz-db-01
           property: connectionString
 
-      # (OPTIONAL) Kama code yako bado inategemea DB_* fallbacks, weka pia:
+      # (Hiari) Fallbacks kama code nyingine inazitumia
       - key: DB_HOST
         fromDatabase:
           name: smartbiz-db-01
@@ -65,21 +79,31 @@ services:
       - key: DB_PORT
         value: "5432"
 
-      # ---- JWT / Security ----
+      # ---- Env ya app ----
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEBUG
+        value: "false"
+      - key: AUTO_CREATE_TABLES
+        value: "true"             # unaweza kuweka false ukitegemea Alembic
+
+      # ---- Security / JWT ----
       - key: SECRET_KEY
         value: pK179z2QQzIyIVge415C0e7kvdIX6p4y9d7_AQ1HTcU_hh35U4dO5guT0eKTSgj5IunErK1byXqUz5O5ysh6cQ
       - key: JWT_ALG
         value: HS256
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
-        value: "1440"
+        value: "1440"            # 1 day
       - key: REFRESH_TOKEN_EXPIRE_MINUTES
-        value: "43200"
+        value: "43200"           # 30 days
 
       # ---- CORS (weka domains zako za frontend) ----
       - key: CORS_ORIGINS
         value: https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site
 
-      # ---- Cookies ----
+      # ---- Cookies (kwa SPA cross-site) ----
       - key: USE_COOKIE_AUTH
         value: "true"
       - key: AUTH_COOKIE_NAME
@@ -91,23 +115,11 @@ services:
       - key: AUTH_COOKIE_PATH
         value: "/"
 
-      # ---- App toggles / logging ----
-      - key: ENVIRONMENT
-        value: production
-      - key: DEBUG
-        value: "false"
-      - key: LOG_LEVEL
-        value: INFO
-      - key: AUTO_CREATE_TABLES
+      # ---- Docs (hiari: onyesha /docs hata production) ----
+      - key: ENABLE_DOCS
         value: "true"
 
-      # ---- Auth options (hiari) ----
-      - key: AUTH_LOGIN_ALLOW_PHONE
-        value: "false"
-      - key: LOGIN_RATE_LIMIT_PER_MIN
-        value: "20"
-
-      # ---- Runtime hygiene ----
+      # ---- Hygiene ----
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: WEB_CONCURRENCY
