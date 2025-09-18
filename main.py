@@ -13,6 +13,12 @@ ROOT_DIR = BACKEND_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+# 👉 Backend URL ya Render (tumia yako hapa chini)
+BACKEND_PUBLIC_URL = os.getenv(
+    "BACKEND_PUBLIC_URL",
+    "https://smartbiz-backend-p45m.onrender.com",
+).rstrip("/")
+
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Depends, status, Form
 from fastapi.exceptions import RequestValidationError
@@ -26,7 +32,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, RedirectResponse
 from starlette.datastructures import MutableHeaders
 
 # ── DB imports (package-first, then relative) ─────────────────────────────────
@@ -229,12 +235,14 @@ if _docs_enabled:
     def swagger_ui_redirect():
         return get_swagger_ui_oauth2_redirect_html()
 
-# ────────────────────────── CORS ──────────────────────────────────────────────
+# ────────────────────────── CORS (ikijumuisha backend URL moja kwa moja) ─────
 def _resolve_cors_origins() -> List[str]:
+    # Hizi ndizo origins halali za frontend zako + backend yako
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
         "https://www.smartbiz.site",
+        BACKEND_PUBLIC_URL,  # 👈 backend yenyewe (kwa test/tools)
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
@@ -272,7 +280,7 @@ with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-trusted_hosts = env_list("TRUSTED_HOSTS") or ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1"]
+trusted_hosts = _uniq(env_list("TRUSTED_HOSTS") + ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1", BACKEND_PUBLIC_URL.replace("https://","")])
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
 # Compression + security + request-id + cookie policy
@@ -422,12 +430,21 @@ class TokenOut(BaseModel):
     token_type: str = "bearer"
     user: Optional[Dict[str, Any]] = None
 
-# ────────────────────────── Health & Diag ─────────────────────────────────────
+# ────────────────────────── Health & Diag + Meta ──────────────────────────────
+@app.get("/")
+def root_redirect():
+    # kurahisisha test; peleka docs kama zimewezeshwa, la sivyo health
+    return RedirectResponse("/docs" if _docs_enabled else "/api/health", status_code=302)
+
+@app.get("/api/meta/baseurl")
+def meta_baseurl():
+    return {"base_url": BACKEND_PUBLIC_URL}
+
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/api/healthz")
 def health():
-    return {"status": "healthy", "database": _db_ping(), "ts": time.time()}
+    return {"status": "healthy", "database": _db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
 
 @app.get("/ready")
 @app.get("/api/ready")
@@ -457,7 +474,7 @@ def diag_headers(request: Request):
 
 @app.get("/api/_diag/cors")
 def diag_cors():
-    return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL}
+    return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL, "base": BACKEND_PUBLIC_URL}
 
 # ────────────────────────── Prefer real auth router, else fallback ───────────
 def _include_auth_routers():
