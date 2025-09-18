@@ -1,29 +1,24 @@
 # backend/main.py
 from __future__ import annotations
 
-import base64
-import hmac
-import hashlib
-import json
-import logging
-import os
-import re
-import time
-import uuid
-from contextlib import asynccontextmanager, suppress
+# ── Path fallback (salama kwa Render na local) ────────────────────────────────
+import os, sys, re, json, time, uuid, base64, hmac, hashlib, logging
 from pathlib import Path
+from contextlib import asynccontextmanager, suppress
 from typing import Callable, Iterable, Optional, List, Tuple, Dict, Any
 
+THIS_FILE = Path(__file__).resolve()
+BACKEND_DIR = THIS_FILE.parent
+ROOT_DIR = BACKEND_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
 import anyio
-from fastapi import (
-    FastAPI, HTTPException, Request, Depends, status, Body, Form
-)
+from fastapi import FastAPI, HTTPException, Request, Depends, status, Form
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.openapi.docs import (
-    get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
-)
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import text
@@ -34,8 +29,13 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response
 from starlette.datastructures import MutableHeaders
 
-# ────────────────────────── Env helpers ──────────────────────────
+# ── DB imports (package-first, then relative) ─────────────────────────────────
+try:
+    from backend.db import Base, SessionLocal, engine
+except Exception:  # pragma: no cover
+    from db import Base, SessionLocal, engine  # type: ignore
 
+# ────────────────────────── Env helpers ──────────────────────────
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -52,27 +52,13 @@ def _uniq(items: Iterable[Optional[str]]) -> List[str]:
     return out
 
 def _sanitize_db_url(url: str) -> str:
-    if not url:
-        return ""
-    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
+    return "" if not url else re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
 
-# ────────────────────────── Paths & base env ──────────────────────────
-
-BACKEND_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BACKEND_DIR.parent
+ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", BACKEND_DIR / "uploads")).resolve()
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
-
-# DB wiring (support both relative and package import layouts)
-try:
-    from db import Base, SessionLocal, engine  # type: ignore
-except Exception:
-    from backend.db import Base, SessionLocal, engine  # type: ignore
-
 # ────────────────────────── Logging ──────────────────────────
-
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = env_bool("LOG_JSON", False)
 
@@ -80,7 +66,7 @@ class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
+            "lvl": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
         }
@@ -89,16 +75,16 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 _handler = logging.StreamHandler()
-_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
+_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
 root_logger = logging.getLogger()
 root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
-# ────────────────────────── Optional DB column autodetect ──────────────────────────
-_USERS_COLS: Optional[set[str]] = None
-PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+# ────────────────────────── Optional user table introspection ─────────────────
 USER_TABLE = os.getenv("USER_TABLE", "users")
+PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+_USERS_COLS: Optional[set[str]] = None
 
 with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
@@ -107,7 +93,7 @@ with suppress(Exception):
     chosen = "hashed_password" if "hashed_password" in _USERS_COLS else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
-    logger.info("PW column = %s (users cols: %s)", chosen, sorted(_USERS_COLS or []))
+    logger.info("Users cols: %s | PW col: %s", sorted(_USERS_COLS or []), PW_COL)
 
 def _users_columns() -> set[str]:
     global _USERS_COLS
@@ -115,12 +101,10 @@ def _users_columns() -> set[str]:
         return _USERS_COLS
     with suppress(Exception):
         from sqlalchemy import inspect as _sa_inspect
-        insp = _sa_inspect(engine)
-        _USERS_COLS = {c["name"] for c in insp.get_columns(USER_TABLE)}
+        _USERS_COLS = {c["name"] for c in _sa_inspect(engine).get_columns(USER_TABLE)}
     return _USERS_COLS or set()
 
-# ────────────────────────── Middlewares (security + req id) ──────────────────────────
-
+# ────────────────────────── Middlewares ──────────────────────────
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         try:
@@ -130,12 +114,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw")
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # Basic hardening
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # CSP (relaxed for SPA/docs CDN)
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
@@ -154,25 +136,18 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("reqid-mw")
             response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-        try:
-            response.headers["x-request-id"] = rid
-            response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
-        except Exception:
-            pass
+        response.headers["x-request-id"] = rid
+        response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
         return response
-
-# ────────────────────────── Cookie policy (SameSite=None; Secure; HttpOnly) ──────────────────────────
 
 FORCE_SAMESITE_NONE = env_bool("COOKIE_SAMESITE_NONE", True)
 FORCE_HTTPONLY = env_bool("COOKIE_HTTPONLY_DEFAULT", True)
 
 class CookiePolicyMiddleware(BaseHTTPMiddleware):
-    """Normalize Set-Cookie for cross-site SPA use."""
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response: Response = await call_next(request)
         if not (FORCE_SAMESITE_NONE or FORCE_HTTPONLY):
             return response
-
         raw = list(response.raw_headers)
         cookie_values: List[str] = []
         mutated = False
@@ -180,29 +155,20 @@ class CookiePolicyMiddleware(BaseHTTPMiddleware):
             if name.lower() == b"set-cookie":
                 s = value.decode("latin-1")
                 if FORCE_SAMESITE_NONE:
-                    if "samesite=" in s.lower():
-                        s = re.sub(r"(?i)SameSite=\w+", "SameSite=None", s)
-                    else:
-                        s += "; SameSite=None"
+                    s = re.sub(r"(?i)SameSite=\w+", "SameSite=None", s) if "samesite=" in s.lower() else s + "; SameSite=None"
                     if "secure" not in s.lower():
                         s += "; Secure"
                 if FORCE_HTTPONLY and "httponly" not in s.lower():
                     s += "; HttpOnly"
-                cookie_values.append(s)
-                mutated = True
-
+                cookie_values.append(s); mutated = True
         if mutated:
             headers = MutableHeaders(response.headers)
-            try:
-                del headers["set-cookie"]
-            except KeyError:
-                pass
+            headers.pop("set-cookie", None)
             for cv in cookie_values:
                 headers.append("set-cookie", cv)
         return response
 
-# ────────────────────────── DB ping ──────────────────────────
-
+# ────────────────────────── DB helpers ──────────────────────────
 def _db_ping() -> bool:
     try:
         with engine.connect() as conn:
@@ -211,38 +177,37 @@ def _db_ping() -> bool:
     except Exception:
         return False
 
-# ────────────────────────── Lifespan ──────────────────────────
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
+# ────────────────────────── Lifespan ──────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(
-        "SmartBiz starting (env=%s, db=%s)",
-        ENVIRONMENT,
-        _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-    )
+    logger.info("Starting SmartBiz (env=%s, db=%s)", ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL", "")))
     if not _db_ping():
-        logger.error("Database connection failed at startup!")
+        logger.error("Database connection failed at startup")
     else:
-        logger.info("Database connection successful")
-
-    if ENVIRONMENT != "production" and env_bool("AUTO_CREATE_TABLES", True):
+        logger.info("Database OK")
+    if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
-            logger.info("DB tables verified/created")
-
+            logger.info("Tables verified/created")
     try:
         yield
     finally:
-        logger.info("SmartBiz shutting down")
+        logger.info("Shutting down SmartBiz")
 
-# ────────────────────────── FastAPI app ──────────────────────────
-
+# ────────────────────────── App ────────────────────────────────
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
     version=os.getenv("APP_VERSION", "1.0.0"),
-    docs_url=None,  # tutatumia custom /docs hapa chini
+    docs_url=None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan,
@@ -263,8 +228,7 @@ if _docs_enabled:
     def swagger_ui_redirect():
         return get_swagger_ui_oauth2_redirect_html()
 
-# ───────────── CORS (must be BEFORE other middleware & routers) ─────────────
-
+# ────────────────────────── CORS ───────────────────────────────
 def _resolve_cors_origins() -> List[str]:
     hardcoded = [
         "https://smartbizsite.netlify.app",
@@ -281,45 +245,28 @@ ALLOW_ORIGINS = _resolve_cors_origins()
 CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
 
 if CORS_ALLOW_ALL:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["set-cookie"],
-        max_age=600,
-    )
-    logger.warning("CORS_ALLOW_ALL=1 (dev/diagnostic mode) — DO NOT use in production.")
+    app.add_middleware(CORSMiddleware, allow_origin_regex=".*", allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["set-cookie"], max_age=600)
+    logger.warning("CORS_ALLOW_ALL=1 (dev mode) — avoid in production")
 else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOW_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["set-cookie"],
-        max_age=600,
-    )
+    app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["set-cookie"], max_age=600)
     logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
 
 class EnsureCorsCredentialsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response: Response = await call_next(request)
         origin = request.headers.get("origin")
-        if not origin:
-            return response
-        if CORS_ALLOW_ALL or origin in ALLOW_ORIGINS:
+        if origin and (CORS_ALLOW_ALL or origin in ALLOW_ORIGINS):
             response.headers.setdefault("Access-Control-Allow-Credentials", "true")
         return response
 
 app.add_middleware(EnsureCorsCredentialsMiddleware)
 
-# Preflight handlers (kwa routes zote, ikiwemo /api/*)
+# Preflight kwa routes zote
 @app.options("/{rest_of_path:path}", include_in_schema=False)
-async def any_options(_: Request, rest_of_path: str):
+async def any_options(_: Request, rest_of_path: str):  # noqa: ARG001
     return Response(status_code=204)
 
+# Proxy headers (Render) & Trusted hosts
 with suppress(Exception):
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -327,30 +274,20 @@ with suppress(Exception):
 trusted_hosts = env_list("TRUSTED_HOSTS") or ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1"]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
+# Compression + security + request-id + cookie policy
 app.add_middleware(GZipMiddleware, minimum_size=512)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(CookiePolicyMiddleware)
 
-# ────────────────────────── Static files ──────────────────────────
-
+# ────────────────────────── Static ─────────────────────────────
 class _Uploads(StaticFiles):
-    def is_not_modified(self, scope, request_headers, stat_result, etag=None):
+    def is_not_modified(self, scope, request_headers, stat_result, etag=None):  # noqa: ANN001
         return super().is_not_modified(scope, request_headers, stat_result, etag)
 
 app.mount("/uploads", _Uploads(directory=str(UPLOADS_DIR)), name="uploads")
 
-# ────────────────────────── DB dependency ──────────────────────────
-
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# ────────────────────────── Exception handlers ──────────────────────────
-
+# ────────────────────────── Exceptions ─────────────────────────
 @app.exception_handler(ClientDisconnect)
 async def client_disconnect_handler(_: Request, __: ClientDisconnect):
     return Response(status_code=499)
@@ -371,11 +308,9 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("unhandled")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# ────────────────────────── Tiny token (fallback) ──────────────────────────
-# NB: Ikiwa una routes/auth_routes.py yenye JWT kamili, hii haitatumika isipokuwa kama fallback.
-
+# ────────────────────────── Tiny Auth Fallback ─────────────────
 SECRET = (os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or "dev-secret").encode("utf-8")
-ACCESS_TTL = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600"))  # seconds
+ACCESS_TTL = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600"))
 ACCESS_COOKIE = os.getenv("ACCESS_COOKIE", "sb_access")
 
 def _sign(payload: str) -> str:
@@ -392,7 +327,7 @@ def _verify_token(token: str) -> Tuple[bool, Optional[str]]:
         p, sig = token.rsplit(".", 1)
         if not hmac.compare_digest(_sign(p), sig):
             return False, None
-        user_id, ts, ttl, _rnd = p.split(".", 3)
+        user_id, ts, ttl, _ = p.split(".", 3)
         if int(time.time()) > int(ts) + int(ttl):
             return False, None
         return True, user_id
@@ -400,21 +335,12 @@ def _verify_token(token: str) -> Tuple[bool, Optional[str]]:
         return False, None
 
 def _set_access_cookie(resp: Response, token: str, ttl: int = ACCESS_TTL) -> None:
-    resp.set_cookie(
-        key=ACCESS_COOKIE,
-        value=token,
-        max_age=ttl,
-        secure=True,
-        httponly=True,
-        samesite="none",
-        path="/",
-    )
+    resp.set_cookie(key=ACCESS_COOKIE, value=token, max_age=ttl, secure=True, httponly=True, samesite="none", path="/")
 
 def _clear_access_cookie(resp: Response) -> None:
     resp.delete_cookie(key=ACCESS_COOKIE, path="/")
 
-# ────────────────────────── Password hashing (fallback) ──────────────────────────
-
+# Password hashing (bcrypt preferred; PBKDF2 fallback)
 def _hash_password(pw: str) -> str:
     try:
         from passlib.hash import bcrypt  # type: ignore
@@ -441,26 +367,22 @@ def _verify_password(pw: str, stored: str) -> bool:
             return False
     return stored == pw
 
-# ────────────────────────── Minimal user table access ──────────────────────────
-
+# Simple SQL helpers
 def _get_user_by_email(db: Session, email: str) -> Optional[dict]:
-    sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER(email) = LOWER(:email) LIMIT 1')
-    row = db.execute(sql, {"email": email}).mappings().first()
+    row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE LOWER(email)=LOWER(:e) LIMIT 1'), {"e": email}).mappings().first()
     return dict(row) if row else None
 
 def _get_user_by_username(db: Session, uname: str) -> Optional[dict]:
     cols = _users_columns()
     for cand in ("username", "user_name", "handle"):
         if cand in cols:
-            sql = text(f'SELECT * FROM {USER_TABLE} WHERE LOWER("{cand}") = LOWER(:u) LIMIT 1')
-            row = db.execute(sql, {"u": uname}).mappings().first()
+            row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE LOWER("{cand}")=LOWER(:u) LIMIT 1'), {"u": uname}).mappings().first()
             if row:
                 return dict(row)
     return None
 
 def _get_user_by_id(db: Session, user_id: str) -> Optional[dict]:
-    sql = text(f'SELECT * FROM {USER_TABLE} WHERE id::text = :id LIMIT 1')
-    row = db.execute(sql, {"id": user_id}).mappings().first()
+    row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE id::text=:i LIMIT 1'), {"i": user_id}).mappings().first()
     return dict(row) if row else None
 
 def _create_user(db: Session, email: str, username: str, password: str) -> dict:
@@ -479,27 +401,12 @@ def _create_user(db: Session, email: str, username: str, password: str) -> dict:
     except Exception as e:
         db.rollback()
         msg = str(e)
-        if "unique" in msg.lower() or "duplicate" in msg.lower() or "23505" in msg:
+        if any(k in msg.lower() for k in ("unique", "duplicate", "23505")):
             raise HTTPException(status_code=409, detail="Email already registered")
         logger.exception("create_user")
         raise HTTPException(status_code=500, detail="Failed to create user")
 
-def _verify_login_identifier(db: Session, identifier: str, password: str) -> Optional[dict]:
-    u = _get_user_by_email(db, identifier) if "@" in identifier else None
-    if not u:
-        u = _get_user_by_username(db, identifier) or _get_user_by_email(db, identifier)
-    if not u:
-        return None
-    stored = u.get(PW_COL) or u.get("hashed_password") or u.get("password") or ""
-    if not stored:
-        return None
-    if _verify_password(password, stored):
-        return {"id": str(u.get("id")), "email": u.get("email"),
-                "username": u.get("username") or u.get("user_name") or u.get("handle")}
-    return None
-
-# ────────────────────────── Auth models (for fallback) ──────────────────────────
-
+# Pydantic models
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=6)
@@ -514,140 +421,119 @@ class TokenOut(BaseModel):
     token_type: str = "bearer"
     user: Optional[Dict[str, Any]] = None
 
-# ────────────────────────── Health / diag / echo ──────────────────────────
-
-@app.get("/health", tags=["Health"])
-@app.get("/api/health", tags=["Health"])
-@app.get("/api/healthz", tags=["Health"])
+# ────────────────────────── Health & Diag ──────────────────────
+@app.get("/health"); @app.get("/api/health"); @app.get("/api/healthz")
 def health():
     return {"status": "healthy", "database": _db_ping(), "ts": time.time()}
 
-@app.get("/ready", tags=["Health"])
-@app.get("/api/ready", tags=["Health"])
+@app.get("/ready"); @app.get("/api/ready")
 def ready():
     return {"status": "ready", "database": _db_ping()}
 
-@app.get("/version", tags=["Meta"])
+@app.get("/version")
 def version():
-    return {"name": os.getenv("APP_NAME", "SmartBiz Assistance API"),
-            "version": os.getenv("APP_VERSION", "1.0.0"),
-            "env": ENVIRONMENT}
+    return {"name": os.getenv("APP_NAME", "SmartBiz Assistance API"), "version": os.getenv("APP_VERSION", "1.0.0"), "env": ENVIRONMENT}
 
-@app.api_route("/api/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], tags=["Diag"])
+@app.api_route("/api/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
 async def echo(request: Request):
-    # Jaribu kusoma mwili bila kumaliza stream
     body = None
     with suppress(Exception):
-        body = await request.body()
-        if body and len(body) > 1024 * 1024:
-            body = b"<omitted: too large>"
-        body = body.decode(errors="ignore") if isinstance(body, (bytes, bytearray)) else str(body)
-    return {
-        "method": request.method,
-        "url": str(request.url),
-        "headers": {k: v for k, v in request.headers.items()},
-        "cookies": request.cookies,
-        "body": body,
-    }
+        raw = await request.body()
+        if raw and len(raw) > 1024 * 1024:
+            body = "<omitted: too large>"
+        else:
+            body = raw.decode(errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return {"method": request.method, "url": str(request.url), "headers": dict(request.headers), "cookies": request.cookies, "body": body}
 
-@app.get("/api/_diag/headers", tags=["Diag"])
+@app.get("/api/_diag/headers")
 def diag_headers(request: Request):
     return {"headers": dict(request.headers)}
 
-@app.get("/api/_diag/cors", tags=["Diag"])
+@app.get("/api/_diag/cors")
 def diag_cors():
     return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL}
 
-# ────────────────────────── Auth routers (preferred) or fallback ──────────────────────────
-
+# ────────────────────────── Prefer real auth router, else fallback ───────────
 def _include_auth_routers():
-    """
-    Jaribu kuingiza routers kamili kutoka backend/routes/auth_routes.py
-    zenye JWT. Iwapo hazipo, tunasajili fallback endpoints hapa.
-    """
     try:
         from backend.routes.auth_routes import router as auth_router, legacy_router  # type: ignore
-        app.include_router(auth_router, prefix="/api")           # -> /api/auth/...
-        app.include_router(legacy_router, prefix="/api/auth")    # -> /api/auth/login-form
-        logger.info("Auth routers loaded from backend.routes.auth_routes")
+        app.include_router(auth_router, prefix="/api")
+        app.include_router(legacy_router, prefix="/api/auth")
+        logger.info("Loaded auth routers from backend.routes.auth_routes")
         return
     except Exception:
-        logger.warning("Auth routers not found; using fallback auth endpoints.")
+        logger.warning("Auth routers not found; using fallback endpoints")
 
-    # ── Fallback endpoints (simple token)
-    @app.post("/api/auth/register", response_model=TokenOut, tags=["Auth"])
+    # Fallback auth
+    def _verify_login_identifier(db: Session, identifier: str, password: str) -> Optional[dict]:
+        u = _get_user_by_email(db, identifier) if "@" in identifier else None
+        if not u:
+            u = _get_user_by_username(db, identifier) or _get_user_by_email(db, identifier)
+        if not u: return None
+        stored = u.get(PW_COL) or u.get("hashed_password") or u.get("password") or ""
+        return {"id": str(u.get("id")), "email": u.get("email"),
+                "username": u.get("username") or u.get("user_name") or u.get("handle")} if stored and _verify_password(password, stored) else None
+
+    @app.post("/api/auth/register", response_model=TokenOut)
     def register(payload: SignupIn, db: Session = Depends(get_db)):
         if _get_user_by_email(db, payload.email):
             raise HTTPException(status_code=409, detail="Email already registered")
         user = _create_user(db, payload.email, payload.username, payload.password)
         access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
         resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user}, status_code=status.HTTP_201_CREATED)
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
+        _set_access_cookie(resp, access, ACCESS_TTL); return resp
 
-    @app.post("/api/auth/signup", response_model=TokenOut, tags=["Auth"])
+    @app.post("/api/auth/signup", response_model=TokenOut)
     def signup_alias(payload: SignupIn, db: Session = Depends(get_db)):
-        return register(payload, db)  # type: ignore[misc]
+        return register(payload, db)  # type: ignore
 
-    @app.post("/api/auth/login", response_model=TokenOut, tags=["Auth"])
+    @app.post("/api/auth/login", response_model=TokenOut)
     def login(payload: LoginIn, db: Session = Depends(get_db)):
         user = _verify_login_identifier(db, payload.identifier, payload.password)
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if not user: raise HTTPException(status_code=401, detail="Invalid credentials")
         access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
         resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
+        _set_access_cookie(resp, access, ACCESS_TTL); return resp
 
-    @app.post("/api/auth/login-form", response_model=TokenOut, tags=["Auth"])
-    def login_form(username: Optional[str] = Form(None), email: Optional[str] = Form(None),
-                   password: str = Form(...), db: Session = Depends(get_db)):
+    @app.post("/api/auth/login-form", response_model=TokenOut)
+    def login_form(username: Optional[str] = Form(None), email: Optional[str] = Form(None), password: str = Form(...), db: Session = Depends(get_db)):
         ident = (email or username or "").strip()
-        if not ident:
-            raise HTTPException(status_code=422, detail="identifier required")
-        return login(LoginIn(identifier=ident, password=password), db)  # type: ignore[misc]
+        if not ident: raise HTTPException(status_code=422, detail="identifier required")
+        return login(LoginIn(identifier=ident, password=password), db)  # type: ignore
 
-    @app.post("/api/auth/token/refresh", response_model=TokenOut, tags=["Auth"])
+    @app.post("/api/auth/token/refresh", response_model=TokenOut)
     def refresh_token(request: Request, db: Session = Depends(get_db)):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
             auth = request.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
                 raw = auth.split(" ", 1)[1].strip()
-        if not raw:
-            raise HTTPException(status_code=401, detail="Missing token")
+        if not raw: raise HTTPException(status_code=401, detail="Missing token")
         ok, user_id = _verify_token(raw)
-        if not ok or not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        # fetch user (optional)
+        if not ok or not user_id: raise HTTPException(status_code=401, detail="Invalid token")
         user = _get_user_by_id(db, user_id) or {"id": user_id}
         access = _mint_token(user_id=user_id, ttl=ACCESS_TTL)
         resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
+        _set_access_cookie(resp, access, ACCESS_TTL); return resp
 
-    @app.post("/api/auth/logout", status_code=204, tags=["Auth"])
+    @app.post("/api/auth/logout", status_code=204)
     def logout():
-        resp = Response(status_code=204)
-        _clear_access_cookie(resp)
-        return resp
+        resp = Response(status_code=204); _clear_access_cookie(resp); return resp
 
-    @app.get("/api/auth/me", tags=["Auth"])
+    @app.get("/api/auth/me")
     def me(request: Request, db: Session = Depends(get_db)):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
             auth = request.headers.get("authorization", "")
             if auth.lower().startswith("bearer "):
                 raw = auth.split(" ", 1)[1].strip()
-        if not raw:
-            raise HTTPException(status_code=401, detail="Missing token")
+        if not raw: raise HTTPException(status_code=401, detail="Missing token")
         ok, user_id = _verify_token(raw)
-        if not ok or not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        if not ok or not user_id: raise HTTPException(status_code=401, detail="Invalid token")
         u = _get_user_by_id(db, user_id)
-        return {"id": user_id, "email": u.get("email") if u else None, "username": (u or {}).get("username")}
+        return {"id": user_id, "email": (u or {}).get("email"), "username": (u or {}).get("username")}
 
-    @app.get("/api/auth/session/verify", tags=["Auth"])
+    @app.get("/api/auth/session/verify")
     def verify_session(request: Request):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
@@ -659,14 +545,7 @@ def _include_auth_routers():
 
 _include_auth_routers()
 
-# ────────────────────────── Local dev runner ──────────────────────────
-# Hii hukuwezesha: `python backend/main.py` ku-run uvicorn moja kwa moja.
-
+# ────────────────────────── Local runner ───────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "backend.main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=env_bool("DEV_RELOAD", True),
-    )
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=env_bool("DEV_RELOAD", True))
