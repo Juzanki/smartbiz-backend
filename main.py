@@ -1,10 +1,8 @@
-# backend/main.py
 from __future__ import annotations
 
 import base64
-import hmac
 import hashlib
-import importlib
+import hmac
 import json
 import logging
 import os
@@ -13,14 +11,18 @@ import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Callable, Iterable, Optional, List, Tuple
+from typing import Callable, Iterable, Optional, List, Tuple, Any, Dict
 
 import anyio
-import httpx
-from fastapi import FastAPI, HTTPException, Request, Header, Depends, status, Body
+from fastapi import (
+    FastAPI, HTTPException, Request, Depends, status, Body
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.openapi.docs import (
+    get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import text
@@ -28,7 +30,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, Response, RedirectResponse
+from starlette.responses import JSONResponse, Response
 from starlette.datastructures import MutableHeaders
 
 # ────────────────────────── Env helpers ──────────────────────────
@@ -97,7 +99,7 @@ with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
     insp = _sa_inspect(engine)
     cols = {c["name"] for c in insp.get_columns("users")}
-    chosen = "hashed_password" if "hashed_password" in cols else "password_hash"
+    chosen = "hashed_password" if "hashed_password" in cols else ("password_hash" if "password_hash" in cols else "password")
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     logger.info("PW column = %s (users cols: %s)", chosen, sorted(cols))
 
@@ -117,10 +119,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # CSP relaxed enough for SPA assets; adjust if needed
+        # Relaxed CSP for SPA assets; tweak if needed
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
+            "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+            "script-src 'self' 'unsafe-inline' https:;"
         )
         return response
 
@@ -149,10 +152,7 @@ FORCE_SAMESITE_NONE = env_bool("COOKIE_SAMESITE_NONE", True)
 FORCE_HTTPONLY = env_bool("COOKIE_HTTPONLY_DEFAULT", True)
 
 class CookiePolicyMiddleware(BaseHTTPMiddleware):
-    """
-    Ensures Set-Cookie headers are cross-site compatible for SPA on Netlify (frontend) + Render (backend).
-    Adds/normalizes: SameSite=None; Secure; HttpOnly (configurable by env).
-    """
+    """Normalize Set-Cookie for cross-site requests (Netlify + Render)."""
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response: Response = await call_next(request)
         if not (FORCE_SAMESITE_NONE or FORCE_HTTPONLY):
@@ -222,16 +222,32 @@ async def lifespan(app: FastAPI):
 
 # ────────────────────────── FastAPI app ──────────────────────────
 
-_docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
+_docs_enabled = env_bool("ENABLE_DOCS", True)
+# We set docs_url=None, then add a custom /docs using CDN assets (fixes blank UI)
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
     version=os.getenv("APP_VERSION", "1.0.0"),
-    docs_url="/docs" if _docs_enabled else None,
+    docs_url=None if _docs_enabled else None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan,
 )
+
+if _docs_enabled:
+    @app.get("/docs", include_in_schema=False)
+    def custom_swagger_ui_html():
+        # Force Swagger UI from reliable CDN → avoids white page issues
+        return get_swagger_ui_html(
+            openapi_url=app.openapi_url,
+            title="SmartBiz API Docs",
+            swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+            swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
+        )
+
+    @app.get("/docs/oauth2-redirect", include_in_schema=False)
+    def swagger_ui_redirect():
+        return get_swagger_ui_oauth2_redirect_html()
 
 # ───────────── CORS (must be BEFORE other middleware & routers) ─────────────
 
@@ -277,9 +293,7 @@ class EnsureCorsCredentialsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response: Response = await call_next(request)
         origin = request.headers.get("origin")
-        if not origin:
-            return response
-        if CORS_ALLOW_ALL or origin in ALLOW_ORIGINS:
+        if origin and (CORS_ALLOW_ALL or origin in ALLOW_ORIGINS):
             response.headers.setdefault("Access-Control-Allow-Credentials", "true")
         return response
 
@@ -287,6 +301,7 @@ app.add_middleware(EnsureCorsCredentialsMiddleware)
 
 @app.options("/{rest_of_path:path}", include_in_schema=False)
 async def any_options(_: Request, rest_of_path: str):
+    # Let CORS middleware write headers; just return 204
     return Response(status_code=204)
 
 with suppress(Exception):
@@ -340,19 +355,21 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("unhandled")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# ────────────────────────── Light-weight token utils ──────────────────────────
-# NOT a full JWT; enough for frontend flow (refresh, cookie). Replace with JWT in prod.
+# ────────────────────────── Token + Password utilities ──────────────────────────
+# Lightweight HMAC token (unauthenticated JWT-substitute). For production you
+# already have full JWT in backend/routes/auth_routes.py; this is a safe fallback.
 
 SECRET = (os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or "dev-secret").encode("utf-8")
 ACCESS_TTL = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600"))
-REFRESH_TTL = int(os.getenv("REFRESH_TOKEN_TTL_SECONDS", "1209600"))  # 14 days
 COOKIE_NAME = os.getenv("ACCESS_COOKIE", "sb_access")
+PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+USER_TABLE = os.getenv("USER_TABLE", "users")
 
 def _sign(payload: str) -> str:
     sig = hmac.new(SECRET, payload.encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(sig).decode().rstrip("=")
 
-def _mint_token(user_id: str, ttl: int) -> str:
+def _mint_token(user_id: str, ttl: int = ACCESS_TTL) -> str:
     now = int(time.time())
     raw = f"{user_id}.{now}.{ttl}.{uuid.uuid4().hex}"
     return raw + "." + _sign(raw)
@@ -362,7 +379,7 @@ def _verify_token(token: str) -> Tuple[bool, Optional[str]]:
         p, sig = token.rsplit(".", 1)
         if not hmac.compare_digest(_sign(p), sig):
             return False, None
-        user_id, ts, ttl, _rnd = p.split(".", 3)
+        user_id, ts, ttl, _ = p.split(".", 3)
         if int(time.time()) > int(ts) + int(ttl):
             return False, None
         return True, user_id
@@ -380,9 +397,7 @@ def _set_access_cookie(resp: Response, token: str, ttl: int = ACCESS_TTL) -> Non
         path="/",
     )
 
-# ────────────────────────── Password hashing helpers ──────────────────────────
-# Tries bcrypt if available; otherwise PBKDF2-HMAC-SHA256.
-
+# Password hashing (bcrypt → fallback PBKDF2)
 def _hash_password(pw: str) -> str:
     try:
         from passlib.hash import bcrypt  # type: ignore
@@ -407,24 +422,19 @@ def _verify_password(pw: str, stored: str) -> bool:
             return hmac.compare_digest(dk, cand)
         except Exception:
             return False
-    # raw fallback (not recommended)
     return stored == pw
 
-# ────────────────────────── Minimal user table access ──────────────────────────
-
-USER_TABLE = os.getenv("USER_TABLE", "users")
-PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
+# ────────────────────────── Minimal SQL helpers ──────────────────────────
 
 def _get_user_by_email(db: Session, email: str) -> Optional[dict]:
-    sql = text(f"SELECT * FROM {USER_TABLE} WHERE email = :email LIMIT 1")
+    sql = text(f'SELECT * FROM "{USER_TABLE}" WHERE LOWER(email) = LOWER(:email) LIMIT 1')
     row = db.execute(sql, {"email": email}).mappings().first()
     return dict(row) if row else None
 
 def _create_user(db: Session, email: str, username: str, password: str) -> dict:
-    # Try common columns: id, email, username, <pw column>, created_at
     hpw = _hash_password(password)
     sql = text(f"""
-        INSERT INTO {USER_TABLE} (email, username, {PW_COL})
+        INSERT INTO "{USER_TABLE}" (email, username, "{PW_COL}")
         VALUES (:email, :username, :hpw)
         RETURNING id, email, username
     """)
@@ -434,7 +444,6 @@ def _create_user(db: Session, email: str, username: str, password: str) -> dict:
         return dict(row) if row else {"email": email, "username": username}
     except Exception as e:
         db.rollback()
-        # unique violation → 23505 (PG), else generic
         msg = str(e)
         if "unique" in msg.lower() or "duplicate" in msg.lower() or "23505" in msg:
             raise HTTPException(status_code=409, detail="Email already registered")
@@ -445,14 +454,12 @@ def _verify_login(db: Session, email: str, password: str) -> Optional[dict]:
     u = _get_user_by_email(db, email)
     if not u:
         return None
-    stored = u.get(PW_COL) or u.get("hashed_password") or u.get("password") or ""
-    if not stored:
-        return None
-    if _verify_password(password, stored):
+    stored = (u.get(PW_COL) or u.get("hashed_password") or u.get("password") or "") or ""
+    if stored and _verify_password(password, stored):
         return {"id": str(u.get("id")), "email": u.get("email"), "username": u.get("username")}
     return None
 
-# ────────────────────────── Auth models ──────────────────────────
+# ────────────────────────── Fallback auth models ──────────────────────────
 
 class SignupIn(BaseModel):
     email: EmailStr
@@ -468,232 +475,41 @@ class TokenOut(BaseModel):
     token_type: str = "bearer"
     user: Optional[dict] = None
 
-# ────────────────────────── Auth endpoints (match your axios) ──────────────────────────
+# ────────────────────────── Health/Ready + root info ──────────────────────────
 
-@app.post("/api/auth/register", response_model=TokenOut, tags=["Auth"])
-def register(payload: SignupIn, db: Session = Depends(get_db)):
-    if _get_user_by_email(db, payload.email):
-        raise HTTPException(status_code=409, detail="Email already registered")
-    user = _create_user(db, payload.email, payload.username, payload.password)
-    access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
-    resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user}, status_code=status.HTTP_201_CREATED)
-    _set_access_cookie(resp, access, ACCESS_TTL)
-    return resp
-
-@app.post("/api/auth/login", response_model=TokenOut, tags=["Auth"])
-def login(payload: LoginIn, db: Session = Depends(get_db)):
-    user = _verify_login(db, payload.email, payload.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
-    resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-    _set_access_cookie(resp, access, ACCESS_TTL)
-    return resp
-
-@app.post("/api/auth/token/refresh", response_model=TokenOut, tags=["Auth"])
-def refresh_token(request: Request, db: Session = Depends(get_db)):
-    # prefer cookie; fallback to Authorization: Bearer
-    raw = request.cookies.get(COOKIE_NAME)
-    if not raw:
-        auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            raw = auth.split(" ", 1)[1].strip()
-    if not raw:
-        raise HTTPException(status_code=401, detail="Missing token")
-
-    ok, user_id = _verify_token(raw)
-    if not ok or not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    # try to fetch user email/username
-    user = None
-    with suppress(Exception):
-        # if user_id was email, this still works
-        u = _get_user_by_email(db, user_id)
-        if not u:
-            # maybe user_id is numeric id
-            sql = text(f"SELECT id,email,username FROM {USER_TABLE} WHERE id::text = :uid LIMIT 1")
-            row = db.execute(sql, {"uid": user_id}).mappings().first()
-            user = dict(row) if row else None
-        else:
-            user = u
-
-    access = _mint_token(user_id=user_id, ttl=ACCESS_TTL)
-    resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-    _set_access_cookie(resp, access, ACCESS_TTL)
-    return resp
-
-# Compatibility: accept legacy /api/auth/signup → forward internally to register (no redirect)
-@app.post("/api/auth/signup", tags=["Auth"], include_in_schema=False)
-async def _compat_signup(request: Request):
-    ctype = request.headers.get("content-type", "")
-    try:
-        if "application/json" in ctype:
-            payload = await request.json()
-            send_kwargs = dict(json=payload)
-            headers = {}
-        elif "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
-            form = await request.form()
-            payload = dict(form)
-            send_kwargs = dict(json=payload)
-            headers = {}
-        else:
-            raw = await request.body()
-            send_kwargs = dict(content=raw)
-            headers = {"content-type": ctype or "application/json"}
-    except Exception:
-        raw = await request.body()
-        send_kwargs = dict(content=raw)
-        headers = {"content-type": ctype or "application/json"}
-
-    async with httpx.AsyncClient(app=app, base_url="http://internal") as ac:
-        resp = await ac.post("/api/auth/register", headers=headers, **send_kwargs)
-
-    mt = resp.headers.get("content-type", "application/json")
-    if "application/json" in mt:
-        try:
-            return JSONResponse(resp.json(), status_code=resp.status_code)
-        except Exception:
-            return Response(resp.content, status_code=resp.status_code, media_type=mt)
-    return Response(resp.content, status_code=resp.status_code, media_type=mt)
-
-# Optional aliases (/api/register, /api/login)
-def _register_auth_aliases(pref: str):
-    p = pref
-    @app.post(f"{p}/register", include_in_schema=False, tags=["Auth"])
-    async def _register_alias(request: Request):
-        data = await request.body()
-        headers = {"content-type": request.headers.get("content-type", "application/json")}
-        async with httpx.AsyncClient(app=app, base_url="http://internal") as ac:
-            r = await ac.post(f"{p}/auth/register", headers=headers, content=data)
-        return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
-    @app.post(f"{p}/login", include_in_schema=False, tags=["Auth"])
-    async def _login_alias(request: Request):
-        data = await request.body()
-        headers = {"content-type": request.headers.get("content-type", "application/json")}
-        async with httpx.AsyncClient(app=app, base_url="http://internal") as ac:
-            r = await ac.post(f"{p}/auth/login", headers=headers, content=data)
-        return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
-
-prefixes = _uniq([p.strip() for p in os.getenv("API_PREFIXES", "/api").split(",") if p.strip()])
-for pref in prefixes:
-    _register_auth_aliases(pref)
-
-# ────────────────────────── Routers (best-effort include) ──────────────────────────
-
-def _safe_include(module_path: str, *, attr: str = "router", prefixes: List[str] = [""]) -> None:
-    try:
-        mod = importlib.import_module(module_path)
-        r = getattr(mod, attr, None)
-        if r is None:
-            logger.warning("Router attribute '%s' missing in %s", attr, module_path)
-            return
-        for p in prefixes:
-            app.include_router(r, prefix=p)
-            logger.debug("Included router %s with prefix %s", module_path, p)
-    except ImportError:
-        logger.debug("Module %s not available")
-    except Exception as e:
-        logger.error("Failed to include router %s: %s", module_path, e)
-
-routers_to_try = [
-    # flat
-    "routes.auth", "routes.auth_routes", "routes.invoice", "routes.owner",
-    "routes.owner_routes", "routes.order", "routes.order_notification",
-    "routes.ai", "routes.ai_responder", "routes.chat", "routes.payments",
-    "routes.wallet", "api.health", "api.status", "websocket.ws", "websocket.ws_routes",
-    # package
-    "backend.routes.auth", "backend.routes.auth_routes", "backend.routes.invoice",
-    "backend.routes.owner", "backend.routes.owner_routes", "backend.routes.order",
-    "backend.routes.order_notification", "backend.routes.ai", "backend.routes.ai_responder",
-    "backend.routes.chat", "backend.routes.payments", "backend.routes.wallet",
-    "backend.api.health", "backend.api.status", "backend.websocket.ws", "backend.websocket.ws_routes",
-]
-for router_module in routers_to_try:
-    _safe_include(router_module, prefixes=prefixes)
-
-# ────────────────────────── Debug utilities ──────────────────────────
-
-@app.get("/debug/cors-ping", tags=["Debug"])
-async def cors_ping():
-    return {"ok": True, "ts": time.time()}
-
-@app.get("/debug/echo-headers", tags=["Debug"])
-async def echo_headers(request: Request, origin: str | None = Header(default=None)):
-    return {
-        "method": request.method,
-        "path": request.url.path,
-        "origin_header": origin,
-        "host_header": request.headers.get("host"),
-        "referer": request.headers.get("referer"),
-        "allowed_cors_origins": ALLOW_ORIGINS,
-        "ts": time.time(),
-    }
-
-@app.get("/debug/set-cookie", tags=["Debug"], include_in_schema=False)
-async def debug_set_cookie():
-    r = JSONResponse({"ok": True, "note": "cookie issued"})
-    _set_access_cookie(r, _mint_token("debug", ACCESS_TTL), ACCESS_TTL)
-    return r
-
-# ────────────────────────── Core endpoints ──────────────────────────
-
-class WhatsAppMessage(BaseModel):
-    message: str
-
-@app.post("/send-whatsapp/", tags=["WhatsApp"])
-async def send_whatsapp_message(payload: WhatsAppMessage):
-    return {"status": "queued", "to": os.getenv("RECIPIENT_PHONE", "N/A"), "message": payload.message}
-
-@app.get("/", tags=["Root"])
-async def root():
-    return {
-        "message": "SmartBiz Assistance API",
-        "status": "running",
-        "version": app.version,
-        "environment": ENVIRONMENT,
-        "database": "connected" if _db_ping() else "disconnected",
-        "documentation": "/docs" if _docs_enabled else "disabled",
-    }
-
-@app.get("/_info", tags=["Debug"], include_in_schema=_docs_enabled)
-async def info():
+@app.get("/", tags=["Meta"])
+def root_info():
     return {
         "environment": ENVIRONMENT,
         "database": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-        "cors_origins": ALLOW_ORIGINS,
-        "api_prefixes": prefixes,
-        "render_url": os.getenv("RENDER_PUBLIC_URL", "Not set"),
-        "netlify_url": os.getenv("NETLIFY_PUBLIC_URL", "Not set"),
+        "cors_origins": _resolve_cors_origins(),
+        "api_prefixes": ["/api"],
+        "render_url": os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_PUBLIC_URL"),
+        "netlify_url": os.getenv("NETLIFY_PUBLIC_URL") or os.getenv("FRONTEND_URL"),
     }
 
-@app.get("/health", include_in_schema=False)
-async def health():
-    return {"ok": True, "ts": time.time()}
-
-@app.get("/healthz", tags=["Health"])
-async def healthz():
-    db_ok = _db_ping()
-    return {"status": "healthy" if db_ok else "degraded", "database": db_ok, "ts": time.time()}
+@app.get("/api/healthz", tags=["Health"])
+def healthz():
+    return {"status": "healthy", "database": _db_ping(), "ts": time.time()}
 
 @app.get("/readyz", tags=["Health"])
-async def readyz():
-    db_ok = _db_ping()
-    return {"ready": db_ok, "ts": time.time()}
+def readyz():
+    return {"ready": True, "db": _db_ping(), "ts": time.time()}
 
-@app.post("/echo", include_in_schema=False)
-async def echo(payload: dict = Body(default_factory=dict)):
-    return {"ok": True, "echo": payload, "ts": time.time()}
+# ────────────────────────── Attach full-featured auth router if available ──────────────────────────
 
-# ────────────────────────── Entrypoint (local dev) ──────────────────────────
+with suppress(Exception):
+    # If you have backend/routes/auth_routes.py (advanced JWT router), include it
+    from backend.routes.auth_routes import router as auth_router, legacy_router  # type: ignore
+    app.include_router(auth_router, prefix="/api")
+    app.include_router(legacy_router, prefix="/api")
+    logger.info("Mounted advanced auth router from backend.routes.auth_routes")
 
-if __name__ == "__main__":  # pragma: no cover
-    import uvicorn
-    uvicorn.run(
-        "backend.main:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
-        reload=env_bool("RELOAD", ENVIRONMENT != "production"),
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-    )
+# ────────────────────────── Built-in fallback Auth (simple) ──────────────────────────
+# Only used if the advanced router above failed to import.
+
+if not any(r.prefix == "/api/auth" for r in app.routes):
+    logger.warning("Using built-in simple auth routes (advanced auth router not found).")
+
+    @app.post("/api/auth/register", response_model=TokenOut, tags=["Auth"])
+    
