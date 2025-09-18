@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 """
-SmartBiz Auth Router (production-ready)
+SmartBiz Auth Router (production-ready, URL-aware)
 
 Routes (prefixed by /api from main.py, then /auth here):
-- POST /auth/login              (email | username | phone; JSON or form)
-- POST /auth/register           (creates user)       [201 Created]
-- POST /auth/signup             (alias of register)  [201 Created]
-- GET  /auth/me                 (current user from token/cookie)
-- GET  /auth/_whoami            (debug: raw claims)
-- POST /auth/logout             (clear cookie)
-- POST /auth/token/refresh      (rotate short-lived token)
-- POST /auth/change-password    (change own password)
-- GET  /auth/session/verify     (true/false)
-- GET  /auth/_diag              (columns)
+- POST /auth/login                 (email | username | phone; JSON au form)
+- POST /auth/register              (JSON)
+- POST /auth/register-form         (form-data: username,email,password[,phone_number,full_name])
+- POST /auth/signup                (alias ya register)
+- GET  /auth/register              (maelekezo: tumia POST)
+- GET  /auth/signup                (maelekezo: tumia POST)
+- GET  /auth/me                    (current user kutoka token/cookie)
+- GET  /auth/_whoami               (debug claims)
+- POST /auth/logout                (clear cookie)
+- POST /auth/token/refresh         (rotate token)
+- POST /auth/change-password       (badili password yako)
+- GET  /auth/session/verify        (true/false)
+- GET  /auth/_meta                 (HUONESHA URL KAMILI za auth zako)
+- GET  /auth/_diag                 (columns)
 - GET  /auth/_diag/columns/{table}
 - GET  /auth/_diag/pwhash
+- OPTIONS /auth/{path}             (CORS preflight 204)
 """
 
 import base64
@@ -30,7 +35,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Form
 from pydantic import BaseModel, EmailStr, Field, validator
 from sqlalchemy import func, or, text
 from sqlalchemy.exc import (
@@ -43,7 +48,7 @@ from sqlalchemy.exc import (
 )
 from sqlalchemy.orm import Session, load_only, noload
 
-# ───────────────────────────────── DB wiring (layout-safe) ─────────────────────────────────
+# ──────────────── DB wiring (layout-safe) ────────────────
 try:
     from db import get_db, engine  # type: ignore
 except Exception:  # pragma: no cover
@@ -54,9 +59,8 @@ try:
 except Exception:  # pragma: no cover
     from backend.models.user import User  # type: ignore
 
-# ───────────────────────────────── Security helpers (hash/verify) ─────────────────────────────────
+# ──────────────── Security helpers (hash/verify) ────────────────
 try:
-    # preferred helper if you already have it
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
 except Exception:
     from passlib.hash import bcrypt  # type: ignore
@@ -70,23 +74,19 @@ except Exception:
         except Exception:
             return False
 
-# ───────────────────────────────── JWT (PyJWT) ─────────────────────────────────
+# ──────────────── JWT (PyJWT) ────────────────
 SECRET_KEY = os.getenv("SECRET_KEY") or base64.urlsafe_b64encode(os.urandom(48)).decode()
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))        # 1h default
-REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))   # 30d (reserved)
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))        # 1h
+REFRESH_MIN = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "43200"))   # 30d
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _ts(dt: datetime) -> int:
-    return int(dt.timestamp())
+def _now() -> datetime: return datetime.now(timezone.utc)
+def _ts(dt: datetime) -> int: return int(dt.timestamp())
 
 def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> str:
     now = _now()
     payload = {"typ": "access", "iss": "smartbiz-api", "iat": _ts(now), "exp": _ts(now + timedelta(minutes=minutes)), **claims}
-    if "sub" in payload:
-        payload["sub"] = str(payload["sub"])
+    if "sub" in payload: payload["sub"] = str(payload["sub"])
     return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
 
 def decode_token(token: str) -> Dict[str, Any]:
@@ -108,7 +108,7 @@ def get_current_user_from_token(request: Request) -> Dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# ───────────────────────────────── Config / Flags ─────────────────────────────────
+# ──────────────── Config / Flags ────────────────
 logger = logging.getLogger("smartbiz.auth")
 router = APIRouter(prefix="/auth", tags=["Auth"])
 legacy_router = APIRouter(tags=["Auth"])
@@ -133,7 +133,7 @@ ALLOW_REG = (
     or _flag("SMARTBIZ_ALLOW_SIGNUP", "true")
 )
 
-# simple in-memory rate limiter: (identifier|ip) per minute
+# simple in-memory rate limiter
 LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
@@ -141,7 +141,6 @@ _LOGIN_BUCKET: Dict[str, List[float]] = {}
 def _rate_ok(key: str) -> bool:
     now = time.time()
     bucket = _LOGIN_BUCKET.setdefault(key, [])
-    # drop old stamps
     while bucket and (now - bucket[0]) > _RATE_WIN:
         bucket.pop(0)
     if len(bucket) >= LOGIN_RATE_MAX_PER_MIN:
@@ -149,7 +148,19 @@ def _rate_ok(key: str) -> bool:
     bucket.append(now)
     return True
 
-# ───────────────────────────────── Normalizers ─────────────────────────────────
+# ──────────────── URL helpers (hutengeneza absolute URLs) ────────────────
+def _base_url(request: Request) -> str:
+    env = (os.getenv("BACKEND_PUBLIC_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+def _url(request: Request, path: str) -> str:
+    base = _base_url(request)
+    path = path if path.startswith("/") else ("/" + path)
+    return base + path
+
+# ──────────────── Normalizers ────────────────
 _phone_digits = re.compile(r"\D+")
 def _norm(s: Optional[str]) -> str: return (s or "").strip()
 def _norm_email(s: Optional[str]) -> str: return _norm(s).lower()
@@ -157,10 +168,9 @@ def _norm_username(s: Optional[str]) -> str: return " ".join(_norm(s).split()).l
 def _norm_phone(s: Optional[str]) -> str:
     s = _norm(s)
     if not s: return ""
-    # keep leading + if any; otherwise digits only
     return "+" + _phone_digits.sub("", s) if s.startswith("+") else _phone_digits.sub("", s)
 
-# ───────────────────────────────── DB inspection helpers ─────────────────────────────────
+# ──────────────── DB inspection helpers ────────────────
 @lru_cache(maxsize=1)
 def _users_columns() -> set[str]:
     from sqlalchemy import inspect as _inspect
@@ -178,12 +188,11 @@ def _model_col(model, name: str):
     try:
         if hasattr(model, name):
             return getattr(model, name)
-        # try fallback to table column
         return model.__table__.c[name]  # type: ignore[attr-defined]
     except Exception:
         return None
 
-def _first_existing_attr(candidates: List[str]) -> Tuple[Optional[Any], Optional[str]]:
+def _first_existing_attr(candidates: List[str]):
     prefer = os.getenv("SMARTBIZ_PWHASH_COL")
     if prefer and _col_exists(prefer) and hasattr(User, prefer):
         return getattr(User, prefer), prefer
@@ -201,7 +210,7 @@ def _pwd_col_name() -> Optional[str]:
             return n
     return None
 
-# ───────────────────────────────── Schemas ─────────────────────────────────
+# ──────────────── Schemas ────────────────
 class LoginJSON(BaseModel):
     email: Optional[EmailStr] = None
     username: Optional[str] = None
@@ -242,27 +251,23 @@ class ChangePasswordInput(BaseModel):
     old_password: str = Field(..., min_length=1, max_length=256)
     new_password: str = Field(..., min_length=6, max_length=128)
 
-# ───────────────────────────────── Small helpers ─────────────────────────────────
+# ──────────────── Small helpers ────────────────
 def _safe_eq(col, value: str):
-    try:  # case-insensitive compare if backend supports func.lower
+    try:
         return col == value
     except Exception:
         return func.lower(col) == value.lower()
 
 def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
     def val(n: str): return getattr(u, n) if n in names and hasattr(u, n) else None
-    # phone
     phone = None
     for n in ("phone_number", "phone", "mobile", "msisdn"):
         if n in names:
-            phone = val(n)
-            if phone: break
-    # username
+            phone = val(n); break
     username = None
     for n in ("username", "user_name", "handle"):
         if n in names:
-            username = val(n)
-            if username: break
+            username = val(n); break
     out = {
         "id": val("id"),
         "email": val("email"),
@@ -271,8 +276,7 @@ def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
         "role": val("role"),
         "phone_number": phone,
     }
-    if out.get("id") is not None:
-        out["id"] = str(out["id"])
+    if out.get("id") is not None: out["id"] = str(out["id"])
     return out
 
 def _issue_tokens_for_user(user: Any) -> str:
@@ -296,7 +300,7 @@ def _set_auth_cookie(response: Response, token: str) -> None:
 def _clear_auth_cookie(response: Response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path=COOKIE_PATH, domain=COOKIE_DOMAIN)
 
-# ───────────────────────────────── RAW SQL fallbacks ─────────────────────────────────
+# ──────────────── RAW SQL fallbacks ────────────────
 def _sql_fetch_user_by_ident(db: Session, ident: str) -> Optional[Dict[str, Any]]:
     cols = _users_columns()
     pwcol = _pwd_col_name()
@@ -311,18 +315,13 @@ def _sql_fetch_user_by_ident(db: Session, ident: str) -> Optional[Dict[str, Any]
 
     where_parts, params = [], {}
     if "email" in cols:
-        where_parts.append('LOWER("email") = LOWER(:email)')
-        params["email"] = ident
+        where_parts.append('LOWER("email") = LOWER(:email)'); params["email"] = ident
     for cand in ("username","user_name","handle"):
         if cand in cols:
-            where_parts.append(f'LOWER("{cand}") = LOWER(:uname)')
-            params.setdefault("uname", ident)
-            break
+            where_parts.append(f'LOWER("{cand}") = LOWER(:uname)'); params.setdefault("uname", ident); break
     for cand in ("phone_number","phone","mobile","msisdn"):
         if cand in cols:
-            where_parts.append(f'"{cand}" = :phone')
-            params.setdefault("phone", _phone_digits.sub("", ident))
-            break
+            where_parts.append(f'"{cand}" = :phone'); params.setdefault("phone", _phone_digits.sub("", ident)); break
     if not where_parts:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -341,14 +340,12 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
     if "full_name" in cols and data.full_name: fields["full_name"] = _norm(data.full_name)
     for cand in ("username","user_name","handle"):
         if cand in cols:
-            fields[cand] = _norm_username(data.username)
-            break
+            fields[cand] = _norm_username(data.username); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
         ph = _phone_digits.sub("", data.phone_number)
         for cand in ("phone_number","phone","mobile","msisdn"):
             if cand in cols:
-                fields[cand] = ph
-                break
+                fields[cand] = ph; break
     if "is_active" in cols: fields.setdefault("is_active", True)
     if "is_verified" in cols: fields.setdefault("is_verified", False)
     if "subscription_status" in cols: fields.setdefault("subscription_status", "free")
@@ -363,11 +360,10 @@ def _sql_insert_user(db: Session, data: RegisterInput) -> Dict[str, Any]:
 
     out = {"id": new_id}
     for k in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn"):
-        if k in fields:
-            out[k] = fields[k]
+        if k in fields: out[k] = fields[k]
     return {"message": "Registration successful", "user": out}
 
-# ───────────────────────────────── Login (ORM → SQL fallback) ─────────────────────────────────
+# ──────────────── Login (ORM → SQL fallback) ────────────────
 class _LoginPayload(BaseModel):
     identifier: str
     password: str
@@ -391,13 +387,13 @@ async def _parse_login(request: Request) -> _LoginPayload:
         raise HTTPException(status_code=400, detail="missing_credentials")
     return _LoginPayload(identifier=ident, password=pwd)
 
+def _rate_ok_or_429(identifier: str, ip: str):
+    if not _rate_ok(f"{identifier}|{ip}"):
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+
 async def _do_login(request: Request, db: Session, response: Response) -> LoginOutput:
     data = await _parse_login(request)
-
-    # rate limit
-    ip = request.client.host if request.client else "0.0.0.0"
-    if not _rate_ok(f"{data.identifier}|{ip}"):
-        raise HTTPException(status_code=429, detail="too_many_attempts")
+    _rate_ok_or_429(data.identifier, request.client.host if request.client else "0.0.0.0")
 
     cols = _users_columns()
 
@@ -416,15 +412,13 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
                 if cand in cols:
                     col = _model_col(User, cand)
                     if col is not None:
-                        conds.append(_safe_eq(col, uname))
-                        break
+                        conds.append(_safe_eq(col, uname)); break
         if ALLOW_PHONE_LOGIN and phone:
             for cand in ("phone_number","phone","mobile","msisdn"):
                 if cand in cols:
                     col = _model_col(User, cand)
                     if col is not None:
-                        conds.append(col == phone)
-                        break
+                        conds.append(col == phone); break
 
         if not conds:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -435,14 +429,12 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
 
         load_names: List[str] = ["id", pwd_name]
         for n in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn","is_active"):
-            if _col_exists(n) and _is_mapped(n):
-                load_names.append(n)
+            if _col_exists(n) and _is_mapped(n): load_names.append(n)
 
         seen, only_names = set(), []
         for n in load_names:
             if n not in seen and _is_mapped(n):
-                seen.add(n)
-                only_names.append(n)
+                seen.add(n); only_names.append(n)
         only_attrs = [getattr(User, n) for n in only_names]
 
         user = db.query(User).options(noload("*"), load_only(*only_attrs)).filter(or_(*conds)).limit(1).first()
@@ -477,26 +469,22 @@ async def _do_login(request: Request, db: Session, response: Response) -> LoginO
 
     token = create_access_token({"sub": str(row.get("id")), "email": row.get("email")})
     _set_auth_cookie(response, token)
-    if pwcol and pwcol in row:
-        row.pop(pwcol, None)
-    names = set(row.keys())
-    return LoginOutput(access_token=token, user={k: row.get(k) for k in names})
+    if pwcol and pwcol in row: row.pop(pwcol, None)
+    return LoginOutput(access_token=token, user=row)
 
-# ───────────────────────────────── Register (ORM → SQL fallback) ─────────────────────────────────
+# ──────────────── Register (ORM → SQL fallback) ────────────────
 def _build_user_kwargs(data: RegisterInput, cols: set[str]) -> Dict[str, Any]:
     kw: Dict[str, Any] = {}
     if "email" in cols and _is_mapped("email"): kw["email"] = _norm_email(data.email)
     if "full_name" in cols and _is_mapped("full_name"): kw["full_name"] = (_norm(data.full_name) or None)
     for cand in ("username","user_name","handle"):
         if cand in cols and _is_mapped(cand) and data.username:
-            kw[cand] = _norm_username(data.username)
-            break
+            kw[cand] = _norm_username(data.username); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
         ph = _phone_digits.sub("", data.phone_number)
         for cand in ("phone_number","phone","mobile","msisdn"):
             if cand in cols and _is_mapped(cand):
-                kw[cand] = ph
-                break
+                kw[cand] = ph; break
     if "is_active" in cols and _is_mapped("is_active"): kw.setdefault("is_active", True)
     if "is_verified" in cols and _is_mapped("is_verified"): kw.setdefault("is_verified", False)
     if "subscription_status" in cols and _is_mapped("subscription_status"): kw.setdefault("subscription_status", "free")
@@ -519,16 +507,14 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
             if cand in cols:
                 col = _model_col(User, cand)
                 if col is not None:
-                    uniq_conds.append(_safe_eq(col, _norm_username(data.username)))
-                    break
+                    uniq_conds.append(_safe_eq(col, _norm_username(data.username))); break
     if ALLOW_PHONE_LOGIN and data.phone_number:
         ph = _phone_digits.sub("", data.phone_number)
         for cand in ("phone_number","phone","mobile","msisdn"):
             if cand in cols:
                 col = _model_col(User, cand)
                 if col is not None:
-                    uniq_conds.append(col == ph)
-                    break
+                    uniq_conds.append(col == ph); break
 
     try:
         if uniq_conds:
@@ -549,9 +535,7 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
         user_kwargs[pwd_name] = get_password_hash(data.password)
 
         new_user = User(**user_kwargs)
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
+        db.add(new_user); db.commit(); db.refresh(new_user)
         names_loaded = {n for n in user_kwargs.keys() if _is_mapped(n)} | {"id"}
         return {"message": "Registration successful", "user": _user_summary_loaded(new_user, names_loaded)}
 
@@ -559,7 +543,7 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
         logger.exception("ORM register failed; falling back to SQL: %s", e)
         return _sql_insert_user(db, data)
 
-# ───────────────────────────────── Routes ─────────────────────────────────
+# ──────────────── Routes ────────────────
 @router.post("/login", response_model=LoginOutput, summary="Login (email/username/phone)")
 async def login(request: Request, response: Response, db: Session = Depends(get_db)):
     return await _do_login(request, db, response)
@@ -572,9 +556,43 @@ async def login_form_legacy(request: Request, response: Response, db: Session = 
 def register(data: RegisterInput, db: Session = Depends(get_db)):
     return _register_core(data, db)
 
+@router.post("/register-form", status_code=status.HTTP_201_CREATED, summary="Register via form-data")
+def register_form(
+    username: str = Form(...),
+    email: EmailStr = Form(...),
+    password: str = Form(...),
+    full_name: Optional[str] = Form(None),
+    phone_number: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    payload = RegisterInput(username=username, email=email, password=password, full_name=full_name, phone_number=phone_number)
+    return _register_core(payload, db)
+
 @router.post("/signup", status_code=status.HTTP_201_CREATED, summary="Signup (alias of register)")
 def signup(data: RegisterInput, db: Session = Depends(get_db)):
     return _register_core(data, db)
+
+# Maelekezo rafiki pale mtu akipiga GET badala ya POST
+@router.get("/register", summary="How to use this endpoint")
+def register_howto(request: Request):
+    return {
+        "hint": "Use POST to create a user.",
+        "url": _url(request, "/api/auth/register"),
+        "accepts": ["application/json", "multipart/form-data"],
+        "json_example": {
+            "username": "juma",
+            "email": "juma@example.com",
+            "password": "strongPass123",
+            "full_name": "Juma Example"
+        }
+    }
+
+@router.get("/signup", summary="How to use this endpoint")
+def signup_howto(request: Request):
+    return {
+        "hint": "Use POST to signup (alias of /register).",
+        "url": _url(request, "/api/auth/signup")
+    }
 
 @router.get("/me", response_model=MeResponse, response_model_exclude_none=True, summary="Get current user")
 def me(request: Request, db: Session = Depends(get_db)):
@@ -591,14 +609,7 @@ def me(request: Request, db: Session = Depends(get_db)):
         fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
         loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
         return _user_summary_loaded(u, loaded)
-    return {
-        "id": str(claims.get("sub") or ""),
-        "email": claims.get("email") or None,
-        "username": None,
-        "full_name": claims.get("name") or None,
-        "role": claims.get("role") or None,
-        "phone_number": None,
-    }
+    return {"id": str(claims.get("sub") or ""), "email": claims.get("email") or None}
 
 @router.get("/_whoami", tags=["Auth"], summary="Debug: raw current user/claims")
 def whoami_raw(request: Request):
@@ -659,10 +670,27 @@ def change_password(data: ChangePasswordInput, db: Session = Depends(get_db), re
         raise HTTPException(status_code=401, detail="Old password is incorrect")
 
     setattr(user, pwd_name, get_password_hash(data.new_password))
-    db.add(user)
-    db.commit()
+    db.add(user); db.commit()
     return Response(status_code=204)
 
+# ──────────────── Meta/discovery: HUONESHA URL KAMILI ────────────────
+@router.get("/_meta", summary="Auth endpoint discovery (absolute URLs)")
+def auth_meta(request: Request):
+    return {
+        "base_url": _base_url(request),
+        "endpoints": {
+            "login": _url(request, "/api/auth/login"),
+            "register": _url(request, "/api/auth/register"),
+            "register_form": _url(request, "/api/auth/register-form"),
+            "signup": _url(request, "/api/auth/signup"),
+            "me": _url(request, "/api/auth/me"),
+            "verify": _url(request, "/api/auth/session/verify"),
+            "logout": _url(request, "/api/auth/logout"),
+            "token_refresh": _url(request, "/api/auth/token/refresh"),
+        }
+    }
+
+# ──────────────── Diagnostics ────────────────
 @router.get("/_diag", tags=["Auth"], summary="Auth diagnostics")
 def auth_diag():
     return {"users_columns": sorted(list(_users_columns()))}
@@ -680,5 +708,10 @@ def diag_columns(table: str, db: Session = Depends(get_db)):
 @router.get("/_diag/pwhash", tags=["Auth"], summary="Which password column is used")
 def diag_pwhash():
     return {"password_column": _pwd_col_name()}
+
+# ──────────────── CORS preflight convenience ────────────────
+@router.options("/{path:path}", include_in_schema=False)
+def auth_preflight(path: str):  # noqa: ARG001
+    return Response(status_code=204)
 
 __all__ = ["router", "legacy_router"]
