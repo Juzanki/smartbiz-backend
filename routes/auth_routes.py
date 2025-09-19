@@ -3,26 +3,25 @@
 from __future__ import annotations
 
 """
-SmartBiz Auth Router (production-ready, URL-aware)
+SmartBiz Auth Router (production-ready, URL-aware) — no /api prefix here.
 
-Routes (prefixed by /api from main.py, then /auth here):
+Main endpoints (all under /auth/*):
 - POST /auth/login                 (email | username | phone; JSON au form)
 - POST /auth/register              (JSON)
-- POST /auth/register-form         (form-data: username,email,password[,phone_number,full_name])
-- POST /auth/signup                (alias ya register)
-- GET  /auth/register              (maelekezo: tumia POST)
-- GET  /auth/signup                (maelekezo: tumia POST)
-- GET  /auth/me                    (current user kutoka token/cookie)
-- GET  /auth/_whoami               (debug claims)
+- POST /auth/register-form         (multipart/form-data)
+- POST /auth/signup                (alias of register)
+- GET  /auth/me                    (current user by token/cookie)
 - POST /auth/logout                (clear cookie)
 - POST /auth/token/refresh         (rotate token)
-- POST /auth/change-password       (badili password yako)
-- GET  /auth/session/verify        (true/false)
-- GET  /auth/_meta                 (HUONESHA URL KAMILI za auth zako)
-- GET  /auth/_diag                 (columns)
+- POST /auth/change-password       (change current password)
+- GET  /auth/session/verify        (boolean)
+- GET  /auth/_meta                 (absolute URLs)
+- GET  /auth/_diag                 (diagnostics)
 - GET  /auth/_diag/columns/{table}
 - GET  /auth/_diag/pwhash
 - OPTIONS /auth/{path}             (CORS preflight 204)
+
+Optional legacy router is exported to ease migration from /api/auth/*.
 """
 
 import base64
@@ -37,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Form
 from pydantic import BaseModel, EmailStr, Field, validator
-from sqlalchemy import func, or, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import (
     DBAPIError,
     IntegrityError,
@@ -63,16 +62,12 @@ except Exception:  # pragma: no cover
 try:
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
 except Exception:
+    # Fallback kwa passlib
     from passlib.hash import bcrypt  # type: ignore
-
-    def get_password_hash(pw: str) -> str:
-        return bcrypt.hash(pw)
-
+    def get_password_hash(pw: str) -> str: return bcrypt.hash(pw)
     def verify_password(pw: str, hashed: str) -> bool:
-        try:
-            return bcrypt.verify(pw, hashed)
-        except Exception:
-            return False
+        try: return bcrypt.verify(pw, hashed)
+        except Exception: return False
 
 # ──────────────── JWT (PyJWT) ────────────────
 SECRET_KEY = os.getenv("SECRET_KEY") or base64.urlsafe_b64encode(os.urandom(48)).decode()
@@ -111,49 +106,44 @@ def get_current_user_from_token(request: Request) -> Dict[str, Any]:
 # ──────────────── Config / Flags ────────────────
 logger = logging.getLogger("smartbiz.auth")
 router = APIRouter(prefix="/auth", tags=["Auth"])
-legacy_router = APIRouter(tags=["Auth"])
-
-USE_COOKIE_AUTH = os.getenv("USE_COOKIE_AUTH", "true").lower() in {"1", "true", "yes", "on", "y"}
-COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
-COOKIE_MAX_AGE = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))
-COOKIE_PATH = os.getenv("AUTH_COOKIE_PATH", "/")
-COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() in {"1", "true", "yes", "on", "y"}
-COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
-COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
-
-ALLOW_PHONE_LOGIN = os.getenv("AUTH_LOGIN_ALLOW_PHONE", "false").lower() in {"1", "true", "yes", "on", "y"}
+# Legacy router (utaweza kui-mount chini ya /api/auth/* ikiwa bado unahitaji)
+legacy_router = APIRouter(tags=["AuthLegacy"])
 
 def _flag(name: str, default: str = "true") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on", "y"}
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
-ALLOW_REG = (
-    _flag("ALLOW_REGISTRATION", "true")
-    or _flag("REGISTRATION_ENABLED", "true")
-    or _flag("SIGNUP_ENABLED", "true")
-    or _flag("SMARTBIZ_ALLOW_SIGNUP", "true")
-)
+USE_COOKIE_AUTH = _flag("USE_COOKIE_AUTH", "true")
+COOKIE_NAME     = os.getenv("AUTH_COOKIE_NAME", "sb_access")
+COOKIE_MAX_AGE  = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))
+COOKIE_PATH     = os.getenv("AUTH_COOKIE_PATH", "/")
+COOKIE_SECURE   = _flag("AUTH_COOKIE_SECURE", "true")
+COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")
+COOKIE_DOMAIN   = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
+
+ALLOW_PHONE_LOGIN = _flag("AUTH_LOGIN_ALLOW_PHONE", "false")
+ALLOW_REG = any([
+    _flag("ALLOW_REGISTRATION", "true"),
+    _flag("REGISTRATION_ENABLED", "true"),
+    _flag("SIGNUP_ENABLED", "true"),
+    _flag("SMARTBIZ_ALLOW_SIGNUP", "true"),
+])
 
 # simple in-memory rate limiter
 LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
-
 def _rate_ok(key: str) -> bool:
     now = time.time()
     bucket = _LOGIN_BUCKET.setdefault(key, [])
     while bucket and (now - bucket[0]) > _RATE_WIN:
         bucket.pop(0)
-    if len(bucket) >= LOGIN_RATE_MAX_PER_MIN:
-        return False
-    bucket.append(now)
-    return True
+    if len(bucket) >= LOGIN_RATE_MAX_PER_MIN: return False
+    bucket.append(now); return True
 
-# ──────────────── URL helpers (hutengeneza absolute URLs) ────────────────
+# ──────────────── URL helpers ────────────────
 def _base_url(request: Request) -> str:
     env = (os.getenv("BACKEND_PUBLIC_URL") or "").strip()
-    if env:
-        return env.rstrip("/")
-    return str(request.base_url).rstrip("/")
+    return (env.rstrip("/") if env else str(request.base_url).rstrip("/"))
 
 def _url(request: Request, path: str) -> str:
     base = _base_url(request)
@@ -186,8 +176,7 @@ def _is_mapped(name: str) -> bool: return hasattr(User, name)
 
 def _model_col(model, name: str):
     try:
-        if hasattr(model, name):
-            return getattr(model, name)
+        if hasattr(model, name): return getattr(model, name)
         return model.__table__.c[name]  # type: ignore[attr-defined]
     except Exception:
         return None
@@ -203,11 +192,9 @@ def _first_existing_attr(candidates: List[str]):
 
 def _pwd_col_name() -> Optional[str]:
     prefer = os.getenv("SMARTBIZ_PWHASH_COL")
-    if prefer and _col_exists(prefer):
-        return prefer
+    if prefer and _col_exists(prefer): return prefer
     for n in ("hashed_password", "password_hash", "password", "pass_hash"):
-        if _col_exists(n):
-            return n
+        if _col_exists(n): return n
     return None
 
 # ──────────────── Schemas ────────────────
@@ -232,8 +219,7 @@ class RegisterInput(BaseModel):
     @validator("username")
     def _v_username(cls, v: str) -> str:
         v = _norm_username(v)
-        if not v:
-            raise ValueError("username required")
+        if not v: raise ValueError("username required")
         return v
 
 class MeResponse(BaseModel):
@@ -243,9 +229,7 @@ class MeResponse(BaseModel):
     full_name: Optional[str] = None
     role: Optional[str] = None
     phone_number: Optional[str] = None
-
-    class Config:
-        orm_mode = True
+    class Config: orm_mode = True
 
 class ChangePasswordInput(BaseModel):
     old_password: str = Field(..., min_length=1, max_length=256)
@@ -253,21 +237,17 @@ class ChangePasswordInput(BaseModel):
 
 # ──────────────── Small helpers ────────────────
 def _safe_eq(col, value: str):
-    try:
-        return col == value
-    except Exception:
-        return func.lower(col) == value.lower()
+    try: return col == value
+    except Exception: return func.lower(col) == value.lower()
 
 def _user_summary_loaded(u: Any, names: set[str]) -> Dict[str, Any]:
     def val(n: str): return getattr(u, n) if n in names and hasattr(u, n) else None
     phone = None
     for n in ("phone_number", "phone", "mobile", "msisdn"):
-        if n in names:
-            phone = val(n); break
+        if n in names: phone = val(n); break
     username = None
     for n in ("username", "user_name", "handle"):
-        if n in names:
-            username = val(n); break
+        if n in names: username = val(n); break
     out = {
         "id": val("id"),
         "email": val("email"),
@@ -309,8 +289,7 @@ def _sql_fetch_user_by_ident(db: Session, ident: str) -> Optional[Dict[str, Any]
 
     select_cols = ["id"]
     for cand in ("email","full_name","role","username","user_name","handle","phone_number","phone","mobile","msisdn",pwcol):
-        if cand in cols:
-            select_cols.append(cand)
+        if cand in cols: select_cols.append(cand)
     sel = ", ".join(f'"{c}"' for c in select_cols)
 
     where_parts, params = [], {}
@@ -384,7 +363,7 @@ async def _parse_login(request: Request) -> _LoginPayload:
             ident = _norm(qp.get("email") or qp.get("username") or qp.get("phone"))
             pwd = _norm(qp.get("password"))
     if not ident or not pwd:
-        raise HTTPException(status_code=400, detail="missing_credentials")
+        raise HTTPException(status_code=422, detail="missing_credentials")
     return _LoginPayload(identifier=ident, password=pwd)
 
 def _rate_ok_or_429(identifier: str, ip: str):
@@ -548,10 +527,6 @@ def _register_core(data: RegisterInput, db: Session) -> Dict[str, Any]:
 async def login(request: Request, response: Response, db: Session = Depends(get_db)):
     return await _do_login(request, db, response)
 
-@legacy_router.post("/login-form", response_model=LoginOutput, summary="Legacy form login")
-async def login_form_legacy(request: Request, response: Response, db: Session = Depends(get_db)):
-    return await _do_login(request, db, response)
-
 @router.post("/register", status_code=status.HTTP_201_CREATED, summary="Register a new user")
 def register(data: RegisterInput, db: Session = Depends(get_db)):
     return _register_core(data, db)
@@ -572,28 +547,6 @@ def register_form(
 def signup(data: RegisterInput, db: Session = Depends(get_db)):
     return _register_core(data, db)
 
-# Maelekezo rafiki pale mtu akipiga GET badala ya POST
-@router.get("/register", summary="How to use this endpoint")
-def register_howto(request: Request):
-    return {
-        "hint": "Use POST to create a user.",
-        "url": _url(request, "/api/auth/register"),
-        "accepts": ["application/json", "multipart/form-data"],
-        "json_example": {
-            "username": "juma",
-            "email": "juma@example.com",
-            "password": "strongPass123",
-            "full_name": "Juma Example"
-        }
-    }
-
-@router.get("/signup", summary="How to use this endpoint")
-def signup_howto(request: Request):
-    return {
-        "hint": "Use POST to signup (alias of /register).",
-        "url": _url(request, "/api/auth/signup")
-    }
-
 @router.get("/me", response_model=MeResponse, response_model_exclude_none=True, summary="Get current user")
 def me(request: Request, db: Session = Depends(get_db)):
     claims = get_current_user_from_token(request)
@@ -607,16 +560,9 @@ def me(request: Request, db: Session = Depends(get_db)):
     if u:
         cols = _users_columns()
         fields = ("id","email","username","full_name","role","phone_number","phone","mobile","msisdn")
-        loaded = {n for n in fields if _col_exists(n) and _is_mapped(n)}
+        loaded = {n for n in fields if n in cols and _is_mapped(n)}
         return _user_summary_loaded(u, loaded)
     return {"id": str(claims.get("sub") or ""), "email": claims.get("email") or None}
-
-@router.get("/_whoami", tags=["Auth"], summary="Debug: raw current user/claims")
-def whoami_raw(request: Request):
-    try:
-        return get_current_user_from_token(request)
-    except HTTPException as e:
-        return {"error": e.detail}
 
 @router.get("/session/verify", summary="Verify current session")
 def verify_session(request: Request):
@@ -643,7 +589,7 @@ def token_refresh(request: Request, response: Response):
     sub = str(claims.get("sub") or "")
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token subject")
-    new_token = create_access_token({"sub": sub, "email": claims.get("email")})
+    new_token = create_access_token({"sub": sub, "email": claims.get("email")}, minutes=ACCESS_MIN)
     _set_auth_cookie(response, new_token)
     return {"access_token": new_token, "token_type": "bearer"}
 
@@ -673,20 +619,21 @@ def change_password(data: ChangePasswordInput, db: Session = Depends(get_db), re
     db.add(user); db.commit()
     return Response(status_code=204)
 
-# ──────────────── Meta/discovery: HUONESHA URL KAMILI ────────────────
+# ──────────────── Meta/discovery (absolute URLs with /auth/*) ────────────────
 @router.get("/_meta", summary="Auth endpoint discovery (absolute URLs)")
 def auth_meta(request: Request):
     return {
         "base_url": _base_url(request),
         "endpoints": {
-            "login": _url(request, "/api/auth/login"),
-            "register": _url(request, "/api/auth/register"),
-            "register_form": _url(request, "/api/auth/register-form"),
-            "signup": _url(request, "/api/auth/signup"),
-            "me": _url(request, "/api/auth/me"),
-            "verify": _url(request, "/api/auth/session/verify"),
-            "logout": _url(request, "/api/auth/logout"),
-            "token_refresh": _url(request, "/api/auth/token/refresh"),
+            "login":           _url(request, "/auth/login"),
+            "register":        _url(request, "/auth/register"),
+            "register_form":   _url(request, "/auth/register-form"),
+            "signup":          _url(request, "/auth/signup"),
+            "me":              _url(request, "/auth/me"),
+            "verify":          _url(request, "/auth/session/verify"),
+            "logout":          _url(request, "/auth/logout"),
+            "token_refresh":   _url(request, "/auth/token/refresh"),
+            "change_password": _url(request, "/auth/change-password"),
         }
     }
 
@@ -713,5 +660,19 @@ def diag_pwhash():
 @router.options("/{path:path}", include_in_schema=False)
 def auth_preflight(path: str):  # noqa: ARG001
     return Response(status_code=204)
+
+# ──────────────── Optional legacy: mount these under /api/auth/* if needed ───
+# (Au tumia 308 redirect kwenye main.py kama tulivyoweka.)
+@legacy_router.post("/login", include_in_schema=False)
+async def legacy_login(request: Request, response: Response, db: Session = Depends(get_db)):
+    return await _do_login(request, db, response)
+
+@legacy_router.post("/register", include_in_schema=False)
+def legacy_register(data: RegisterInput, db: Session = Depends(get_db)):
+    return _register_core(data, db)
+
+@legacy_router.post("/signup", include_in_schema=False)
+def legacy_signup(data: RegisterInput, db: Session = Depends(get_db)):
+    return _register_core(data, db)
 
 __all__ = ["router", "legacy_router"]
