@@ -1,21 +1,43 @@
+# ───────────────────────── SmartBiz Assistance — Backend deps ─────────────────────────
+# NOTE:
+# - passlib[bcrypt]==1.7.4 + bcrypt==3.2.2 => huzuia "module 'bcrypt' has no attribute '__about__'"
+# - FastAPI 0.111.x inategemea Pydantic v2; Starlette version itapangwa na FastAPI yenyewe.
+# - SQLAlchemy 2.x + psycopg2-binary 2.9.x ni stable kwenye Render Postgres.
+
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
+
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
+alembic==1.13.2
+
 python-dotenv==1.0.1
+typing-extensions==4.12.2
+python-dateutil==2.9.0.post0
+
+# ── Auth & security ───────────────────────────────────────────────────────────────────
 PyJWT==2.8.0
 passlib[bcrypt]==1.7.4
+bcrypt==3.2.2                 # 👈 pin chini ya 4.x kuondoa __about__ error
 email-validator==2.1.1
+python-multipart==0.0.9       # kwa form-data uploads (ikihitajika kwa auth/register)
+
+# ── HTTP clients ──────────────────────────────────────────────────────────────────────
 httpx==0.27.2
 requests==2.32.3
-python-multipart==0.0.9
-APScheduler==3.11.0
-python-dateutil==2.9.0.post0
-openai>=1.35.0,<2.0
-typing-extensions==4.12.2
+
+# ── Media & utils (kama unazitumia kwenye features zako) ──────────────────────────────
 moviepy==1.0.3
 imageio==2.34.1
 imageio-ffmpeg==0.4.9
-qrcode==7.4.2
 pillow==10.4.0
-alembic>=1.13
+qrcode==7.4.2
+
+# ── Schedulers / background jobs ──────────────────────────────────────────────────────
+APScheduler==3.11.0
+
+# ── OpenAI SDK (kama inahitajika) ─────────────────────────────────────────────────────
+openai>=1.35.0,<2.0
+
+# (Hiari lakini inapendekezwa kwa performance ya JSON responses)
+# orjson==3.10.7
