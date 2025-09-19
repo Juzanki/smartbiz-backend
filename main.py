@@ -13,7 +13,6 @@ ROOT_DIR = BACKEND_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-# 👉 Backend URL ya Render (tumia yako hapa chini)
 BACKEND_PUBLIC_URL = os.getenv(
     "BACKEND_PUBLIC_URL",
     "https://smartbiz-backend-p45m.onrender.com",
@@ -235,14 +234,13 @@ if _docs_enabled:
     def swagger_ui_redirect():
         return get_swagger_ui_oauth2_redirect_html()
 
-# ────────────────────────── CORS (ikijumuisha backend URL moja kwa moja) ─────
+# ────────────────────────── CORS ──────────────────────────────────────────────
 def _resolve_cors_origins() -> List[str]:
-    # Hizi ndizo origins halali za frontend zako + backend yako
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
         "https://www.smartbiz.site",
-        BACKEND_PUBLIC_URL,  # 👈 backend yenyewe (kwa test/tools)
+        BACKEND_PUBLIC_URL,
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
@@ -433,31 +431,21 @@ class TokenOut(BaseModel):
 # ────────────────────────── Health & Diag + Meta ──────────────────────────────
 @app.get("/")
 def root_redirect():
-    # kurahisisha test; peleka docs kama zimewezeshwa, la sivyo health
-    return RedirectResponse("/docs" if _docs_enabled else "/api/health", status_code=302)
+    return RedirectResponse("/health", status_code=302)
 
-@app.get("/api/meta/baseurl")
+@app.get("/meta/baseurl")
 def meta_baseurl():
     return {"base_url": BACKEND_PUBLIC_URL}
 
 @app.get("/health")
-@app.get("/api/health")
-@app.get("/api/healthz")
 def health():
     return {"status": "healthy", "database": _db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
 
 @app.get("/ready")
-@app.get("/api/ready")
 def ready():
     return {"status": "ready", "database": _db_ping()}
 
-@app.get("/version")
-def version():
-    return {"name": os.getenv("APP_NAME", "SmartBiz Assistance API"),
-            "version": os.getenv("APP_VERSION", "1.0.0"),
-            "env": ENVIRONMENT}
-
-@app.api_route("/api/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
+@app.api_route("/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
 async def echo(request: Request):
     body = None
     with suppress(Exception):
@@ -468,26 +456,35 @@ async def echo(request: Request):
             body = raw.decode(errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
     return {"method": request.method, "url": str(request.url), "headers": dict(request.headers), "cookies": request.cookies, "body": body}
 
-@app.get("/api/_diag/headers")
+@app.get("/_diag/headers")
 def diag_headers(request: Request):
     return {"headers": dict(request.headers)}
 
-@app.get("/api/_diag/cors")
+@app.get("/_diag/cors")
 def diag_cors():
     return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL, "base": BACKEND_PUBLIC_URL}
 
 # ────────────────────────── Prefer real auth router, else fallback ───────────
 def _include_auth_routers():
+    """
+    Tunajaribu kuchukua router halisi ikiwa ipo; kama haipo, tunatoa fallback.
+    * NJIA MPYA: /auth/*
+    * NJIA ZA ZAMANI: /api/* → 308 redirect kwenda / (legacy protection)
+    """
     try:
-        from backend.routes.auth_routes import router as auth_router, legacy_router  # type: ignore
-        app.include_router(auth_router, prefix="/api")
-        app.include_router(legacy_router, prefix="/api/auth")
-        logger.info("Loaded auth routers from backend.routes.auth_routes")
+        # Kama router yako ya kweli ina prefix="/auth", usiongeze tena.
+        from backend.routes.auth_routes import router as auth_router  # type: ignore
+        app.include_router(auth_router)  # hakuna prefix hapa
+        logger.info("Loaded auth router from backend.routes.auth_routes at /auth/*")
+        # Legacy redirect: /api/auth/* -> /auth/*
+        @app.api_route("/api/auth/{rest:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], include_in_schema=False)
+        async def legacy_redirect_auth(rest: str, request: Request):
+            return RedirectResponse(url=f"/auth/{rest}", status_code=308)
         return
     except Exception:
-        logger.warning("Auth routers not found; using fallback endpoints")
+        logger.warning("Auth router not found; using fallback endpoints at /auth/*")
 
-    # Fallback auth
+    # ── Fallback auth (njia mpya moja kwa moja: /auth/*) ──────────────────────
     def _verify_login_identifier(db: Session, identifier: str, password: str) -> Optional[dict]:
         u = _get_user_by_email(db, identifier) if "@" in identifier else None
         if not u:
@@ -499,7 +496,7 @@ def _include_auth_routers():
                  "username": u.get("username") or u.get("user_name") or u.get("handle")}
                 if stored and _verify_password(password, stored) else None)
 
-    @app.post("/api/auth/register", response_model=TokenOut)
+    @app.post("/auth/register", response_model=TokenOut)
     def register(payload: SignupIn, db: Session = Depends(get_db)):
         if _get_user_by_email(db, payload.email):
             raise HTTPException(status_code=409, detail="Email already registered")
@@ -510,11 +507,11 @@ def _include_auth_routers():
         _set_access_cookie(resp, access, ACCESS_TTL)
         return resp
 
-    @app.post("/api/auth/signup", response_model=TokenOut)
+    @app.post("/auth/signup", response_model=TokenOut)
     def signup_alias(payload: SignupIn, db: Session = Depends(get_db)):
         return register(payload, db)  # type: ignore
 
-    @app.post("/api/auth/login", response_model=TokenOut)
+    @app.post("/auth/login", response_model=TokenOut)
     def login(payload: LoginIn, db: Session = Depends(get_db)):
         user = _verify_login_identifier(db, payload.identifier, payload.password)
         if not user:
@@ -524,7 +521,7 @@ def _include_auth_routers():
         _set_access_cookie(resp, access, ACCESS_TTL)
         return resp
 
-    @app.post("/api/auth/login-form", response_model=TokenOut)
+    @app.post("/auth/login-form", response_model=TokenOut)
     def login_form(username: Optional[str] = Form(None), email: Optional[str] = Form(None),
                    password: str = Form(...), db: Session = Depends(get_db)):
         ident = (email or username or "").strip()
@@ -532,7 +529,7 @@ def _include_auth_routers():
             raise HTTPException(status_code=422, detail="identifier required")
         return login(LoginIn(identifier=ident, password=password), db)  # type: ignore
 
-    @app.post("/api/auth/token/refresh", response_model=TokenOut)
+    @app.post("/auth/token/refresh", response_model=TokenOut)
     def refresh_token(request: Request, db: Session = Depends(get_db)):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
@@ -550,13 +547,13 @@ def _include_auth_routers():
         _set_access_cookie(resp, access, ACCESS_TTL)
         return resp
 
-    @app.post("/api/auth/logout", status_code=204)
+    @app.post("/auth/logout", status_code=204)
     def logout():
         resp = Response(status_code=204)
         _clear_access_cookie(resp)
         return resp
 
-    @app.get("/api/auth/me")
+    @app.get("/auth/me")
     def me(request: Request, db: Session = Depends(get_db)):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
@@ -571,7 +568,7 @@ def _include_auth_routers():
         u = _get_user_by_id(db, user_id)
         return {"id": user_id, "email": (u or {}).get("email"), "username": (u or {}).get("username")}
 
-    @app.get("/api/auth/session/verify")
+    @app.get("/auth/session/verify")
     def verify_session(request: Request):
         raw = request.cookies.get(ACCESS_COOKIE) or ""
         if not raw:
@@ -580,6 +577,13 @@ def _include_auth_routers():
                 raw = auth.split(" ", 1)[1].strip()
         ok, user_id = _verify_token(raw) if raw else (False, None)
         return {"valid": bool(ok), "user": {"id": user_id} if ok else None}
+
+    # Legacy redirects kwa /api/* ili visivunike vilivyoko production
+    @app.api_route("/api/{rest:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], include_in_schema=False)
+    async def legacy_redirect(rest: str):
+        # mfano: /api/auth/login -> /auth/login  |  /api/health -> /health
+        target = f"/{rest}"
+        return RedirectResponse(url=target, status_code=308)
 
 _include_auth_routers()
 
