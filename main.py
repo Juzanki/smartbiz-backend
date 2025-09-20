@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 # ── Path fallback (Render + local) ────────────────────────────────────────────
-import os, sys, re, json, time, uuid, base64, hmac, hashlib, logging
+import os, sys, re, json, time, uuid, logging, secrets, hashlib, datetime as dt
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
-from typing import Callable, Iterable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Iterable, Optional, List, Dict, Any
 
 THIS_FILE = Path(__file__).resolve()
 BACKEND_DIR = THIS_FILE.parent
@@ -19,7 +19,7 @@ BACKEND_PUBLIC_URL = os.getenv(
 ).rstrip("/")
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -224,18 +224,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ────────────────────────── CORS ──────────────────────────────────────────────
+# ────────────────────────── CORS (robust + env-driven) ────────────────────────
 def _resolve_cors_origins() -> List[str]:
     hardcoded = [
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site",
         "https://www.smartbiz.site",
-        BACKEND_PUBLIC_URL,
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
     env_origins = env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS")
-    extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL", "RENDER_PUBLIC_URL")]
+    extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL")]
     return _uniq([*env_origins, *[x for x in extra if x], *hardcoded])
 
 ALLOW_ORIGINS = _resolve_cors_origins()
@@ -263,6 +262,16 @@ else:
         max_age=600,
     )
     logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
+
+# Optional compression + basic security/ids
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(CookiePolicyMiddleware)
+# Trusted hosts if you use custom domains (optional)
+if env_bool("ENABLE_TRUSTED_HOSTS", False):
+    hosts = env_list("TRUSTED_HOSTS") or ["smartbiz.site", "smartbizsite.netlify.app", "localhost"]
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
 
 # ────────────────────────── Static ────────────────────────────────────────────
 class _Uploads(StaticFiles):
@@ -296,18 +305,33 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
-    username: constr(min_length=3, pattern=r"^[a-z0-9_]+$")  # pattern instead of regex
+    username: constr(min_length=3, pattern=r"^[a-z0-9_]+$")
 
 class LoginIn(BaseModel):
     identifier: str
     password: constr(min_length=1)
 
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: Optional[Dict[str, Any]] = None
+class UserOut(BaseModel):
+    id: Any
+    email: EmailStr
+    username: str
+    created_at: Optional[str] = None
 
-# ────────────────────────── Health Endpoints ──────────────────────────────────
+# ────────────────────────── Password hashing (bcrypt→fallback) ────────────────
+try:
+    # Recommended path
+    from passlib.context import CryptContext  # type: ignore
+    _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    def _hash_password(pw: str) -> str:
+        return _pwd_ctx.hash(pw)
+except Exception:
+    # Fallback: PBKDF2-HMAC-SHA256 (salted) — still secure
+    def _hash_password(pw: str) -> str:
+        salt = secrets.token_bytes(16)
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
+        return "pbkdf2$sha256$200000$" + salt.hex() + "$" + dk.hex()
+
+# ────────────────────────── Health & Docs ─────────────────────────────────────
 @app.get("/")
 def root_redirect():
     return RedirectResponse("/health", status_code=302)
@@ -315,3 +339,141 @@ def root_redirect():
 @app.get("/health")
 def health():
     return {"status": "healthy", "database": _db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
+
+if _docs_enabled:
+    @app.get("/docs", include_in_schema=False)
+    async def custom_swagger_ui_html():
+        return get_swagger_ui_html(openapi_url=app.openapi_url, title="SmartBiz API Docs")
+
+    @app.get("/docs/oauth2-redirect", include_in_schema=False)
+    async def swagger_ui_redirect():
+        return get_swagger_ui_oauth2_redirect_html()
+
+# ────────────────────────── CORS DIAG ─────────────────────────────────────────
+@app.get("/auth/_diag_cors")
+async def cors_diag(request: Request):
+    return {
+        "method": request.method,
+        "origin_header": request.headers.get("origin"),
+        "access_control_request_method": request.headers.get("access-control-request-method"),
+        "access_control_request_headers": request.headers.get("access-control-request-headers"),
+        "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["* (regex)"],
+        "credentials_required": True,
+    }
+
+# ────────────────────────── SIGNUP / REGISTER (shared handler) ────────────────
+# Tunajaribu kutumia ORM 'User' kama ipo; vinginevyo tunatumia SQL ya moja kwa moja.
+try:
+    from backend.models.user import User  # type: ignore
+except Exception:
+    try:
+        from models.user import User  # type: ignore
+    except Exception:
+        User = None  # type: ignore
+
+def _now_iso() -> str:
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+
+def _select_one(db: Session, query: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    row = db.execute(text(query), params).mappings().first()
+    return dict(row) if row else None
+
+def _create_user_sql(db: Session, payload: SignupIn) -> Dict[str, Any]:
+    cols = _users_columns()
+    if not cols:
+        raise HTTPException(status_code=500, detail="Users table not introspectable.")
+
+    # 1) duplicates
+    if "email" in cols:
+        existing = _select_one(db, f"SELECT id, email FROM {USER_TABLE} WHERE email=:e LIMIT 1", {"e": payload.email})
+        if existing:
+            raise HTTPException(status_code=409, detail="email_already_exists")
+    if "username" in cols:
+        existing = _select_one(db, f"SELECT id, username FROM {USER_TABLE} WHERE username=:u LIMIT 1", {"u": payload.username})
+        if existing:
+            raise HTTPException(status_code=409, detail="username_already_exists")
+
+    # 2) insert minimal set dynamically
+    insert_cols: List[str] = []
+    params: Dict[str, Any] = {}
+
+    if "email" in cols:
+        insert_cols.append("email"); params["email"] = str(payload.email)
+    if "username" in cols:
+        insert_cols.append("username"); params["username"] = payload.username
+    if PW_COL in cols:
+        insert_cols.append(PW_COL); params[PW_COL] = _hash_password(payload.password)
+    # nice-to-have fields if exist
+    now = _now_iso()
+    for c in ("created_at", "updated_at", "created_on", "joined_at"):
+        if c in cols:
+            insert_cols.append(c); params[c] = now
+    for c, v in (("is_active", True), ("is_verified", False), ("status", "active")):
+        if c in cols:
+            insert_cols.append(c); params[c] = v
+
+    if not insert_cols:
+        raise HTTPException(status_code=500, detail="No compatible columns to insert.")
+
+    placeholders = ",".join([f":{c}" for c in insert_cols])
+    sql = f"INSERT INTO {USER_TABLE} ({','.join(insert_cols)}) VALUES ({placeholders}) RETURNING id, email, username"
+    row = db.execute(text(sql), params).mappings().first()
+    db.commit()
+    return {"id": row["id"], "email": row.get("email"), "username": row.get("username")}
+
+def _create_user_orm(db: Session, payload: SignupIn) -> Dict[str, Any]:
+    # Safely set attributes that exist
+    # duplicates
+    if hasattr(User, "email"):
+        q = db.query(User).filter(getattr(User, "email") == str(payload.email)).first()
+        if q: raise HTTPException(status_code=409, detail="email_already_exists")
+    if hasattr(User, "username"):
+        q = db.query(User).filter(getattr(User, "username") == payload.username).first()
+        if q: raise HTTPException(status_code=409, detail="username_already_exists")
+
+    user = User()  # type: ignore
+    if hasattr(user, "email"): setattr(user, "email", str(payload.email))
+    if hasattr(user, "username"): setattr(user, "username", payload.username)
+    # password column resolved earlier
+    setattr(user, PW_COL, _hash_password(payload.password))
+    # optional flags
+    for c, v in (("is_active", True), ("is_verified", False), ("status", "active")):
+        if hasattr(user, c): setattr(user, c, v)
+    now = dt.datetime.utcnow()
+    for c in ("created_at", "updated_at", "created_on", "joined_at"):
+        if hasattr(user, c): setattr(user, c, now)
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {
+        "id": getattr(user, "id", None),
+        "email": getattr(user, "email", None),
+        "username": getattr(user, "username", None),
+        "created_at": str(getattr(user, "created_at", None)) if hasattr(user, "created_at") else None,
+    }
+
+def _signup_core(db: Session, payload: SignupIn) -> Dict[str, Any]:
+    if User is not None:
+        try:
+            return _create_user_orm(db, payload)
+        except Exception as e:
+            logger.warning("ORM create failed, will fallback to SQL: %s", e)
+    return _create_user_sql(db, payload)
+
+@app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)  # alias
+def signup(payload: SignupIn, db: Session = Depends(get_db)):
+    user = _signup_core(db, payload)
+    return {"ok": True, "user": user}
+
+# ────────────────────────── (Optionally keep a tiny echo tester) ──────────────
+@app.post("/auth/_echo")  # kwa debugging ya CORS tu
+async def register_echo(payload: dict):
+    logger.info("register_echo payload keys: %s", list(payload.keys()))
+    return {"ok": True, "data": payload, "note": "Echo OK"}
+
+# ────────────────────────── DONE: routers zako zingine unaweza kuongeza hapa ─
+# Mfano:
+# from backend.routes.auth_routes import router as auth_router
+# app.include_router(auth_router, prefix="/auth")
