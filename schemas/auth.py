@@ -1,6 +1,4 @@
-# backend/schemas/auth.py
 from __future__ import annotations
-
 from typing import Optional, List, Union
 from datetime import datetime
 from typing import Literal
@@ -22,15 +20,12 @@ except Exception:  # Pydantic v1 fallback
             return validator(field_name, pre=pre, allow_reuse=True)(fn)  # type: ignore
         return deco
 
-    # v1 haina field_serializer; tutatumia @property au validator wa after
     def field_serializer(*_a, **_k):  # type: ignore
         def deco(fn):
             return fn
         return deco
 
-
 # ------------------------------- HELPERS -------------------------------------
-
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,50}$")
 
 def _ensure_non_empty_str(v: object, name: str) -> str:
@@ -40,7 +35,6 @@ def _ensure_non_empty_str(v: object, name: str) -> str:
     if not s:
         raise ValueError(f"{name} cannot be empty")
     return s
-
 
 # ------------------------------- MODELS -------------------------------------
 
@@ -69,7 +63,6 @@ class Token(BaseModel):
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
-            orm_mode = True
             schema_extra = {
                 "example": {
                     "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
@@ -119,7 +112,6 @@ class TokenData(BaseModel):
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
-            orm_mode = True
             schema_extra = {
                 "example": {
                     "sub": "b6f7a2e8-0a6b-4a5e-90c3-7a9a6b8a1234",
@@ -129,7 +121,6 @@ class TokenData(BaseModel):
                 }
             }
 
-    # --- validators ---
     @field_validator("scopes", mode="before")
     def _normalize_scopes(cls, v):
         if v is None:
@@ -142,7 +133,6 @@ class TokenData(BaseModel):
             if not s:
                 continue
             cleaned.append(s.lower())
-        # unique, keep order
         seen = set()
         unique = []
         for s in cleaned:
@@ -166,7 +156,6 @@ class RegisterRequest(BaseModel):
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
-            orm_mode = True
 
     @field_validator("username", mode="before")
     def _validate_username(cls, v):
@@ -180,9 +169,7 @@ class RegisterRequest(BaseModel):
         v = _ensure_non_empty_str(v, "password")
         if len(v) < 8:
             raise ValueError("password must be at least 8 characters")
-        # basic strength check (optional; tweak as needed)
         if not (re.search(r"[A-Z]", v) and re.search(r"[a-z]", v) and re.search(r"[0-9]", v)):
-            # allow symbols but not mandatory
             raise ValueError("password must contain upper, lower, and number")
         return v
 
@@ -195,7 +182,6 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    # `identifier` can be email or username
     identifier: str
     password: str
 
@@ -205,7 +191,6 @@ class LoginRequest(BaseModel):
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
-            orm_mode = True
 
     @field_validator("identifier", mode="before")
     def _id_required(cls, v):
@@ -245,7 +230,6 @@ class UserOut(BaseModel):
             allow_population_by_field_name = True
             orm_mode = True
 
-        # v1: coerce in validator-after
         @field_validator("id")
         def _v1_id_to_str(cls, v):
             return str(v)
