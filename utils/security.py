@@ -1,33 +1,10 @@
-# backend/utils/security.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-"""
-Security helpers for SmartBiz.
-
-- Password hashing/verification (passlib[bcrypt])
-- JWT create/verify for access & refresh tokens (python-jose)
-- Strict defaults (issuer, audience, leeway)
-- Compatible whether your User model stores `password`, `password_hash`, or `hashed_password`.
-
-ENV / Settings expected (backend.config.settings):
-  SECRET_KEY (required in non-dev), ALGORITHM (default HS256),
-  ACCESS_TOKEN_EXPIRE_MINUTES (default 60),
-  REFRESH_TOKEN_EXPIRE_DAYS (default 14),
-  TOKEN_AUDIENCE (default "smartbiz-api"),
-  TOKEN_ISSUER (default "smartbiz"),
-  JWT_LEEWAY_SECONDS (default 10),
-  BCRYPT_ROUNDS (default 12),
-  ENV ("development"/"production"/etc)
-"""
-
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 import secrets
 import warnings
 import uuid
 import logging
-
 from jose import jwt, JWTError  # python-jose
 from passlib.context import CryptContext  # passlib[bcrypt]
 
@@ -79,23 +56,26 @@ else:
         raise RuntimeError("🔐 SECRET_KEY is required in non-development environments.")
 
 ALGORITHM: str = getattr(settings, "ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES: int = int(getattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES", 60))
-REFRESH_TOKEN_EXPIRE_DAYS: int = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", 14))
+ACCESS_TOKEN_EXPIRE_MINUTES: int = int(getattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES", "60"))        # 1h
+REFRESH_TOKEN_EXPIRE_DAYS: int = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAYS", "14"))   # 14 days
 TOKEN_AUDIENCE: str = getattr(settings, "TOKEN_AUDIENCE", "smartbiz-api")
 ISSUER: str = getattr(settings, "TOKEN_ISSUER", "smartbiz")
-JWT_LEEWAY_SECONDS: int = int(getattr(settings, "JWT_LEEWAY_SECONDS", 10))
-BCRYPT_ROUNDS: int = int(getattr(settings, "BCRYPT_ROUNDS", 12))  # cost factor
+JWT_LEEWAY_SECONDS: int = int(getattr(settings, "JWT_LEEWAY_SECONDS", "10"))
+BCRYPT_ROUNDS: int = int(getattr(settings, "BCRYPT_ROUNDS", "12"))  # bcrypt rounds (cost factor)
 
 # =========================
 # Time helpers
 # =========================
 def _now_utc() -> datetime:
+    """Return the current UTC time"""
     return datetime.now(timezone.utc)
 
 def _exp_in(minutes: float) -> datetime:
+    """Return the time of expiration (in minutes)"""
     return _now_utc() + timedelta(minutes=minutes)
 
 def _exp_days(days: float) -> datetime:
+    """Return the time of expiration (in days)"""
     return _now_utc() + timedelta(days=days)
 
 # =========================
@@ -113,7 +93,6 @@ def _build_pwd_context() -> CryptContext:
         deprecated="auto",
         bcrypt__rounds=BCRYPT_ROUNDS,
         # normalize unicode input; avoid surprise mismatches
-        # see: https://passlib.readthedocs.io/en/stable/lib/passlib.context.html
     )
     # Soft self-check (avoid crashing if bcrypt backend is odd)
     try:
@@ -121,7 +100,6 @@ def _build_pwd_context() -> CryptContext:
         if not ctx.verify("self-check", test_hash):
             raise RuntimeError("bcrypt self-check failed")
     except Exception as e:
-        # Don't crash the app; log a clear warning so ops can fix deps.
         logger.warning("Passlib/bcrypt backend check failed: %s", e)
     return ctx
 
@@ -151,16 +129,16 @@ def get_password_hash(password: str) -> str:
 # JWT helpers
 # =========================
 def _base_claims(subject: Union[str, int], token_type: str, audience: Optional[str]) -> Dict[str, Any]:
-    """Common claims for both access and refresh."""
+    """Common claims for both access and refresh tokens."""
     now = _now_utc()
     return {
         "sub": str(subject),
         "aud": audience or TOKEN_AUDIENCE,
         "iss": ISSUER,
         "jti": uuid.uuid4().hex,
-        "type": token_type,             # "access" | "refresh"
+        "type": token_type,  # "access" | "refresh"
         "iat": int(now.timestamp()),
-        "nbf": int(now.timestamp()),    # valid from now
+        "nbf": int(now.timestamp()),  # valid from now
     }
 
 def create_access_token(
@@ -212,7 +190,7 @@ def decode_token(token: str, *, audience: Optional[str] = None) -> Dict[str, Any
         options={"leeway": JWT_LEEWAY_SECONDS},
     )
 
-def safe_decode_token(token: str, *, audience: Optional[str] = None) -> tuple[bool, Dict[str, Any] | None, str | None]:
+def safe_decode_token(token: str, *, audience: Optional[str] = None) -> Tuple[bool, Dict[str, Any] | None, str | None]:
     """
     Like decode_token but never raises.
     Returns (ok, claims, error_message)
