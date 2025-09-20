@@ -1,3 +1,4 @@
+# backend/main.py
 from __future__ import annotations
 
 # ── Path fallback (Render + local) ────────────────────────────────────────────
@@ -18,7 +19,7 @@ BACKEND_PUBLIC_URL = os.getenv(
 ).rstrip("/")
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request, Depends, Body
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -79,13 +80,15 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 _handler = logging.StreamHandler()
-_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+_handler.setFormatter(
+    _JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+)
 root_logger = logging.getLogger()
 root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
-# ────────────────────────── User table introspection (optional) ──────────────
+# ────────────────────────── User table introspection ──────────────────────────
 USER_TABLE = os.getenv("USER_TABLE", "users")
 PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
 _USERS_COLS: Optional[set[str]] = None
@@ -94,7 +97,9 @@ with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
     insp = _sa_inspect(engine)
     _USERS_COLS = {c["name"] for c in insp.get_columns(USER_TABLE)}
-    chosen = "hashed_password" if "hashed_password" in _USERS_COLS else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
+    chosen = "hashed_password" if "hashed_password" in _USERS_COLS else (
+        "password_hash" if "password_hash" in _USERS_COLS else PW_COL
+    )
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
     logger.info("Users cols: %s | PW col: %s", sorted(_USERS_COLS or []), PW_COL)
@@ -118,14 +123,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw")
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # basic hardening
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+            "default-src 'self'; img-src 'self' data: https:; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
         )
         return response
 
@@ -173,23 +179,6 @@ class CookiePolicyMiddleware(BaseHTTPMiddleware):
                 headers.append("set-cookie", cv)
         return response
 
-# ────────────────────────── CORS ──────────────────────────────────────────────
-def _resolve_cors_origins() -> List[str]:
-    hardcoded = [
-        "https://smartbizsite.netlify.app",
-        "https://smartbiz.site",
-        "https://www.smartbiz.site",
-        BACKEND_PUBLIC_URL,
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:4173", "http://127.0.0.1:4173",
-    ]
-    env_origins = env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS")
-    extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL", "RENDER_PUBLIC_URL")]
-    return _uniq([*env_origins, *[x for x in extra if x], *hardcoded])
-
-ALLOW_ORIGINS = _resolve_cors_origins()
-CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
-
 # ────────────────────────── DB helpers ────────────────────────────────────────
 def _db_ping() -> bool:
     try:
@@ -235,7 +224,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS
+# ────────────────────────── CORS ──────────────────────────────────────────────
+def _resolve_cors_origins() -> List[str]:
+    hardcoded = [
+        "https://smartbizsite.netlify.app",
+        "https://smartbiz.site",
+        "https://www.smartbiz.site",
+        BACKEND_PUBLIC_URL,
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:4173", "http://127.0.0.1:4173",
+    ]
+    env_origins = env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS")
+    extra = [os.getenv(k) for k in ("FRONTEND_URL", "WEB_URL", "NETLIFY_PUBLIC_URL", "RENDER_PUBLIC_URL")]
+    return _uniq([*env_origins, *[x for x in extra if x], *hardcoded])
+
+ALLOW_ORIGINS = _resolve_cors_origins()
+CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
+
 if CORS_ALLOW_ALL:
     app.add_middleware(
         CORSMiddleware,
@@ -258,39 +263,6 @@ else:
         max_age=600,
     )
     logger.info("CORS allow_origins: %s", ALLOW_ORIGINS)
-
-class EnsureCorsCredentialsMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        response: Response = await call_next(request)
-        origin = request.headers.get("origin")
-        if origin and (CORS_ALLOW_ALL or origin in ALLOW_ORIGINS):
-            response.headers.setdefault("Access-Control-Allow-Credentials", "true")
-        return response
-
-app.add_middleware(EnsureCorsCredentialsMiddleware)
-
-# Preflight kwa routes zote
-@app.options("/{rest_of_path:path}", include_in_schema=False)
-async def any_options(_: Request, rest_of_path: str):
-    return Response(status_code=204)
-
-# Proxy headers (Render) & Trusted hosts
-with suppress(Exception):
-    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-
-trusted_hosts = _uniq(
-    env_list("TRUSTED_HOSTS")
-    + ["*", ".onrender.com", ".smartbiz.site", "localhost", "127.0.0.1",
-       BACKEND_PUBLIC_URL.replace("https://", "").replace("http://", "")]
-)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
-
-# Compression + security + request-id + cookie policy
-app.add_middleware(GZipMiddleware, minimum_size=512)
-app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestIDMiddleware)
-app.add_middleware(CookiePolicyMiddleware)
 
 # ────────────────────────── Static ────────────────────────────────────────────
 class _Uploads(StaticFiles):
@@ -320,109 +292,11 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("unhandled")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# ────────────────────────── Tiny Auth Fallback & Helpers ──────────────────────
-SECRET = (os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or "dev-secret").encode("utf-8")
-ACCESS_TTL = int(os.getenv("ACCESS_TOKEN_TTL_SECONDS", "3600"))
-ACCESS_COOKIE = os.getenv("ACCESS_COOKIE", "sb_access")
-
-def _sign(payload: str) -> str:
-    sig = hmac.new(SECRET, payload.encode(), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
-
-def _mint_token(user_id: str, ttl: int = ACCESS_TTL) -> str:
-    now = int(time.time())
-    raw = f"{user_id}.{now}.{ttl}.{uuid.uuid4().hex}"
-    return raw + "." + _sign(raw)
-
-def _verify_token(token: str) -> Tuple[bool, Optional[str]]:
-    try:
-        p, sig = token.rsplit(".", 1)
-        if not hmac.compare_digest(_sign(p), sig):
-            return False, None
-        user_id, ts, ttl, _ = p.split(".", 3)
-        if int(time.time()) > int(ts) + int(ttl):
-            return False, None
-        return True, user_id
-    except Exception:
-        return False, None
-
-def _set_access_cookie(resp: Response, token: str, ttl: int = ACCESS_TTL) -> None:
-    resp.set_cookie(key=ACCESS_COOKIE, value=token, max_age=ttl, secure=True, httponly=True, samesite="none", path="/")
-
-def _clear_access_cookie(resp: Response) -> None:
-    resp.delete_cookie(key=ACCESS_COOKIE, path="/")
-
-# Password hashing (bcrypt preferred; PBKDF2 fallback)
-def _hash_password(pw: str) -> str:
-    try:
-        from passlib.hash import bcrypt  # type: ignore
-        return bcrypt.using(rounds=12).hash(pw)
-    except Exception:
-        salt = os.urandom(16)
-        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120_000)
-        return "pbkdf2$" + base64.b64encode(salt + dk).decode()
-
-def _verify_password(pw: str, stored: str) -> bool:
-    if stored.startswith("$2b$") or stored.startswith("$2a$"):
-        try:
-            from passlib.hash import bcrypt  # type: ignore
-            return bcrypt.verify(pw, stored)
-        except Exception:
-            return False
-    if stored.startswith("pbkdf2$"):
-        try:
-            blob = base64.b64decode(stored.split("$", 1)[1].encode())
-            salt, dk = blob[:16], blob[16:]
-            cand = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 120_000)
-            return hmac.compare_digest(dk, cand)
-        except Exception:
-            return False
-    return stored == pw
-
-# Simple SQL helpers
-def _get_user_by_email(db: Session, email: str) -> Optional[dict]:
-    row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE LOWER(email)=LOWER(:e) LIMIT 1'), {"e": email}).mappings().first()
-    return dict(row) if row else None
-
-def _get_user_by_username(db: Session, uname: str) -> Optional[dict]:
-    cols = _users_columns()
-    for cand in ("username", "user_name", "handle"):
-        if cand in cols:
-            row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE LOWER("{cand}")=LOWER(:u) LIMIT 1'), {"u": uname}).mappings().first()
-            if row:
-                return dict(row)
-    return None
-
-def _get_user_by_id(db: Session, user_id: str) -> Optional[dict]:
-    row = db.execute(text(f'SELECT * FROM {USER_TABLE} WHERE id::text=:i LIMIT 1'), {"i": user_id}).mappings().first()
-    return dict(row) if row else None
-
-def _create_user(db: Session, email: str, username: str, password: str) -> dict:
-    hpw = _hash_password(password)
-    cols = _users_columns()
-    uname_col = next((c for c in ("username","user_name","handle") if c in cols), "username")
-    sql = text(
-        f'INSERT INTO {USER_TABLE} (email, "{uname_col}", {PW_COL}) '
-        'VALUES (:email, :username, :hpw) '
-        f'RETURNING id, email, "{uname_col}" AS username'
-    )
-    try:
-        row = db.execute(sql, {"email": email, "username": username, "hpw": hpw}).mappings().first()
-        db.commit()
-        return dict(row) if row else {"email": email, "username": username}
-    except Exception as e:
-        db.rollback()
-        msg = str(e)
-        if any(k in msg.lower() for k in ("unique", "duplicate", "23505")):
-            raise HTTPException(status_code=409, detail="Email already registered")
-        logger.exception("create_user")
-        raise HTTPException(status_code=500, detail="Failed to create user")
-
-# Pydantic models
+# ────────────────────────── Pydantic Models ───────────────────────────────────
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
-    username: constr(min_length=3, regex=r"^[a-z0-9_]+$")
+    username: constr(min_length=3, pattern=r"^[a-z0-9_]+$")  # pattern instead of regex
 
 class LoginIn(BaseModel):
     identifier: str
@@ -433,54 +307,11 @@ class TokenOut(BaseModel):
     token_type: str = "bearer"
     user: Optional[Dict[str, Any]] = None
 
-# ────────────────────────── Health & Diag + Meta ──────────────────────────────
+# ────────────────────────── Health Endpoints ──────────────────────────────────
 @app.get("/")
 def root_redirect():
     return RedirectResponse("/health", status_code=302)
 
-@app.get("/meta/baseurl")
-def meta_baseurl():
-    return {"base_url": BACKEND_PUBLIC_URL}
-
 @app.get("/health")
 def health():
     return {"status": "healthy", "database": _db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
-
-@app.get("/ready")
-def ready():
-    return {"status": "ready", "database": _db_ping()}
-
-@app.api_route("/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
-async def echo(request: Request):
-    body = None
-    with suppress(Exception):
-        raw = await request.body()
-        if raw and len(raw) > 1024 * 1024:
-            body = "<omitted: too large>"
-        else:
-            body = raw.decode(errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-    return {"method": request.method, "url": str(request.url), "headers": dict(request.headers), "cookies": request.cookies, "body": body}
-
-@app.get("/_diag/headers")
-def diag_headers(request: Request):
-    return {"headers": dict(request.headers)}
-
-@app.get("/_diag/cors")
-def diag_cors():
-    return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL, "base": BACKEND_PUBLIC_URL}
-
-# ────────────────────────── Prefer real auth router, else fallback ───────────
-def _include_auth_routers() -> None:
-    """
-    Tunajaribu kuchukua router halisi (backend.routes.auth_routes:router AU routes.auth_routes:router).
-    Malengo:
-      - *Hakuna* '/api' — tumia '/auth/*' tu.
-      - Ikiwa router tayari ina '/auth' kwenye path zake, tunaijumuisha kama ilivyo.
-      - Ikiwa haina, tunaifunga ndani ya APIRouter(prefix='/auth').
-      - ENV 'COMPAT_ENABLE_API_PREFIX=1' itaongeza pia '/api/auth/*' (hiari).
-    """
-    router = None
-    with suppress(Exception):
-        from backend.routes.auth_routes import router as _r  # type: ignore
-        router = _r
-   
