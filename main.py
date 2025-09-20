@@ -19,7 +19,7 @@ BACKEND_PUBLIC_URL = os.getenv(
 ).rstrip("/")
 
 import anyio
-from fastapi import FastAPI, HTTPException, Request, Depends, status, Form
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -416,8 +416,8 @@ def _create_user(db: Session, email: str, username: str, password: str) -> dict:
 # Pydantic models
 class SignupIn(BaseModel):
     email: EmailStr
-    password: constr(min_length=6)
-    username: constr(min_length=2)
+    password: constr(min_length=8)
+    username: constr(min_length=3, regex=r"^[a-z0-9_]+$")
 
 class LoginIn(BaseModel):
     identifier: str
@@ -465,132 +465,6 @@ def diag_cors():
     return {"allow_origins": ALLOW_ORIGINS, "allow_all": CORS_ALLOW_ALL, "base": BACKEND_PUBLIC_URL}
 
 # ────────────────────────── Prefer real auth router, else fallback ───────────
-def _include_auth_routers():
+def _include_auth_routers() -> None:
     """
-    Tunajaribu kuchukua router halisi ikiwa ipo; kama haipo, tunatoa fallback.
-    * NJIA MPYA: /auth/*
-    * NJIA ZA ZAMANI: /api/* → 308 redirect kwenda / (legacy protection)
-    """
-    try:
-        # Kama router yako ya kweli ina prefix="/auth", usiongeze tena.
-        from backend.routes.auth_routes import router as auth_router  # type: ignore
-        app.include_router(auth_router)  # hakuna prefix hapa
-        logger.info("Loaded auth router from backend.routes.auth_routes at /auth/*")
-        # Legacy redirect: /api/auth/* -> /auth/*
-        @app.api_route("/api/auth/{rest:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], include_in_schema=False)
-        async def legacy_redirect_auth(rest: str, request: Request):
-            return RedirectResponse(url=f"/auth/{rest}", status_code=308)
-        return
-    except Exception:
-        logger.warning("Auth router not found; using fallback endpoints at /auth/*")
-
-    # ── Fallback auth (njia mpya moja kwa moja: /auth/*) ──────────────────────
-    def _verify_login_identifier(db: Session, identifier: str, password: str) -> Optional[dict]:
-        u = _get_user_by_email(db, identifier) if "@" in identifier else None
-        if not u:
-            u = _get_user_by_username(db, identifier) or _get_user_by_email(db, identifier)
-        if not u:
-            return None
-        stored = u.get(PW_COL) or u.get("hashed_password") or u.get("password") or ""
-        return ({"id": str(u.get("id")), "email": u.get("email"),
-                 "username": u.get("username") or u.get("user_name") or u.get("handle")}
-                if stored and _verify_password(password, stored) else None)
-
-    @app.post("/auth/register", response_model=TokenOut)
-    def register(payload: SignupIn, db: Session = Depends(get_db)):
-        if _get_user_by_email(db, payload.email):
-            raise HTTPException(status_code=409, detail="Email already registered")
-        user = _create_user(db, payload.email, payload.username, payload.password)
-        access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
-        resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user},
-                            status_code=status.HTTP_201_CREATED)
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
-
-    @app.post("/auth/signup", response_model=TokenOut)
-    def signup_alias(payload: SignupIn, db: Session = Depends(get_db)):
-        return register(payload, db)  # type: ignore
-
-    @app.post("/auth/login", response_model=TokenOut)
-    def login(payload: LoginIn, db: Session = Depends(get_db)):
-        user = _verify_login_identifier(db, payload.identifier, payload.password)
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        access = _mint_token(user_id=str(user.get("id") or user["email"]), ttl=ACCESS_TTL)
-        resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
-
-    @app.post("/auth/login-form", response_model=TokenOut)
-    def login_form(username: Optional[str] = Form(None), email: Optional[str] = Form(None),
-                   password: str = Form(...), db: Session = Depends(get_db)):
-        ident = (email or username or "").strip()
-        if not ident:
-            raise HTTPException(status_code=422, detail="identifier required")
-        return login(LoginIn(identifier=ident, password=password), db)  # type: ignore
-
-    @app.post("/auth/token/refresh", response_model=TokenOut)
-    def refresh_token(request: Request, db: Session = Depends(get_db)):
-        raw = request.cookies.get(ACCESS_COOKIE) or ""
-        if not raw:
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                raw = auth.split(" ", 1)[1].strip()
-        if not raw:
-            raise HTTPException(status_code=401, detail="Missing token")
-        ok, user_id = _verify_token(raw)
-        if not ok or not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = _get_user_by_id(db, user_id) or {"id": user_id}
-        access = _mint_token(user_id=user_id, ttl=ACCESS_TTL)
-        resp = JSONResponse({"access_token": access, "token_type": "bearer", "user": user})
-        _set_access_cookie(resp, access, ACCESS_TTL)
-        return resp
-
-    @app.post("/auth/logout", status_code=204)
-    def logout():
-        resp = Response(status_code=204)
-        _clear_access_cookie(resp)
-        return resp
-
-    @app.get("/auth/me")
-    def me(request: Request, db: Session = Depends(get_db)):
-        raw = request.cookies.get(ACCESS_COOKIE) or ""
-        if not raw:
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                raw = auth.split(" ", 1)[1].strip()
-        if not raw:
-            raise HTTPException(status_code=401, detail="Missing token")
-        ok, user_id = _verify_token(raw)
-        if not ok or not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        u = _get_user_by_id(db, user_id)
-        return {"id": user_id, "email": (u or {}).get("email"), "username": (u or {}).get("username")}
-
-    @app.get("/auth/session/verify")
-    def verify_session(request: Request):
-        raw = request.cookies.get(ACCESS_COOKIE) or ""
-        if not raw:
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                raw = auth.split(" ", 1)[1].strip()
-        ok, user_id = _verify_token(raw) if raw else (False, None)
-        return {"valid": bool(ok), "user": {"id": user_id} if ok else None}
-
-    # Legacy redirects kwa /api/* ili visivunike vilivyoko production
-    @app.api_route("/api/{rest:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], include_in_schema=False)
-    async def legacy_redirect(rest: str):
-        # mfano: /api/auth/login -> /auth/login  |  /api/health -> /health
-        target = f"/{rest}"
-        return RedirectResponse(url=target, status_code=308)
-
-_include_auth_routers()
-
-# ────────────────────────── Local runner ──────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("backend.main:app",
-                host="0.0.0.0",
-                port=int(os.getenv("PORT", "8000")),
-                reload=env_bool("DEV_RELOAD", True))
+    Tunajaribu kuchukua router halisi 
