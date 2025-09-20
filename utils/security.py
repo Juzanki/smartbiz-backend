@@ -17,19 +17,23 @@ ENV / Settings expected (backend.config.settings):
   TOKEN_AUDIENCE (default "smartbiz-api"),
   TOKEN_ISSUER (default "smartbiz"),
   JWT_LEEWAY_SECONDS (default 10),
+  BCRYPT_ROUNDS (default 12),
   ENV ("development"/"production"/etc)
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 import secrets
 import warnings
 import uuid
+import logging
 
 from jose import jwt, JWTError  # python-jose
 from passlib.context import CryptContext  # passlib[bcrypt]
 
 from backend.config import settings
+
+logger = logging.getLogger("smartbiz.security")
 
 # -------------------------------------------------
 # Public exports from this module
@@ -41,6 +45,8 @@ __all__ = [
     "create_access_token",
     "create_refresh_token",
     "decode_token",
+    "safe_decode_token",
+    "get_token_subject",
     "is_access_token",
     "is_refresh_token",
     "token_expires_in_seconds",
@@ -48,22 +54,6 @@ __all__ = [
     "create_reset_token",
     "validate_reset_token",
 ]
-
-# =========================
-# Password hashing
-# =========================
-# Internal context (private name)
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-# Public alias expected by the rest of the codebase
-pwd_context = _pwd_ctx
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Return True if password matches the hash."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password: str) -> str:
-    """Hash password using bcrypt (salted)."""
-    return pwd_context.hash(password)
 
 # =========================
 # SECRET / JWT config
@@ -94,6 +84,7 @@ REFRESH_TOKEN_EXPIRE_DAYS: int = int(getattr(settings, "REFRESH_TOKEN_EXPIRE_DAY
 TOKEN_AUDIENCE: str = getattr(settings, "TOKEN_AUDIENCE", "smartbiz-api")
 ISSUER: str = getattr(settings, "TOKEN_ISSUER", "smartbiz")
 JWT_LEEWAY_SECONDS: int = int(getattr(settings, "JWT_LEEWAY_SECONDS", 10))
+BCRYPT_ROUNDS: int = int(getattr(settings, "BCRYPT_ROUNDS", 12))  # cost factor
 
 # =========================
 # Time helpers
@@ -108,31 +99,82 @@ def _exp_days(days: float) -> datetime:
     return _now_utc() + timedelta(days=days)
 
 # =========================
+# Password hashing
+# =========================
+def _build_pwd_context() -> CryptContext:
+    """
+    Create passlib CryptContext with bcrypt, guarding against env/version pitfalls.
+    Note: requirements.txt should pin:
+      - passlib[bcrypt]==1.7.4
+      - bcrypt==3.2.2
+    """
+    ctx = CryptContext(
+        schemes=["bcrypt"],
+        deprecated="auto",
+        bcrypt__rounds=BCRYPT_ROUNDS,
+        # normalize unicode input; avoid surprise mismatches
+        # see: https://passlib.readthedocs.io/en/stable/lib/passlib.context.html
+    )
+    # Soft self-check (avoid crashing if bcrypt backend is odd)
+    try:
+        test_hash = ctx.hash("self-check")
+        if not ctx.verify("self-check", test_hash):
+            raise RuntimeError("bcrypt self-check failed")
+    except Exception as e:
+        # Don't crash the app; log a clear warning so ops can fix deps.
+        logger.warning("Passlib/bcrypt backend check failed: %s", e)
+    return ctx
+
+# Internal context (private), with guard
+_pwd_ctx = _build_pwd_context()
+# Public alias expected by the rest of the codebase
+pwd_context = _pwd_ctx
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Return True if password matches the hash (never raises)."""
+    if not (isinstance(plain_password, str) and isinstance(hashed_password, str)):
+        return False
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        # Common when bcrypt backend/version mismatches; treat as no-match.
+        logger.debug("verify_password error: %s", e)
+        return False
+
+def get_password_hash(password: str) -> str:
+    """Hash password using bcrypt (salted)."""
+    if not isinstance(password, str) or not password:
+        raise ValueError("Password missing")
+    return pwd_context.hash(password)
+
+# =========================
 # JWT helpers
 # =========================
-def _base_claims(subject: str | int, token_type: str, audience: Optional[str]) -> Dict[str, Any]:
+def _base_claims(subject: Union[str, int], token_type: str, audience: Optional[str]) -> Dict[str, Any]:
     """Common claims for both access and refresh."""
+    now = _now_utc()
     return {
         "sub": str(subject),
         "aud": audience or TOKEN_AUDIENCE,
         "iss": ISSUER,
         "jti": uuid.uuid4().hex,
         "type": token_type,             # "access" | "refresh"
-        "iat": int(_now_utc().timestamp()),
+        "iat": int(now.timestamp()),
+        "nbf": int(now.timestamp()),    # valid from now
     }
 
 def create_access_token(
-    data: Dict[str, Any],
+    data: Dict[str, Any] | None = None,
     expires_delta: Optional[timedelta] = None,
     *,
-    subject: str | int | None = None,
+    subject: Union[str, int, None] = None,
     audience: Optional[str] = None,
 ) -> str:
     """
     Create a short-lived access token (default uses ACCESS_TOKEN_EXPIRE_MINUTES).
     Either pass `subject=` or include `sub` inside `data`.
     """
-    to_encode = dict(data or {})
+    to_encode: Dict[str, Any] = dict(data or {})
     sub = subject or to_encode.get("sub")
     if not sub:
         raise ValueError("subject (sub) is required for access token")
@@ -146,7 +188,7 @@ def create_access_token(
 
 def create_refresh_token(
     *,
-    subject: str | int,
+    subject: Union[str, int],
     audience: Optional[str] = None,
     expires_days: Optional[int] = None,
 ) -> str:
@@ -170,6 +212,26 @@ def decode_token(token: str, *, audience: Optional[str] = None) -> Dict[str, Any
         options={"leeway": JWT_LEEWAY_SECONDS},
     )
 
+def safe_decode_token(token: str, *, audience: Optional[str] = None) -> tuple[bool, Dict[str, Any] | None, str | None]:
+    """
+    Like decode_token but never raises.
+    Returns (ok, claims, error_message)
+    """
+    try:
+        claims = decode_token(token, audience=audience)
+        return True, claims, None
+    except JWTError as e:
+        return False, None, str(e)
+
+def get_token_subject(token_or_claims: Union[str, Dict[str, Any]]) -> Optional[str]:
+    """Get `sub` from token string or claims dict."""
+    claims = token_or_claims
+    if isinstance(token_or_claims, str):
+        ok, claims, _err = safe_decode_token(token_or_claims)
+        if not ok or not isinstance(claims, dict):
+            return None
+    return str(claims.get("sub")) if claims and "sub" in claims else None
+
 def is_access_token(claims: Dict[str, Any]) -> bool:
     return claims.get("type") == "access"
 
@@ -185,7 +247,7 @@ def token_expires_in_seconds(claims: Dict[str, Any]) -> int:
     return int(exp) - now
 
 def issue_session_tokens(
-    subject: str | int,
+    subject: Union[str, int],
     *,
     audience: Optional[str] = None,
     access_minutes: Optional[int] = None,
@@ -207,15 +269,13 @@ def issue_session_tokens(
     )
 
     # decode once to compute TTLs (errors here mean config mismatch)
-    a_claims = decode_token(access, audience=audience)
-    r_claims = decode_token(refresh, audience=audience)
+    a_ok, a_claims, _ = safe_decode_token(access, audience=audience)
+    r_ok, r_claims, _ = safe_decode_token(refresh, audience=audience)
 
-    return (
-        access,
-        refresh,
-        token_expires_in_seconds(a_claims),
-        token_expires_in_seconds(r_claims),
-    )
+    a_ttl = token_expires_in_seconds(a_claims or {}) if a_ok else 0
+    r_ttl = token_expires_in_seconds(r_claims or {}) if r_ok else 0
+
+    return access, refresh, a_ttl, r_ttl
 
 # =========================
 # Optional: reset-token helpers (simple)
