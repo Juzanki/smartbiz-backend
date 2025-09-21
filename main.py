@@ -1,12 +1,12 @@
 # backend/main.py
 from __future__ import annotations
 
-import os, sys, re, json, time, uuid, logging, secrets, hashlib, datetime as dt
+import os, sys, re, json, time, uuid, logging, secrets, hashlib
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
-from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple, Union
+from typing import Callable, Iterable, Optional, List, Dict, Any, Union
 
-# ───────────────── Paths ─────────────────
+# ───────────────────────── Paths ─────────────────────────
 THIS_FILE = Path(__file__).resolve()
 BACKEND_DIR = THIS_FILE.parent
 ROOT_DIR = BACKEND_DIR.parent
@@ -18,15 +18,13 @@ BACKEND_PUBLIC_URL = os.getenv(
     "https://smartbiz-backend-p45m.onrender.com"
 ).rstrip("/")
 
+# ─────────────────────── Framework ───────────────────────
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.openapi.docs import (
-    get_swagger_ui_html,
-    get_swagger_ui_oauth2_redirect_html,
-)
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -34,13 +32,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
 
-# ───────────────── DB imports ─────────────────
+# ──────────────────────── DB imports ─────────────────────
 try:
     from backend.db import Base, SessionLocal, engine
 except Exception:
     from db import Base, SessionLocal, engine  # type: ignore
 
-# ───────────────── Env helpers ───────────────
+# ───────────────────── Env helpers ───────────────────────
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
     return default if v is None else v.strip().lower() in {"1","true","yes","y","on"}
@@ -60,10 +58,8 @@ def _sanitize_db_url(url: str) -> str:
     return "" if not url else re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
-UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", BACKEND_DIR / "uploads")).resolve()
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ───────────────── Logging ───────────────────
+# ─────────────────────── Logging ─────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = env_bool("LOG_JSON", False)
 
@@ -86,7 +82,7 @@ root_logger.handlers = [_handler]
 root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("smartbiz.main")
 
-# ─────────────── User table introspection ────
+# ─────────────── User table introspection ────────────────
 USER_TABLE = os.getenv("USER_TABLE", "users")
 PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
 _USERS_COLS: Optional[set[str]] = None
@@ -95,8 +91,7 @@ with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
     _insp = _sa_inspect(engine)
     _USERS_COLS = {c["name"] for c in _insp.get_columns(USER_TABLE)}
-    chosen = "hashed_password" if "hashed_password" in _USERS_COLS \
-        else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
+    chosen = "hashed_password" if "hashed_password" in _USERS_COLS else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
     logger.info("Users cols: %s | PW col: %s", sorted(_USERS_COLS or []), PW_COL)
@@ -109,7 +104,7 @@ def _users_columns() -> set[str]:
         _USERS_COLS = {c["name"] for c in _sa_inspect(engine).get_columns(USER_TABLE)}
     return _USERS_COLS or set()
 
-# ───────────────── Middlewares ───────────────
+# ───────────────────── Middlewares ───────────────────────
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         try:
@@ -141,7 +136,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         response.headers["x-process-time-ms"] = str(int((time.perf_counter() - start) * 1000))
         return response
 
-# ───────────────── DB helpers ────────────────
+# ─────────────────────── DB helpers ──────────────────────
 def _db_ping() -> bool:
     try:
         with engine.connect() as conn:
@@ -157,7 +152,7 @@ def get_db() -> Session:
     finally:
         db.close()
 
-# ───────────────── Lifespan ────────────────
+# ─────────────────────── Lifespan ────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting SmartBiz (env=%s, db=%s)", ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL","")))
@@ -174,7 +169,7 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down SmartBiz")
 
-# ───────────────── App ─────────────────────
+# ───────────────────────── App ───────────────────────────
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME","SmartBiz Assistance API"),
@@ -186,7 +181,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ───────────────── CORS ────────────────────
+# ───────────────────────── CORS ──────────────────────────
 def _resolve_cors_origins() -> List[str]:
     hardcoded = [
         "https://smartbizsite.netlify.app",
@@ -225,18 +220,18 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
-# ───────────────── Models ───────────────────
+# ───────────────────────── Models ────────────────────────
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
     username: constr(min_length=3, pattern=r"^[a-z0-9_]+$", strip_whitespace=True)
 
-# Strict model (not used directly by routes; tunatumia flexible)
+# (strict) not used directly by routes
 class LoginIn(BaseModel):
     identifier: str
     password: constr(min_length=1)
 
-# Flexible: inakubali {identifier,password} AU {email,password}
+# Flexible: accepts {identifier,password} OR {email,password}
 class LoginInFlexible(BaseModel):
     identifier: Optional[str] = None
     email: Optional[EmailStr] = None
@@ -247,7 +242,7 @@ def _resolve_identifier(payload: Union[LoginInFlexible, dict]) -> str:
         return (payload.get("identifier") or payload.get("email") or "").strip()
     return (payload.identifier or (payload.email or "")).strip()
 
-# ───────── Password hashing (bcrypt→pbkdf2 fallback) ────────
+# ───────────── Password hashing & JWT ─────────────
 try:
     from passlib.context import CryptContext  # type: ignore
     _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -258,7 +253,6 @@ except Exception:
         dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200_000)
         return f"pbkdf2$sha256$200000${salt.hex()}${dk.hex()}"
 
-# ───────── JWT + Password verify ────────────
 JWT_SECRET = os.getenv("JWT_SECRET","change-me-super-secret")
 JWT_ISS = os.getenv("JWT_ISS","smartbiz")
 JWT_AUD = os.getenv("JWT_AUD","smartbiz-web")
@@ -317,17 +311,14 @@ def _verify_password(plain: str, stored: str) -> bool:
         return dk.hex() == dk_hex
     return False
 
-# ───────────── Auth helpers ────────────────
+# ───────────────── Auth helpers & deps ───────────────────
 def _get_user_by_identifier(db: Session, identifier: str) -> Optional[Dict[str, Any]]:
     cols = _users_columns()
     where, params = [], {}
     if "email" in cols:    where.append("email=:e");    params["e"] = identifier
     if "username" in cols: where.append("username=:u"); params["u"] = identifier
     if not where: return None
-    row = db.execute(
-        text(f"SELECT * FROM {USER_TABLE} WHERE {' OR '.join(where)} LIMIT 1"),
-        params
-    ).mappings().first()
+    row = db.execute(text(f"SELECT * FROM {USER_TABLE} WHERE {' OR '.join(where)} LIMIT 1"), params).mappings().first()
     return dict(row) if row else None
 
 def _get_user_by_id_or_email(db: Session, uid: Optional[str], email: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -346,15 +337,15 @@ def _get_bearer_token(request: Request) -> str:
         raise HTTPException(status_code=401, detail="missing_bearer")
     return auth.split(" ",1)[1].strip()
 
-# Dependency: current user
 def current_user(request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
     token = _get_bearer_token(request)
     payload = _decode_jwt(token)
     user = _get_user_by_id_or_email(db, payload.get("sub") or payload.get("uid"), payload.get("email"))
-    if not user: raise HTTPException(status_code=404, detail="user_not_found")
+    if not user:
+        raise HTTPException(status_code=404, detail="user_not_found")
     return {"id": user.get("id"), "email": user.get("email"), "username": user.get("username")}
 
-# ───────────── Global error handlers ─────────────
+# ───────────────── Global error handlers ─────────────────
 @app.exception_handler(HTTPException)
 async def http_exc_handler(_: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
@@ -363,9 +354,10 @@ async def http_exc_handler(_: Request, exc: HTTPException):
 async def validation_exc_handler(_: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": "validation_error", "errors": exc.errors()})
 
-# ───────────── Routes ──────────────────────
+# ───────────────────────── Routes ─────────────────────────
 @app.get("/")
-def root_redirect(): return RedirectResponse("/health", status_code=302)
+def root_redirect():
+    return RedirectResponse("/health", status_code=302)
 
 @app.get("/health")
 @app.get("/api/health")
@@ -376,6 +368,7 @@ if _docs_enabled:
     @app.get("/docs", include_in_schema=False)
     async def custom_swagger_ui_html():
         return get_swagger_ui_html(openapi_url=app.openapi_url, title="SmartBiz API Docs")
+
     @app.get("/docs/oauth2-redirect", include_in_schema=False)
     async def swagger_ui_redirect():
         return get_swagger_ui_oauth2_redirect_html()
@@ -389,7 +382,7 @@ async def cors_diag(request: Request):
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
 
-# ───────────── Signup/Register ─────────────
+# ─────────────── Signup/Register ───────────────
 @app.post("/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
 @app.post("/api/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED, tags=["Auth"])
@@ -405,7 +398,8 @@ def signup(payload: SignupIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "user": dict(row)}
 
-# ───────────── Login/Signin (identifier OR email) ─────────────
+# ─────────────── Login / Signin ───────────────
+# ✅ Usajili wa route ndani ya main + @app.post umeongezwa (aliases pia)
 @app.post("/auth/login", tags=["Auth"])
 @app.post("/api/auth/login", tags=["Auth"])
 @app.post("/auth/signin", tags=["Auth"])
@@ -430,7 +424,7 @@ def login(payload: LoginInFlexible, db: Session = Depends(get_db)):
         "user": {"id": row["id"], "email": row.get("email"), "username": row.get("username")},
     }
 
-# ───────────── /auth/me (decode JWT & return user) ─────────────
+# ─────────────── /auth/me ───────────────
 @app.get("/auth/me", tags=["Auth"])
 @app.get("/api/auth/me", tags=["Auth"])
 def auth_me(user: Dict[str, Any] = Depends(current_user)):
