@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, sys, re, json, time, uuid, logging, secrets, hashlib, datetime as dt
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
-from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple
+from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple, Union
 
 THIS_FILE = Path(__file__).resolve()
 BACKEND_DIR = THIS_FILE.parent
@@ -187,11 +187,35 @@ def _resolve_cors_origins() -> List[str]:
         "https://smartbizsite.netlify.app",
         "https://smartbiz.site","https://www.smartbiz.site",
         "http://localhost:5173","http://127.0.0.1:5173",
+        "http://localhost:4173","http://127.0.0.1:4173",
     ]
     return _uniq(hardcoded + env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS"))
 
 ALLOW_ORIGINS = _resolve_cors_origins()
-app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
+
+if CORS_ALLOW_ALL:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["set-cookie"],
+        max_age=600,
+    )
+    logger.warning("CORS_ALLOW_ALL=1 (dev mode)")
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOW_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["set-cookie"],
+        max_age=600,
+    )
+
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
@@ -200,11 +224,23 @@ app.add_middleware(RequestIDMiddleware)
 class SignupIn(BaseModel):
     email: EmailStr
     password: constr(min_length=8)
-    username: constr(min_length=3)
+    username: constr(min_length=3, pattern=r"^[a-z0-9_]+$", strip_whitespace=True)
 
 class LoginIn(BaseModel):
     identifier: str
     password: constr(min_length=1)
+
+# --- flexible login model (accepts identifier OR email) ---
+class LoginInFlexible(BaseModel):
+    identifier: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: constr(min_length=1)
+
+def _resolve_identifier(payload: Union[LoginInFlexible, dict]) -> str:
+    # In case frontend sends { email, password } instead of { identifier, password }
+    if isinstance(payload, dict):
+        return (payload.get("identifier") or payload.get("email") or "").strip()
+    return (payload.identifier or (payload.email or "")).strip()
 
 # ───────── Password hashing (bcrypt→pbkdf2 fallback) ────────
 try:
@@ -330,7 +366,7 @@ if _docs_enabled:
 async def cors_diag(request: Request):
     return {
         "origin_header": request.headers.get("origin"),
-        "allowed_origins": ALLOW_ORIGINS,
+        "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["* (regex)"],
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
 
@@ -347,20 +383,31 @@ def signup(payload: SignupIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "user": dict(row)}
 
-# Login/Signin
+# Login/Signin (flexible: identifier OR email)
 @app.post("/auth/login")
 @app.post("/auth/signin")
-def login(payload: LoginIn, db: Session = Depends(get_db)):
-    row = _get_user_by_identifier(db, payload.identifier)
-    if not row: raise HTTPException(404, "user_not_found")
+def login(payload: LoginInFlexible, db: Session = Depends(get_db)):
+    ident = _resolve_identifier(payload)
+    if not ident:
+        raise HTTPException(status_code=422, detail="identifier_required")
+
+    row = _get_user_by_identifier(db, ident)
+    if not row:
+        raise HTTPException(status_code=404, detail="user_not_found")
+
     stored = row.get(PW_COL)
     if not stored or not _verify_password(payload.password, stored):
-        raise HTTPException(401, "invalid_credentials")
-    token = _make_jwt({"sub": str(row.get("id")), "uid": row.get("id"), "email": row.get("email")})
-    return {"ok": True, "access_token": token, "token_type": "bearer",
-            "user": {"id": row["id"], "email": row.get("email"), "username": row.get("username")}}
+        raise HTTPException(status_code=401, detail="invalid_credentials")
 
-# NEW: /auth/me (decode JWT & return user)
+    token = _make_jwt({"sub": str(row.get("id")), "uid": row.get("id"), "email": row.get("email")})
+    return {
+        "ok": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": row["id"], "email": row.get("email"), "username": row.get("username")},
+    }
+
+# /auth/me (decode JWT & return user)
 @app.get("/auth/me")
 def auth_me(user: Dict[str, Any] = Depends(current_user)):
     return {"ok": True, "user": user}
