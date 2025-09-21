@@ -6,29 +6,33 @@ from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple, Union
 
+# ───────────────── Paths ─────────────────
 THIS_FILE = Path(__file__).resolve()
 BACKEND_DIR = THIS_FILE.parent
 ROOT_DIR = BACKEND_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL","https://smartbiz-backend-p45m.onrender.com").rstrip("/")
+BACKEND_PUBLIC_URL = os.getenv(
+    "BACKEND_PUBLIC_URL",
+    "https://smartbiz-backend-p45m.onrender.com"
+).rstrip("/")
 
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
-from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import (
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
-from starlette.datastructures import MutableHeaders
 
 # ───────────────── DB imports ─────────────────
 try:
@@ -89,9 +93,10 @@ _USERS_COLS: Optional[set[str]] = None
 
 with suppress(Exception):
     from sqlalchemy import inspect as _sa_inspect
-    insp = _sa_inspect(engine)
-    _USERS_COLS = {c["name"] for c in insp.get_columns(USER_TABLE)}
-    chosen = "hashed_password" if "hashed_password" in _USERS_COLS else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
+    _insp = _sa_inspect(engine)
+    _USERS_COLS = {c["name"] for c in _insp.get_columns(USER_TABLE)}
+    chosen = "hashed_password" if "hashed_password" in _USERS_COLS \
+        else ("password_hash" if "password_hash" in _USERS_COLS else PW_COL)
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
     logger.info("Users cols: %s | PW col: %s", sorted(_USERS_COLS or []), PW_COL)
@@ -113,7 +118,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             return Response(status_code=499)
         except Exception:
             logger.exception("security-mw")
-            return JSONResponse(status_code=500, content={"detail":"Internal server error"})
+            return JSONResponse(status_code=500, content={"detail": "Internal server error"})
         response.headers.setdefault("X-Content-Type-Options","nosniff")
         response.headers.setdefault("X-Frame-Options","DENY")
         response.headers.setdefault("Referrer-Policy","strict-origin-when-cross-origin")
@@ -185,9 +190,9 @@ app = FastAPI(
 def _resolve_cors_origins() -> List[str]:
     hardcoded = [
         "https://smartbizsite.netlify.app",
-        "https://smartbiz.site","https://www.smartbiz.site",
-        "http://localhost:5173","http://127.0.0.1:5173",
-        "http://localhost:4173","http://127.0.0.1:4173",
+        "https://smartbiz.site", "https://www.smartbiz.site",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:4173", "http://127.0.0.1:4173",
     ]
     return _uniq(hardcoded + env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS"))
 
@@ -226,18 +231,18 @@ class SignupIn(BaseModel):
     password: constr(min_length=8)
     username: constr(min_length=3, pattern=r"^[a-z0-9_]+$", strip_whitespace=True)
 
+# Strict model (not used directly by routes; tunatumia flexible)
 class LoginIn(BaseModel):
     identifier: str
     password: constr(min_length=1)
 
-# --- flexible login model (accepts identifier OR email) ---
+# Flexible: inakubali {identifier,password} AU {email,password}
 class LoginInFlexible(BaseModel):
     identifier: Optional[str] = None
     email: Optional[EmailStr] = None
     password: constr(min_length=1)
 
 def _resolve_identifier(payload: Union[LoginInFlexible, dict]) -> str:
-    # In case frontend sends { email, password } instead of { identifier, password }
     if isinstance(payload, dict):
         return (payload.get("identifier") or payload.get("email") or "").strip()
     return (payload.identifier or (payload.email or "")).strip()
@@ -316,10 +321,13 @@ def _verify_password(plain: str, stored: str) -> bool:
 def _get_user_by_identifier(db: Session, identifier: str) -> Optional[Dict[str, Any]]:
     cols = _users_columns()
     where, params = [], {}
-    if "email" in cols: where.append("email=:e"); params["e"] = identifier
+    if "email" in cols:    where.append("email=:e");    params["e"] = identifier
     if "username" in cols: where.append("username=:u"); params["u"] = identifier
     if not where: return None
-    row = db.execute(text(f"SELECT * FROM {USER_TABLE} WHERE {' OR '.join(where)} LIMIT 1"), params).mappings().first()
+    row = db.execute(
+        text(f"SELECT * FROM {USER_TABLE} WHERE {' OR '.join(where)} LIMIT 1"),
+        params
+    ).mappings().first()
     return dict(row) if row else None
 
 def _get_user_by_id_or_email(db: Session, uid: Optional[str], email: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -346,12 +354,23 @@ def current_user(request: Request, db: Session = Depends(get_db)) -> Dict[str, A
     if not user: raise HTTPException(status_code=404, detail="user_not_found")
     return {"id": user.get("id"), "email": user.get("email"), "username": user.get("username")}
 
+# ───────────── Global error handlers ─────────────
+@app.exception_handler(HTTPException)
+async def http_exc_handler(_: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+@app.exception_handler(RequestValidationError)
+async def validation_exc_handler(_: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": "validation_error", "errors": exc.errors()})
+
 # ───────────── Routes ──────────────────────
 @app.get("/")
 def root_redirect(): return RedirectResponse("/health", status_code=302)
 
 @app.get("/health")
-def health(): return {"status":"healthy", "db":_db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
+@app.get("/api/health")
+def health():
+    return {"status":"healthy", "db":_db_ping(), "ts": time.time(), "base_url": BACKEND_PUBLIC_URL}
 
 if _docs_enabled:
     @app.get("/docs", include_in_schema=False)
@@ -370,24 +389,28 @@ async def cors_diag(request: Request):
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
 
-# Signup/Register
-@app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+# ───────────── Signup/Register ─────────────
+@app.post("/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
+@app.post("/api/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED, tags=["Auth"])
 def signup(payload: SignupIn, db: Session = Depends(get_db)):
     cols = _users_columns()
-    if "email" in cols and _get_user_by_identifier(db, payload.email): raise HTTPException(409, "email_already_exists")
-    if "username" in cols and _get_user_by_identifier(db, payload.username): raise HTTPException(409, "username_already_exists")
+    if "email" in cols and _get_user_by_identifier(db, payload.email):
+        raise HTTPException(409, "email_already_exists")
+    if "username" in cols and _get_user_by_identifier(db, payload.username):
+        raise HTTPException(409, "username_already_exists")
     pw = _hash_password(payload.password)
     sql = f"INSERT INTO {USER_TABLE} (email, username, {PW_COL}) VALUES (:e,:u,:p) RETURNING id,email,username"
     row = db.execute(text(sql), {"e": payload.email, "u": payload.username, "p": pw}).mappings().first()
     db.commit()
     return {"ok": True, "user": dict(row)}
 
-# Login/Signin (flexible: identifier OR email)
-@app.post("/auth/login")
-@app.post("/auth/signin")
+# ───────────── Login/Signin (identifier OR email) ─────────────
+@app.post("/auth/login", tags=["Auth"])
+@app.post("/api/auth/login", tags=["Auth"])
+@app.post("/auth/signin", tags=["Auth"])
 def login(payload: LoginInFlexible, db: Session = Depends(get_db)):
-    ident = _resolve_identifier(payload)
+    ident = _resolve_identifier(payload).lower()
     if not ident:
         raise HTTPException(status_code=422, detail="identifier_required")
 
@@ -407,7 +430,8 @@ def login(payload: LoginInFlexible, db: Session = Depends(get_db)):
         "user": {"id": row["id"], "email": row.get("email"), "username": row.get("username")},
     }
 
-# /auth/me (decode JWT & return user)
-@app.get("/auth/me")
+# ───────────── /auth/me (decode JWT & return user) ─────────────
+@app.get("/auth/me", tags=["Auth"])
+@app.get("/api/auth/me", tags=["Auth"])
 def auth_me(user: Dict[str, Any] = Depends(current_user)):
     return {"ok": True, "user": user}
