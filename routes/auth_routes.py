@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import jwt  # PyJWT
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Body
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -33,13 +34,13 @@ except Exception:  # pragma: no cover
 # ──────────────────────────────────────────────────────────────────────
 # Security helpers (hash/verify)
 # ──────────────────────────────────────────────────────────────────────
-# Jaribu kutumia helper zako kama zipo; vinginevyo tumia passlib (bcrypt)
 try:
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
 except Exception:
     try:
         from utils.security import verify_password, get_password_hash  # type: ignore
     except Exception:
+        # Fallback ya ndani: passlib[bcrypt]
         from passlib.context import CryptContext
 
         _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -56,19 +57,25 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────
 # JWT (PyJWT)
 # ──────────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    # Dev fallback: usitumie fallback hii kwenye production
+    # ⚠️ Dev fallback tu. Kwenye production weka SECRET_KEY/ JWT_SECRET kwenye env.
     SECRET_KEY = base64.urlsafe_b64encode(os.urandom(48)).decode()
 
-JWT_ALG = os.getenv("JWT_ALG", "HS256")
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # 60 min default
+JWT_ALG = os.getenv("JWT_ALG", os.getenv("JWT_ALGORITHM", "HS256"))
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # default 60 min
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
-def _expires_in_secs(minutes: int) -> int:
+def _secs(minutes: int) -> int:
     return int(timedelta(minutes=minutes).total_seconds())
+
+def _ensure_str(x: Any) -> str:
+    """Hakikisha token ni str (baadhi ya matoleo ya PyJWT hurudisha bytes)."""
+    if isinstance(x, bytes):
+        return x.decode("utf-8")
+    return str(x)
 
 def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, int]:
     now = _now()
@@ -83,24 +90,23 @@ def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, i
     if "sub" in payload:
         payload["sub"] = str(payload["sub"])
     token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
-    return token, _expires_in_secs(minutes)
+    token = _ensure_str(token)
+    return token, _secs(minutes)
 
 def decode_token(token: str) -> Dict[str, Any]:
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid or expired token: {e}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_or_expired_token") from e
 
 # ──────────────────────────────────────────────────────────────────────
 # Config & Flags
 # ──────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("smartbiz.auth")
-
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# Cookie settings (hiari)
 def _flag(name: str, default: str = "true") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on", "y"}
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 USE_COOKIE_AUTH = _flag("USE_COOKIE_AUTH", "true")
 COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
@@ -110,10 +116,8 @@ COOKIE_SECURE = _flag("AUTH_COOKIE_SECURE", "true")
 COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")  # 'lax' | 'strict' | 'none'
 COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
 
-# Allow phone login? (tuta-support kama field ipo)
 ALLOW_PHONE_LOGIN = _flag("AUTH_LOGIN_ALLOW_PHONE", "false")
 
-# Registration enable flags
 ALLOW_REG = (
     _flag("ALLOW_REGISTRATION", "true")
     or _flag("REGISTRATION_ENABLED", "true")
@@ -121,7 +125,6 @@ ALLOW_REG = (
     or _flag("SMARTBIZ_ALLOW_SIGNUP", "true")
 )
 
-# Rate limit for login (per minute)
 LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
@@ -129,7 +132,6 @@ _LOGIN_BUCKET: Dict[str, List[float]] = {}
 def _rate_ok(key: str) -> bool:
     now = time.time()
     q = _LOGIN_BUCKET.setdefault(key, [])
-    # toa entries za zamani
     while q and (now - q[0]) > _RATE_WIN:
         q.pop(0)
     if len(q) >= LOGIN_RATE_MAX_PER_MIN:
@@ -149,7 +151,6 @@ def _norm_email(s: Optional[str]) -> str:
     return _norm(s).lower()
 
 def _norm_username(s: Optional[str]) -> str:
-    # collapse spaces and lower
     return " ".join(_norm(s).split()).lower()
 
 def _norm_phone(s: Optional[str]) -> str:
@@ -187,7 +188,8 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=6, max_length=128)
     full_name: Optional[str] = Field(default=None, max_length=120)
 
-class LoginRequest(BaseModel):
+class LoginJSON(BaseModel):
+    # Inaruhusu email AU username (au phone kama umeweka flag)
     email_or_username: str
     password: str
 
@@ -223,7 +225,6 @@ def _find_user_by_identifier(db: Session, ident: str):
 
     query = db.query(User)
     conds = [User.email == ident, User.username == ident]
-    # phone support kama field ipo
     for phone_field in ("phone", "phone_number", "msisdn"):
         if hasattr(User, phone_field) and phone_norm:
             conds.append(getattr(User, phone_field) == phone_norm)
@@ -281,7 +282,13 @@ def get_current_user(
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_sub")
 
-    user = db.query(User).get(uid)  # SQLAlchemy 1.4 style
+    # SQLAlchemy 1.4/2.0 compatibility
+    user = None
+    try:
+        user = db.get(User, uid)  # SA 1.4+
+    except Exception:
+        user = db.query(User).get(uid)  # legacy
+
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user_not_found")
     if hasattr(user, "is_active") and not getattr(user, "is_active"):
@@ -316,53 +323,89 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         db.refresh(user)
     except IntegrityError as e:
         db.rollback()
-        msg = str(e).lower()
+        msg = (str(e) or "").lower()
         if "email" in msg:
             raise HTTPException(status_code=409, detail="email_taken")
-        if "user" in msg or "name" in msg or "username" in msg or "handle" in msg:
+        if any(k in msg for k in ("user", "name", "username", "handle")):
             raise HTTPException(status_code=409, detail="username_taken")
+        logger.exception("register_failed")
         raise HTTPException(status_code=500, detail="register_failed")
 
     token, expires_in = create_access_token({"sub": user.id, "email": user.email, "username": user.username})
     _maybe_set_cookie(response, token)
 
     return AuthResponse(
-        access_token=token,
+        access_token=_ensure_str(token),
         expires_in=expires_in,
         user=UserOut.from_orm_user(user),
     )
 
 @router.post("/login", response_model=AuthResponse)
 @router.post("/signin", response_model=AuthResponse)
-def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
-    # Rate limit key: ip + identifier prefix
-    ip = (request.client.host if request.client else "unknown").strip()
-    ident_preview = (payload.email_or_username or "")[:32]
-    rl_key = f"{ip}|{ident_preview}"
-    if not _rate_ok(rl_key):
-        raise HTTPException(status_code=429, detail="too_many_requests")
+def login(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    # Huenda kupitia JSON *au* form; zote ni optional hapa
+    form_data: Optional[OAuth2PasswordRequestForm] = Depends(None),
+    json_payload: Optional[LoginJSON] = Body(default=None),
+):
+    """
+    Inakubali:
+    - application/x-www-form-urlencoded  (username=...&password=...)
+    - application/json                   ({ "email_or_username": "...", "password": "..." })
+    """
+    try:
+        # Rate limit (per IP + ident preview)
+        ip = (request.client.host if request.client else "unknown").strip()
+        ident_preview = ""
+        if form_data and getattr(form_data, "username", None):
+            ident_preview = (form_data.username or "")[:32]
+        elif json_payload and getattr(json_payload, "email_or_username", None):
+            ident_preview = (json_payload.email_or_username or "")[:32]
+        rl_key = f"{ip}|{ident_preview}"
+        if not _rate_ok(rl_key):
+            raise HTTPException(status_code=429, detail="too_many_requests")
 
-    ident = payload.email_or_username.strip()
-    user = _find_user_by_identifier(db, ident)
-    if not user:
-        # kulinda user enumeration
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
+        # Pata credentials
+        if form_data and getattr(form_data, "username", None):
+            ident = (form_data.username or "").strip()
+            password = (form_data.password or "")
+        elif json_payload:
+            ident = (json_payload.email_or_username or "").strip()
+            password = (json_payload.password or "")
+        else:
+            raise HTTPException(status_code=400, detail="missing_credentials")
 
-    hashed = _get_user_password_hash(user)
-    if not hashed or not verify_password(payload.password, hashed):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
+        if not ident or not password:
+            raise HTTPException(status_code=400, detail="missing_credentials")
 
-    if hasattr(user, "is_active") and not getattr(user, "is_active"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_inactive")
+        user = _find_user_by_identifier(db, ident)
+        if not user:
+            # Linda user enumeration
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
 
-    token, expires_in = create_access_token({"sub": user.id, "email": user.email, "username": user.username})
-    _maybe_set_cookie(response, token)
+        hashed = _get_user_password_hash(user)
+        if not hashed or not verify_password(password, hashed):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
 
-    return AuthResponse(
-        access_token=token,
-        expires_in=expires_in,
-        user=UserOut.from_orm_user(user),
-    )
+        if hasattr(user, "is_active") and not getattr(user, "is_active"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_inactive")
+
+        token, expires_in = create_access_token({"sub": user.id, "email": user.email, "username": user.username})
+        token = _ensure_str(token)
+        _maybe_set_cookie(response, token)
+
+        return AuthResponse(
+            access_token=token,
+            expires_in=expires_in,
+            user=UserOut.from_orm_user(user),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("login_crashed")
+        raise HTTPException(status_code=500, detail="server_error_login") from e
 
 @router.get("/me", response_model=UserOut)
 def me(current = Depends(get_current_user)):
@@ -370,7 +413,6 @@ def me(current = Depends(get_current_user)):
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(response: Response):
-    # Ondoa cookie kama inatumika
     if USE_COOKIE_AUTH:
         response.delete_cookie(
             key=COOKIE_NAME,
