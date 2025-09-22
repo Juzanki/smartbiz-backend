@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, sys, re, json, time, uuid, logging, secrets, hashlib
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
-from typing import Callable, Iterable, Optional, List, Dict, Any, Union
+from typing import Callable, Iterable, Optional, List, Dict, Any
 
 # ───────────────────────── Paths ─────────────────────────
 THIS_FILE = Path(__file__).resolve()
@@ -175,7 +175,7 @@ app = FastAPI(
     title=os.getenv("APP_NAME","SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
     version=os.getenv("APP_VERSION","1.0.0"),
-    docs_url=None,
+    docs_url=None,  # we provide /docs manually if enabled
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan,
@@ -220,130 +220,23 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 
-# ───────────────────────── Models ────────────────────────
-class SignupIn(BaseModel):
-    email: EmailStr
-    password: constr(min_length=8)
-    username: constr(min_length=3, pattern=r"^[a-z0-9_]+$", strip_whitespace=True)
-
-# (strict) not used directly by routes
-class LoginIn(BaseModel):
-    identifier: str
-    password: constr(min_length=1)
-
-# Flexible: accepts {identifier,password} OR {email,password}
-class LoginInFlexible(BaseModel):
-    identifier: Optional[str] = None
-    email: Optional[EmailStr] = None
-    password: constr(min_length=1)
-
-def _resolve_identifier(payload: Union[LoginInFlexible, dict]) -> str:
-    if isinstance(payload, dict):
-        return (payload.get("identifier") or payload.get("email") or "").strip()
-    return (payload.identifier or (payload.email or "")).strip()
-
-# ───────────── Password hashing & JWT ─────────────
-try:
-    from passlib.context import CryptContext  # type: ignore
-    _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-    def _hash_password(pw: str) -> str: return _pwd_ctx.hash(pw)
-except Exception:
-    def _hash_password(pw: str) -> str:
-        salt = secrets.token_bytes(16)
-        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200_000)
-        return f"pbkdf2$sha256$200000${salt.hex()}${dk.hex()}"
-
-JWT_SECRET = os.getenv("JWT_SECRET","change-me-super-secret")
-JWT_ISS = os.getenv("JWT_ISS","smartbiz")
-JWT_AUD = os.getenv("JWT_AUD","smartbiz-web")
-JWT_DAYS = int(os.getenv("JWT_EXPIRE_DAYS","7"))
-
-def _b64url(data: bytes) -> str:
-    import base64
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-def _b64url_decode(s: str) -> bytes:
-    import base64
-    pad = '=' * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-def _sign_hs256(msg: bytes) -> str:
-    import hmac, hashlib
-    sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
-    return _b64url(sig)
-
-def _make_jwt(claims: Dict[str, Any]) -> str:
-    header = {"alg":"HS256","typ":"JWT"}
-    now = int(time.time())
-    payload = {**claims,"iss":JWT_ISS,"aud":JWT_AUD,"iat":now,"nbf":now,"exp":now + JWT_DAYS*86400}
-    head = _b64url(json.dumps(header, separators=(",",":")).encode())
-    body = _b64url(json.dumps(payload, separators=(",",":")).encode())
-    sig  = _sign_hs256(f"{head}.{body}".encode())
-    return f"{head}.{body}.{sig}"
-
-def _decode_jwt(token: str) -> Dict[str, Any]:
+# ───────────────────── Include Routers ───────────────────
+# ⚠️ Usirudie prefix hapa – router tayari ina prefix="/auth"
+def _import_auth_router():
     try:
-        head_b64, body_b64, sig = token.split(".")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="malformed_token")
-    if _sign_hs256(f"{head_b64}.{body_b64}".encode()) != sig:
-        raise HTTPException(status_code=401, detail="bad_signature")
-    try:
-        payload = json.loads(_b64url_decode(body_b64))
-    except Exception:
-        raise HTTPException(status_code=401, detail="invalid_payload")
-    now = int(time.time())
-    if payload.get("iss") != JWT_ISS or payload.get("aud") != JWT_AUD:
-        raise HTTPException(status_code=401, detail="invalid_claims")
-    if now < int(payload.get("nbf",0)) or now > int(payload.get("exp",0)):
-        raise HTTPException(status_code=401, detail="token_expired")
-    return payload
+        from routes.auth_routes import router as auth_router  # when running from project root
+        return auth_router, "routes.auth_routes"
+    except Exception as e1:
+        try:
+            from backend.routes.auth_routes import router as auth_router  # when package is 'backend'
+            return auth_router, "backend.routes.auth_routes"
+        except Exception as e2:
+            logger.error("Failed to import auth router: %s | %s", e1, e2)
+            raise
 
-def _verify_password(plain: str, stored: str) -> bool:
-    try:
-        if stored.startswith("$2"):  # bcrypt
-            return _pwd_ctx.verify(plain, stored)  # type: ignore[name-defined]
-    except Exception:
-        pass
-    if stored.startswith("pbkdf2$sha256$"):
-        _, _, iters, salt_hex, dk_hex = stored.split("$", 4)
-        dk = hashlib.pbkdf2_hmac("sha256", plain.encode(), bytes.fromhex(salt_hex), int(iters))
-        return dk.hex() == dk_hex
-    return False
-
-# ───────────────── Auth helpers & deps ───────────────────
-def _get_user_by_identifier(db: Session, identifier: str) -> Optional[Dict[str, Any]]:
-    cols = _users_columns()
-    where, params = [], {}
-    if "email" in cols:    where.append("email=:e");    params["e"] = identifier
-    if "username" in cols: where.append("username=:u"); params["u"] = identifier
-    if not where: return None
-    row = db.execute(text(f"SELECT * FROM {USER_TABLE} WHERE {' OR '.join(where)} LIMIT 1"), params).mappings().first()
-    return dict(row) if row else None
-
-def _get_user_by_id_or_email(db: Session, uid: Optional[str], email: Optional[str]) -> Optional[Dict[str, Any]]:
-    cols = _users_columns()
-    if "id" in cols and uid:
-        r = db.execute(text(f"SELECT * FROM {USER_TABLE} WHERE id=:i LIMIT 1"), {"i": uid}).mappings().first()
-        if r: return dict(r)
-    if "email" in cols and email:
-        r = db.execute(text(f"SELECT * FROM {USER_TABLE} WHERE email=:e LIMIT 1"), {"e": email}).mappings().first()
-        if r: return dict(r)
-    return None
-
-def _get_bearer_token(request: Request) -> str:
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    if not auth or not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="missing_bearer")
-    return auth.split(" ",1)[1].strip()
-
-def current_user(request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    token = _get_bearer_token(request)
-    payload = _decode_jwt(token)
-    user = _get_user_by_id_or_email(db, payload.get("sub") or payload.get("uid"), payload.get("email"))
-    if not user:
-        raise HTTPException(status_code=404, detail="user_not_found")
-    return {"id": user.get("id"), "email": user.get("email"), "username": user.get("username")}
+_auth_router, _auth_src = _import_auth_router()
+app.include_router(_auth_router)
+logger.info("Auth router registered from %s (prefix already set in router)", _auth_src)
 
 # ───────────────── Global error handlers ─────────────────
 @app.exception_handler(HTTPException)
@@ -357,7 +250,8 @@ async def validation_exc_handler(_: Request, exc: RequestValidationError):
 # ───────────────────────── Routes ─────────────────────────
 @app.get("/")
 def root_redirect():
-    return RedirectResponse("/health", status_code=302)
+    # Prefer health; if docs enabled, redirect to docs for convenience
+    return RedirectResponse("/docs" if _docs_enabled else "/health", status_code=302)
 
 @app.get("/health")
 @app.get("/api/health")
@@ -381,51 +275,3 @@ async def cors_diag(request: Request):
         "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["* (regex)"],
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
-
-# ─────────────── Signup/Register ───────────────
-@app.post("/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
-@app.post("/api/auth/signup", status_code=status.HTTP_201_CREATED, tags=["Auth"])
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED, tags=["Auth"])
-def signup(payload: SignupIn, db: Session = Depends(get_db)):
-    cols = _users_columns()
-    if "email" in cols and _get_user_by_identifier(db, payload.email):
-        raise HTTPException(409, "email_already_exists")
-    if "username" in cols and _get_user_by_identifier(db, payload.username):
-        raise HTTPException(409, "username_already_exists")
-    pw = _hash_password(payload.password)
-    sql = f"INSERT INTO {USER_TABLE} (email, username, {PW_COL}) VALUES (:e,:u,:p) RETURNING id,email,username"
-    row = db.execute(text(sql), {"e": payload.email, "u": payload.username, "p": pw}).mappings().first()
-    db.commit()
-    return {"ok": True, "user": dict(row)}
-
-# ─────────────── Login / Signin ───────────────
-# ✅ Usajili wa route ndani ya main + @app.post umeongezwa (aliases pia)
-@app.post("/auth/login", tags=["Auth"])
-@app.post("/api/auth/login", tags=["Auth"])
-@app.post("/auth/signin", tags=["Auth"])
-def login(payload: LoginInFlexible, db: Session = Depends(get_db)):
-    ident = _resolve_identifier(payload).lower()
-    if not ident:
-        raise HTTPException(status_code=422, detail="identifier_required")
-
-    row = _get_user_by_identifier(db, ident)
-    if not row:
-        raise HTTPException(status_code=404, detail="user_not_found")
-
-    stored = row.get(PW_COL)
-    if not stored or not _verify_password(payload.password, stored):
-        raise HTTPException(status_code=401, detail="invalid_credentials")
-
-    token = _make_jwt({"sub": str(row.get("id")), "uid": row.get("id"), "email": row.get("email")})
-    return {
-        "ok": True,
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {"id": row["id"], "email": row.get("email"), "username": row.get("username")},
-    }
-
-# ─────────────── /auth/me ───────────────
-@app.get("/auth/me", tags=["Auth"])
-@app.get("/api/auth/me", tags=["Auth"])
-def auth_me(user: Dict[str, Any] = Depends(current_user)):
-    return {"ok": True, "user": user}
