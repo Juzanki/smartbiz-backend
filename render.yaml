@@ -2,7 +2,7 @@
 
 databases:
   - name: smartbiz-db-01
-    plan: free                        # badilisha ukihitaji
+    plan: free
     databaseName: smartbiz_db_rcfg
     user: smartbiz_db_rcfg_user
     region: oregon
@@ -12,54 +12,66 @@ services:
     name: smartbiz-backend
     env: python
     plan: free
+    region: oregon
     autoDeploy: true
     pythonVersion: 3.11
 
-    # Install step
-    buildCommand: |
-      python -m pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
+    # (hiari) kama repo yako ina folda ya mizizi yenye 'backend/', acha rootDir: ./
+    rootDir: ./
 
-    # Start step
+    buildCommand: |
+      set -e
+      python -m pip install --upgrade pip
+      # Jaribu backend/requirements.txt kisha fallback kwenye mzizi
+      if [ -f backend/requirements.txt ]; then
+        pip install --no-cache-dir -r backend/requirements.txt
+      elif [ -f requirements.txt ]; then
+        pip install --no-cache-dir -r requirements.txt
+      else
+        echo "[warn] Hakuna requirements.txt iliyopatikana; ukitaka, weka moja."
+      fi
+
     startCommand: |
       bash -lc '
-        # Normalize postgres:// -> postgresql+psycopg2:// kwa SQLAlchemy
-        export DATABASE_URL="${DATABASE_URL/postgres:\/\//postgresql+psycopg2:\/\/}"
+        set -e
 
-        # Render huongeza sslmode=require kwenye connectionString,
-        # lakini tukihakikisha ni salama pia ikiwa haipo:
-        case "$DATABASE_URL" in
-          *"sslmode="*) : ;;  # iko tayari
-          *) export DATABASE_URL="${DATABASE_URL}?sslmode=require" ;;
-        esac
-
-        # Alembic migrations (kama ipo)
-        if command -v alembic >/dev/null 2>&1; then
-          echo "[start] Alembic upgrade head…"
-          alembic upgrade head || echo "[warn] Alembic failed/absent; continuing"
+        # Normaliza postgres:// → postgresql+psycopg2:// (SQLAlchemy)
+        if [ -n "$DATABASE_URL" ]; then
+          export DATABASE_URL="${DATABASE_URL/postgres:\/\//postgresql+psycopg2:\/\/}"
+          case "$DATABASE_URL" in
+            *"sslmode="*) : ;;                      # ipo tayari
+            *) export DATABASE_URL="${DATABASE_URL}?sslmode=require" ;;
+          esac
         fi
 
-        # Anzisha FastAPI (module iko backend/main.py => backend.main:app)
+        # (hiari) Alembic kama ipo (huta-break deploy kama haipo)
+        if command -v alembic >/dev/null 2>&1 && [ -f alembic.ini ]; then
+          echo "[start] Alembic upgrade head…"
+          alembic upgrade head || echo "[warn] Alembic failed; continuing"
+        fi
+
+        # Hakikisha Python anaona mzizi wa repo (backend.main:app ipatikane)
+        export PYTHONPATH=.
+
+        # Endesha uvicorn (FastAPI)
         exec uvicorn backend.main:app \
           --host 0.0.0.0 --port "$PORT" \
           --proxy-headers --forwarded-allow-ips="*" \
-          --http httptools --log-level info
+          --log-level info
       '
 
-    # Healthcheck ya Render (inzii na haraka)
+    # Healthcheck ya Render
     healthCheckPath: /health
-    # (Optional) badilisha timeout/retry kama instance ni polepole kuamka
     healthCheckTimeout: 10
     healthCheckInterval: 15
 
     envVars:
-      # ---- DB: tumia moja kwa moja connectionString kutoka resource ya juu ----
+      # ==== DB (kuchotwa moja kwa moja kutoka kwenye resource ya juu) ====
       - key: DATABASE_URL
         fromDatabase:
           name: smartbiz-db-01
           property: connectionString
-
-      # (Hiari) Fallbacks kama code nyingine inazitumia
+      # (hiari) fallbacks ikiwa code nyingine inahitaji:
       - key: DB_HOST
         fromDatabase:
           name: smartbiz-db-01
@@ -79,7 +91,7 @@ services:
       - key: DB_PORT
         value: "5432"
 
-      # ---- Env ya app ----
+      # ==== App env ====
       - key: ENVIRONMENT
         value: production
       - key: LOG_LEVEL
@@ -87,25 +99,28 @@ services:
       - key: DEBUG
         value: "false"
       - key: AUTO_CREATE_TABLES
-        value: "true"             # unaweza kuweka false ukitegemea Alembic
+        value: "true"       # zima ukitegemea Alembic pekee
 
-      # ---- Security / JWT ----
-      - key: SECRET_KEY
-        value: pK179z2QQzIyIVge415C0e7kvdIX6p4y9d7_AQ1HTcU_hh35U4dO5guT0eKTSgj5IunErK1byXqUz5O5ysh6cQ
-      - key: JWT_ALG
-        value: HS256
-      - key: ACCESS_TOKEN_EXPIRE_MINUTES
-        value: "1440"            # 1 day
-      - key: REFRESH_TOKEN_EXPIRE_MINUTES
-        value: "43200"           # 30 days
+      # ==== JWT / Security ====
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ISS
+        value: smartbiz
+      - key: JWT_AUD
+        value: smartbiz-web
+      - key: JWT_EXPIRE_DAYS
+        value: "7"
 
-      # ---- CORS (weka domains zako za frontend) ----
+      # ==== CORS ====
+      # Tumia moja kati ya hizi mbili: (a) whitelist (salama) au (b) ruhusu zote (kwa test)
+      - key: CORS_ALLOW_ALL
+        value: "0"
       - key: CORS_ORIGINS
-        value: https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site
+        value: https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site,http://localhost:5173,http://127.0.0.1:5173
 
-      # ---- Cookies (kwa SPA cross-site) ----
+      # ==== Cookies (ikiwa unatumia cookie-auth mahali pengine) ====
       - key: USE_COOKIE_AUTH
-        value: "true"
+        value: "false"
       - key: AUTH_COOKIE_NAME
         value: sb_access
       - key: AUTH_COOKIE_SECURE
@@ -115,11 +130,15 @@ services:
       - key: AUTH_COOKIE_PATH
         value: "/"
 
-      # ---- Docs (hiari: onyesha /docs hata production) ----
+      # ==== Docs & Introspection (hiari) ====
       - key: ENABLE_DOCS
-        value: "true"
+        value: "1"          # /docs na /openapi.json upatikane
+      - key: ENABLE_INTROSPECT
+        value: "1"          # kama umeongeza route za /_routes n.k.
 
-      # ---- Hygiene ----
+      # ==== Misc ====
+      - key: BACKEND_PUBLIC_URL
+        value: https://smartbiz-backend-p45m.onrender.com
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: WEB_CONCURRENCY
