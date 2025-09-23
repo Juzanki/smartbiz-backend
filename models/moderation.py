@@ -1,4 +1,4 @@
-﻿# backend/models/moderation.py
+# backend/models/moderation.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from .message import Message
 
 
-# ---------- Enums ----------
+# ---------- Enums (portable: native_enum=False) ----------
 class ActionType(str, enum.Enum):
     mute    = "mute"
     block   = "block"
@@ -43,20 +43,17 @@ class ActionType(str, enum.Enum):
     ban     = "ban"
     kick    = "kick"
     warn    = "warn"
-    timeout = "timeout"   # mute/ban ya muda
-
+    timeout = "timeout"
 
 class ActionStatus(str, enum.Enum):
     applied = "applied"
     revoked = "revoked"
     expired = "expired"
 
-
 class ActionScope(str, enum.Enum):
-    room     = "room"       # chumba/stream
-    global_  = "global"     # mfumo mzima
-    platform = "platform"   # moderation ya nje (yt/tiktok/etc.)
-
+    room     = "room"      # chumba/stream
+    global_  = "global"    # mfumo mzima
+    platform = "platform"  # moderation ya nje (yt/tiktok/etc.)
 
 class ReasonCode(str, enum.Enum):
     spam          = "spam"
@@ -76,7 +73,6 @@ def _ip_hash(ip: str) -> str:
     data = (ip or "").encode("utf-8")
     return hmac.new(secret, data, hashlib.sha256).hexdigest() if secret else hashlib.sha256(data).hexdigest()
 
-
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -86,10 +82,10 @@ class ModerationAction(Base):
     """
     Kitendo cha moderation kwa mtumiaji (target) na aliyechukua hatua (moderator).
     - Scope: room/global/platform
-    - Lifecyle: applied/revoked/expired, duration + auto expires_at
+    - Lifecycle: applied/revoked/expired (+ duration/expires_at)
     - Evidence: message/url/meta
     - Privacy: ip_hash (client_ip hiari kulingana na sera)
-    - Appeals: fields za rufaa (optional)
+    - Appeals: sehemu za rufaa (optional)
     """
     __tablename__ = "moderation_actions"
     __mapper_args__ = {"eager_defaults": True}
@@ -99,49 +95,72 @@ class ModerationAction(Base):
     # Wapi ilipotokea
     room_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
     live_stream_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("live_streams.id", ondelete="SET NULL"), index=True, nullable=True
+        ForeignKey("live_streams.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
     )
 
     # Wahusika
     target_user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     moderator_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
         doc="Anaweza kuwa NULL kwa system/bot auto-moderation",
     )
 
-    # Mahusiano
+    # Mahusiano (back_populates lazima yazingatie yale ya User/LiveStream)
     target: Mapped["User"] = relationship(
-        "User", foreign_keys=[target_user_id], back_populates="moderations_received",
-        passive_deletes=True, lazy="selectin",
+        "User",
+        foreign_keys=lambda: [ModerationAction.target_user_id],
+        back_populates="moderations_received",
+        passive_deletes=True,
+        lazy="selectin",
     )
     moderator: Mapped[Optional["User"]] = relationship(
-        "User", foreign_keys=[moderator_id], back_populates="moderations_taken",
-        passive_deletes=True, lazy="selectin",
+        "User",
+        foreign_keys=lambda: [ModerationAction.moderator_id],
+        back_populates="moderations_taken",
+        passive_deletes=True,
+        lazy="selectin",
     )
     live_stream: Mapped[Optional["LiveStream"]] = relationship(
-        "LiveStream", foreign_keys=[live_stream_id], back_populates="moderation_actions",
-        passive_deletes=True, lazy="selectin",
+        "LiveStream",
+        foreign_keys=lambda: [ModerationAction.live_stream_id],
+        back_populates="moderation_actions",  # LiveStream lazima iwe na moderation_actions
+        passive_deletes=True,
+        lazy="selectin",
     )
 
     # Uainishaji
     action: Mapped[ActionType] = mapped_column(
-        SQLEnum(ActionType, name="moderation_action"), nullable=False, index=True
+        SQLEnum(ActionType, name="moderation_action_type", native_enum=False, validate_strings=True),
+        nullable=False,
+        index=True,
     )
     scope: Mapped[ActionScope] = mapped_column(
-        SQLEnum(ActionScope, name="moderation_scope"),
-        default=ActionScope.room, nullable=False, index=True
+        SQLEnum(ActionScope, name="moderation_scope", native_enum=False, validate_strings=True),
+        default=ActionScope.room,
+        nullable=False,
+        index=True,
     )
     status: Mapped[ActionStatus] = mapped_column(
-        SQLEnum(ActionStatus, name="moderation_status"),
-        default=ActionStatus.applied, nullable=False, index=True
+        SQLEnum(ActionStatus, name="moderation_status", native_enum=False, validate_strings=True),
+        default=ActionStatus.applied,
+        nullable=False,
+        index=True,
     )
 
     # Sababu / maelezo
     reason_code: Mapped[ReasonCode] = mapped_column(
-        SQLEnum(ReasonCode, name="moderation_reason_code"),
-        default=ReasonCode.other, nullable=False, index=True
+        SQLEnum(ReasonCode, name="moderation_reason_code", native_enum=False, validate_strings=True),
+        default=ReasonCode.other,
+        nullable=False,
+        index=True,
     )
     reason: Mapped[Optional[str]] = mapped_column(String(255))
     note: Mapped[Optional[str]] = mapped_column(Text)
@@ -152,12 +171,17 @@ class ModerationAction(Base):
 
     # Ushahidi
     evidence_message_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("messages.id", ondelete="SET NULL"), index=True, nullable=True
+        ForeignKey("messages.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
     )
     evidence_url:  Mapped[Optional[str]] = mapped_column(String(512))
     evidence_meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
     evidence_message: Mapped[Optional["Message"]] = relationship(
-        "Message", foreign_keys=[evidence_message_id], passive_deletes=True, lazy="selectin"
+        "Message",
+        foreign_keys=lambda: [ModerationAction.evidence_message_id],
+        passive_deletes=True,
+        lazy="selectin",
     )
 
     # Appeals (hiari)
@@ -176,10 +200,16 @@ class ModerationAction(Base):
 
     # Timestamps
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False, index=True
+        DateTime(timezone=True),
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+        index=True,
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"), nullable=False
+        DateTime(timezone=True),
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=text("CURRENT_TIMESTAMP"),
+        nullable=False,
     )
     revoked_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
 
@@ -192,14 +222,13 @@ class ModerationAction(Base):
         Index("ix_modact_status_time", "status", "created_at"),
         Index("ix_modact_action_scope", "action", "scope"),
         Index("ix_modact_moderator_time", "moderator_id", "created_at"),
-        Index("ix_modact_target_active", "target_user_id", "status", "expires_at"),  # queries za active bans
+        Index("ix_modact_target_active", "target_user_id", "status", "expires_at"),
         CheckConstraint("target_user_id IS NOT NULL", name="ck_modact_target_required"),
         CheckConstraint(
             "(scope <> 'room') OR (room_id IS NOT NULL OR live_stream_id IS NOT NULL)",
             name="ck_modact_room_scope_target",
         ),
         CheckConstraint("(duration_seconds IS NULL) OR (duration_seconds >= 0)", name="ck_modact_duration_nonneg"),
-        # Status guards ndogo: revoked ⇒ revoked_at IS NOT NULL
         CheckConstraint("(status <> 'revoked') OR (revoked_at IS NOT NULL)", name="ck_modact_revoked_ts"),
         {"extend_existing": True},
     )
@@ -227,17 +256,10 @@ class ModerationAction(Base):
 
     @remaining_seconds.expression
     def remaining_seconds(cls):
-        return func.cast(
-            func.greatest(
-                0,
-                func.extract("epoch", cls.expires_at - func.now())
-            ),
-            Integer,
-        )
+        return func.cast(func.greatest(0, func.extract("epoch", cls.expires_at - func.now())), Integer)
 
     # ---------- Helpers ----------
     def apply_duration(self, seconds: int | None) -> None:
-        """Weka muda wa adhabu na hesabu `expires_at` kuanzia sasa."""
         self.duration_seconds = int(seconds) if seconds is not None else None
         if self.duration_seconds and self.duration_seconds > 0:
             self.expires_at = _utcnow() + dt.timedelta(seconds=self.duration_seconds)
@@ -245,29 +267,24 @@ class ModerationAction(Base):
             self.expires_at = None
 
     def extend(self, *, seconds: int) -> None:
-        """Ongeza muda juu ya `expires_at` (au kuanzia sasa kama haikuwekwa)."""
         add = max(1, int(seconds))
         base = self.expires_at if self.expires_at and self.expires_at > _utcnow() else _utcnow()
         self.expires_at = base + dt.timedelta(seconds=add)
         self.duration_seconds = (self.duration_seconds or 0) + add
 
     def lift(self, *, reason: str | None = None) -> None:
-        """Ondoa adhabu (revoke)."""
         self.status = ActionStatus.revoked
         self.revoked_at = _utcnow()
         if reason:
             self.note = (self.note + " | " if self.note else "") + f"revoked: {reason.strip()}"
 
     def mark_expired_if_needed(self) -> bool:
-        """Geuza status kuwa expired ikiwa muda umeisha."""
         if self.status == ActionStatus.applied and self.expires_at and _utcnow() >= self.expires_at:
             self.status = ActionStatus.expired
             return True
         return False
 
-    # Privacy
     def set_ip(self, ip: Optional[str]) -> None:
-        """Hifadhi `ip_hash` kila wakati; `client_ip` hiari kulingana na env STORE_PLAIN_IP."""
         if ip:
             self.ip_hash = _ip_hash(ip)
             if os.getenv("STORE_PLAIN_IP", "0").lower() in {"1", "true", "yes", "on"}:
@@ -306,15 +323,12 @@ from sqlalchemy.event import listens_for
 
 @listens_for(ModerationAction, "before_insert")
 def _mod_before_insert(_m, _c, t: ModerationAction) -> None:
-    # Auto-compute expires_at from duration if needed
     if (t.duration_seconds or 0) > 0 and not t.expires_at:
         t.expires_at = _utcnow() + dt.timedelta(seconds=int(t.duration_seconds))
-    # Normalize privacy fields
     if t.client_ip and not t.ip_hash:
         t.ip_hash = _ip_hash(t.client_ip)
         if os.getenv("STORE_PLAIN_IP", "0").lower() not in {"1", "true", "yes", "on"}:
             t.client_ip = None
-    # Appeals normalization
     if t.appeal_result:
         t.appeal_result = t.appeal_result.strip() or None
     if t.appeal_note:
@@ -322,14 +336,11 @@ def _mod_before_insert(_m, _c, t: ModerationAction) -> None:
 
 @listens_for(ModerationAction, "before_update")
 def _mod_before_update(_m, _c, t: ModerationAction) -> None:
-    # Sync expires_at if duration changed but expires_at not set
     if (t.duration_seconds or 0) > 0 and not t.expires_at and t.status == ActionStatus.applied:
         t.expires_at = _utcnow() + dt.timedelta(seconds=int(t.duration_seconds))
-    # Auto-expire if needed
     if t.status == ActionStatus.applied and t.expires_at and _utcnow() >= t.expires_at:
         t.status = ActionStatus.expired
-    # Privacy normalization
     if t.client_ip and not t.ip_hash:
         t.ip_hash = _ip_hash(t.client_ip)
-        if os.getenv("STORE_PLAIN_IP", "0").lower() not in {"1", "true", "yes", "on"}:
+        if os.getenv("STORE_PLAIN_IP", "0").lower() not in {"1", "true", "yes", "on"}):
             t.client_ip = None
