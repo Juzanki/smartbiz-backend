@@ -1,4 +1,4 @@
-﻿# backend/models/like.py
+# backend/models/like.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.ext.hybrid import hybrid_property, hybrid_method
 from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.event import listens_for
 
 from backend.db import Base
 from backend.models._types import JSON_VARIANT  # portable JSON/JSONB
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
 
 # -------- Enums --------
 class Reaction(str, enum.Enum):
-    like   = "like"   # classic “thumb”/heart
+    like   = "like"
     love   = "love"
     fire   = "fire"
     laugh  = "laugh"
@@ -58,15 +60,14 @@ class Like(Base):
     Vipengele:
     • Target:  live_stream_id (FK) au room_id (string)
     • Actor:   user_id (mtumiaji) au session_key (mgeni)
-    • Reaction nyingi (❤🔥😂 ...), na “weight” kuunga mkono boosts/experiments
+    • Reactions nyingi (❤🔥😂 ...), na “weight” kuunga mkono boosts/experiments
     • Idempotency & minute_bucket kwa dedupe/analytics ya trafiki kubwa
-    • Soft-unlike + sababu (unlike_reason) na anti-spam flags
-    • Uhamishaji: from guest(session_key) → user_id baada ya login
+    • Soft-unlike + sababu na anti-spam flags
+    • Uhamishaji: session_key → user_id baada ya login
     """
     __tablename__ = "likes"
     __mapper_args__ = {"eager_defaults": True}
 
-    # ---------- Dedupe / Guards / Hot-path ----------
     __table_args__ = (
         # Dedupe kwa watumiaji waliologin (kwa reaction tofauti tunaruhusu rows tofauti)
         UniqueConstraint("live_stream_id", "user_id", "reaction", name="uq_like_stream_user_reac"),
@@ -85,12 +86,14 @@ class Like(Base):
         CheckConstraint("(live_stream_id IS NOT NULL) OR (room_id IS NOT NULL)", name="ck_like_target_present"),
         CheckConstraint("(user_id IS NOT NULL) OR (session_key IS NOT NULL)",    name="ck_like_actor_present"),
         CheckConstraint("weight >= 1", name="ck_like_weight_min1"),
+        {"extend_existing": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # ---------- Target ----------
     live_stream_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         ForeignKey("live_streams.id", ondelete="CASCADE"),
         index=True,
         nullable=True,
@@ -105,6 +108,7 @@ class Like(Base):
 
     # ---------- Actor ----------
     user_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         ForeignKey("users.id", ondelete="CASCADE"),
         index=True,
         nullable=True,
@@ -117,44 +121,51 @@ class Like(Base):
     )
 
     # ---------- Reaction ----------
-    reaction: Mapped[Reaction] = mapped_column(
-        String(16), default=Reaction.like.value, nullable=False, index=True
-    )
-    weight: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    # Tunasave kama string portable; validators zita-normalize.
+    reaction: Mapped[str] = mapped_column(String(16), default=Reaction.like.value, nullable=False, index=True)
+    weight:   Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
 
     # ---------- State ----------
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("1"), index=True)
-    deactivated_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    unlike_reason: Mapped[Optional[str]] = mapped_column(String(160))
+    is_active:       Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("1"), index=True)
+    deactivated_at:  Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    unlike_reason:   Mapped[Optional[str]] = mapped_column(String(160))
     is_suspected_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"), index=True)
-    rate_limited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"))
+    rate_limited:    Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"))
 
     # ---------- Context / Analytics ----------
-    source: Mapped[Optional[str]] = mapped_column(String(16), index=True)  # LikeSource.* (string ili iwe portable)
-    client_ip:  Mapped[Optional[str]]  = mapped_column(String(64))
-    user_agent: Mapped[Optional[str]]  = mapped_column(String(400))
-    minute_bucket: Mapped[dt.datetime] = mapped_column(  # kwa burst analytics
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False, index=True
+    source:          Mapped[Optional[str]] = mapped_column(String(16), index=True)  # LikeSource.* (string ili iwe portable)
+    client_ip:       Mapped[Optional[str]] = mapped_column(String(64))
+    user_agent:      Mapped[Optional[str]] = mapped_column(String(400))
+    minute_bucket:   Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
-    idempotency_key: Mapped[Optional[str]] = mapped_column(String(80), unique=True, index=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(80), unique=True)
 
-    meta: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))  # {"app":"ios","build":"1.2.3","ab":"grpA"}
+    meta: Mapped[Optional[dict]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))
 
     # ---------- Timestamps ----------
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False, index=True
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"),
-        onupdate=text("CURRENT_TIMESTAMP"), nullable=False
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
-    # ---------- Relationships ----------
+    # ---------- Relationships (pair with LiveStream & User) ----------
     user: Mapped[Optional["User"]] = relationship(
-        "User", back_populates="likes", foreign_keys=[user_id], passive_deletes=True, lazy="selectin"
+        "User",
+        back_populates="likes",
+        foreign_keys=lambda: [Like.user_id],
+        passive_deletes=True,
+        lazy="selectin",
     )
     live_stream: Mapped[Optional["LiveStream"]] = relationship(
-        "LiveStream", back_populates="likes", foreign_keys=[live_stream_id], passive_deletes=True, lazy="selectin"
+        "LiveStream",
+        primaryjoin="Like.live_stream_id == foreign(LiveStream.id)",
+        foreign_keys=lambda: [Like.live_stream_id],
+        back_populates="likes",
+        passive_deletes=True,
+        lazy="selectin",
     )
 
     # ---------- Hybrids ----------
@@ -172,7 +183,7 @@ class Like(Base):
 
     # ---------- Helpers ----------
     def _touch_bucket(self) -> None:
-        # floor to minute; portable
+        # floor to minute in UTC
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
         self.minute_bucket = now
 
@@ -209,10 +220,7 @@ class Like(Base):
         self.source = sv if sv in {s.value for s in LikeSource} else LikeSource.other.value
 
     def adopt_guest_like(self, *, new_user_id: int) -> None:
-        """
-        Baada ya login, hamisha umiliki: session_key -> user_id.
-        Hii inaruhusu kudumisha like ya mgeni kama ya mtumiaji.
-        """
+        """Baada ya login, hamisha umiliki: session_key -> user_id."""
         self.user_id = new_user_id
         self.session_key = None
 
@@ -232,7 +240,36 @@ class Like(Base):
         iv = int(v or 1)
         return 1 if iv < 1 else iv
 
+    @validates("reaction")
+    def _v_reaction(self, _k, v: str | Reaction) -> str:
+        if isinstance(v, Reaction):
+            return v.value
+        vv = (v or "").strip().lower()
+        return vv if vv in {r.value for r in Reaction} else Reaction.other.value
+
+    @validates("source")
+    def _v_source(self, _k, v: Optional[str | LikeSource]) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, LikeSource):
+            return v.value
+        vv = str(v).strip().lower()
+        return vv if vv in {s.value for s in LikeSource} else LikeSource.other.value
+
     def __repr__(self) -> str:  # pragma: no cover
         tgt = self.live_stream_id or self.room_id
         who = self.user_id or self.session_key
         return f"<Like id={self.id} target={tgt} user={who} reac={self.reaction} w={self.weight} active={self.is_active}>"
+
+# ---------- Normalization hooks ----------
+@listens_for(Like, "before_insert")
+def _like_before_insert(_m, _c, t: Like) -> None:  # pragma: no cover
+    # Normalize & ensure bucket
+    t.set_reaction(t.reaction or Reaction.like.value)
+    t.set_source(t.source or None)
+    t._touch_bucket()
+
+@listens_for(Like, "before_update")
+def _like_before_update(_m, _c, t: Like) -> None:  # pragma: no cover
+    t.set_reaction(t.reaction or Reaction.like.value)
+    t.set_source(t.source or None)
