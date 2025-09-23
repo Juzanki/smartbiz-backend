@@ -1,4 +1,4 @@
-﻿# backend/models/guest.py
+# backend/models/guest.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -7,17 +7,8 @@ import datetime as dt
 from typing import Optional, Dict, Any, TYPE_CHECKING, Iterable
 
 from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    Enum as SQLEnum,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    UniqueConstraint,
-    func,
-    text,
+    Boolean, CheckConstraint, DateTime, Enum as SQLEnum, ForeignKey, Index,
+    Integer, String, UniqueConstraint, func, text
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.ext.hybrid import hybrid_property, hybrid_method
@@ -25,7 +16,7 @@ from sqlalchemy.event import listens_for
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 from backend.db import Base
-from backend.models._types import JSON_VARIANT  # DECIMAL_TYPE si hitaji hapa
+from backend.models._types import JSON_VARIANT
 
 if TYPE_CHECKING:
     from .user import User
@@ -34,45 +25,42 @@ if TYPE_CHECKING:
 
 # ───────── Enums ─────────
 class GuestRole(str, enum.Enum):
-    host       = "host"
-    cohost     = "cohost"
-    moderator  = "moderator"
-    speaker    = "speaker"   # jukwaani (audio/video)
-    guest      = "guest"     # mtazamaji wa kawaida
+    host = "host"
+    cohost = "cohost"
+    moderator = "moderator"
+    speaker = "speaker"
+    guest = "guest"
 
 class GuestStatus(str, enum.Enum):
-    pending       = "pending"
-    approved      = "approved"
-    denied        = "denied"
-    kicked        = "kicked"
-    banned        = "banned"
-    left          = "left"
-    disconnected  = "disconnected"
+    pending = "pending"
+    approved = "approved"
+    denied = "denied"
+    kicked = "kicked"
+    banned = "banned"
+    left = "left"
+    disconnected = "disconnected"
 
 class StageStatus(str, enum.Enum):
-    offstage   = "offstage"
-    requested  = "requested"   # ameomba kuongea
-    onstage    = "onstage"     # anazungumza/anaonekana
+    offstage = "offstage"
+    requested = "requested"
+    onstage = "onstage"
 
 class GuestAction(str, enum.Enum):
-    send_message   = "send_message"
-    send_reaction  = "send_reaction"
-    send_gift      = "send_gift"
-    raise_hand     = "raise_hand"
-    request_stage  = "request_stage"
-    vote           = "vote"           # polls
-    ask_question   = "ask_question"   # Q&A
-    share_screen   = "share_screen"
-    report_user    = "report_user"
-    invite_friend  = "invite_friend"
+    send_message = "send_message"
+    send_reaction = "send_reaction"
+    send_gift = "send_gift"
+    raise_hand = "raise_hand"
+    request_stage = "request_stage"
+    vote = "vote"
+    ask_question = "ask_question"
+    share_screen = "share_screen"
+    report_user = "report_user"
+    invite_friend = "invite_friend"
 
 
 class Guest(Base):
     """
     Ushiriki wa mtumiaji kwenye live stream (roles, status, capabilities, metrics).
-    • JSON mutable: permissions, preferences, badges
-    • Stage flow: request -> approve -> onstage
-    • Cooldowns/rate-limits + takwimu za matumizi
     """
     __tablename__ = "guests"
     __mapper_args__ = {"eager_defaults": True}
@@ -87,37 +75,38 @@ class Guest(Base):
         CheckConstraint("(NOT is_host) OR (role = 'host')", name="ck_guest_is_host_matches_role"),
         CheckConstraint("messages_sent >= 0 AND reactions_sent >= 0 AND gifts_sent >= 0", name="ck_guest_counts_nonneg"),
         CheckConstraint("time_speaking_seconds >= 0 AND time_watching_seconds >= 0", name="ck_guest_times_nonneg"),
+        {"extend_existing": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # Utambulisho wa chumba/stream
     room_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
-    live_stream_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("live_streams.id", ondelete="SET NULL"), index=True
+
+    # ⚠️ LINGANISHA na LiveStream.guests: tumia CASCADE + non-null
+    live_stream_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("live_streams.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
     )
+
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     # Nafasi na hali
     role: Mapped[GuestRole] = mapped_column(
         SQLEnum(GuestRole, name="guest_role", native_enum=False, validate_strings=True),
-        default=GuestRole.guest,
-        nullable=False,
-        index=True,
+        default=GuestRole.guest, nullable=False, index=True,
     )
     status: Mapped[GuestStatus] = mapped_column(
         SQLEnum(GuestStatus, name="guest_status", native_enum=False, validate_strings=True),
-        default=GuestStatus.pending,
-        nullable=False,
-        index=True,
+        default=GuestStatus.pending, nullable=False, index=True,
     )
     stage_status: Mapped[StageStatus] = mapped_column(
         SQLEnum(StageStatus, name="guest_stage_status", native_enum=False, validate_strings=True),
-        default=StageStatus.offstage,
-        nullable=False,
-        index=True,
+        default=StageStatus.offstage, nullable=False, index=True,
     )
 
     # Back-compat flags
@@ -125,7 +114,7 @@ class Guest(Base):
     is_host:     Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     approved_by_user_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), index=True
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
 
     # Nyakati
@@ -165,23 +154,21 @@ class Guest(Base):
     time_speaking_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     time_watching_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
-    # Wasifu wa muda (kwa wageni/anon)
+    # Wasifu wa muda
     nickname:    Mapped[Optional[str]] = mapped_column(String(80))
     avatar_url:  Mapped[Optional[str]] = mapped_column(String(512))
-    badges:      Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSON_VARIANT))  # ["early_bird","vip"]
+    badges:      Mapped[Optional[list]] = mapped_column(MutableList.as_mutable(JSON_VARIANT))
 
-    # Uwezo/Mapendeleo (mutable JSON)
-    # permissions mfano:
-    #   {"send_message": true, "share_screen": false, "ask_question": true}
+    # Uwezo/Mapendeleo
     permissions:  Mapped[Optional[Dict[str, Any]]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))
-    preferences:  Mapped[Optional[Dict[str, Any]]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))  # {"lang":"sw","theme":"dark"}
+    preferences:  Mapped[Optional[Dict[str, Any]]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))
 
     # Mazingira ya mteja
     device:     Mapped[Optional[str]] = mapped_column(String(80))
     user_agent: Mapped[Optional[str]] = mapped_column(String(400))
     client_ip:  Mapped[Optional[str]] = mapped_column(String(64))
     request_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
-    network_quality: Mapped[Optional[int]] = mapped_column(Integer)  # 0..5; kusaidia auto-downgrade
+    network_quality: Mapped[Optional[int]] = mapped_column(Integer)  # 0..5
 
     # Audit
     meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(MutableDict.as_mutable(JSON_VARIANT))
@@ -192,25 +179,28 @@ class Guest(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
-    # ───────── Relationships ─────────
+    # ───────── Relationships (PAIRS) ─────────
     user: Mapped["User"] = relationship(
         "User",
-        back_populates="guest_entries",
+        back_populates="guest_entries",              # User.guest_entries ➜ relationship("Guest", back_populates="user")
         foreign_keys=lambda: [Guest.user_id],
         passive_deletes=True,
         lazy="selectin",
     )
     approved_by: Mapped[Optional["User"]] = relationship(
         "User",
-        back_populates="guest_approvals",
+        back_populates="guest_approvals",            # User.guest_approvals ➜ relationship("Guest", back_populates="approved_by")
         foreign_keys=lambda: [Guest.approved_by_user_id],
         passive_deletes=True,
         lazy="selectin",
     )
-    live_stream: Mapped[Optional["LiveStream"]] = relationship(
+
+    # 🔗 Hii inalingana na LiveStream.guests (primaryjoin + foreign_keys zimethibitishwa)
+    live_stream: Mapped["LiveStream"] = relationship(
         "LiveStream",
-        back_populates="guests",
+        primaryjoin="Guest.live_stream_id == foreign(LiveStream.id)",
         foreign_keys=lambda: [Guest.live_stream_id],
+        back_populates="guests",
         passive_deletes=True,
         lazy="selectin",
     )
@@ -275,7 +265,6 @@ class Guest(Base):
     @hybrid_method
     def can(self, action: GuestAction | str) -> bool:
         key = action.value if isinstance(action, GuestAction) else str(action)
-        # fallback kwenye flags za juu (can_chat/can_gift/can_react)
         if key == GuestAction.send_message.value:
             return bool((self.permissions or {}).get(key, self.can_chat)) and not self.slowmode_active
         if key == GuestAction.send_reaction.value:
@@ -303,7 +292,6 @@ class Guest(Base):
         now = dt.datetime.now(dt.timezone.utc)
         self.stage_status = StageStatus.offstage
         self.stage_left_at = now
-        # ongeza muda aliozungumza
         if self.stage_entered_at:
             dt_seconds = int((now - self.stage_entered_at).total_seconds())
             self.time_speaking_seconds = (self.time_speaking_seconds or 0) + max(0, dt_seconds)
@@ -408,7 +396,6 @@ def _guest_before_insert(_m, _c, t: Guest) -> None:  # pragma: no cover
     if t.room_id:
         t.room_id = t.room_id.strip()
     if t.permissions is None:
-        # ruhusu vitendo vya msingi kwa mgeni
         t.permissions = {"send_message": True, "send_reaction": True, "ask_question": True, "vote": True}
 
 @listens_for(Guest, "before_update")
