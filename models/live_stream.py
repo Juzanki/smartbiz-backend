@@ -1,34 +1,23 @@
-﻿# backend/models/live_stream.py
+# backend/models/live_stream.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import re
-import hmac
-import hashlib
-import secrets
+import re, hmac, hashlib, secrets
 import datetime as dt
 from typing import Optional, List, TYPE_CHECKING
 
 from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    Index,
-    Integer,
-    String,
-    UniqueConstraint,
-    func,
-    text,
+    Boolean, CheckConstraint, DateTime, Index, Integer, String, UniqueConstraint,
+    func, text
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.event import listens_for
 from sqlalchemy.ext.hybrid import hybrid_property
 
 from backend.db import Base
-from backend.models._types import JSON_VARIANT, DECIMAL_TYPE, as_mutable_json  # portability
 
 if TYPE_CHECKING:
-    # Hizi ni kwa hints tu (hazita-import runtime)
+    # Hizi ziko kwa type-hints tu; runtime hatuzileti hapa kuepuka circular imports
     from .guest import Guest
     from .co_host import CoHost
     from .stream_settings import StreamSettings
@@ -36,7 +25,7 @@ if TYPE_CHECKING:
     from .gift_fly import GiftFly
     from .gift_movement import GiftMovement
     from .gift_marker import GiftMarker
-    from .viewer import Viewer              # ← IMPORTANT: tumetumia Viewer (sio LiveViewer)
+    from .viewer import Viewer
     from .recorded_stream import RecordedStream
     from .post_live_notification import PostLiveNotification
     from .replay_summary import ReplaySummary
@@ -59,7 +48,6 @@ class LiveStream(Base):
     __tablename__ = "live_streams"
     __mapper_args__ = {"eager_defaults": True}
     __table_args__ = (
-        # Guards
         CheckConstraint("viewers_count >= 0", name="ck_ls_viewers_nonneg"),
         CheckConstraint("likes_count   >= 0", name="ck_ls_likes_nonneg"),
         CheckConstraint(
@@ -68,7 +56,6 @@ class LiveStream(Base):
         ),
         CheckConstraint("code IS NULL OR length(code) BETWEEN 3 AND 50", name="ck_ls_code_len"),
         UniqueConstraint("code", name="uq_ls_code"),
-        # Indices
         Index("ix_ls_code", "code"),
         Index("ix_ls_featured_active", "is_featured", "ended_at"),
         Index("ix_ls_started_at", "started_at"),
@@ -80,13 +67,13 @@ class LiveStream(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # Public identifiers
-    code: Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
+    code:  Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
     title: Mapped[Optional[str]] = mapped_column(String(160))
     goal:  Mapped[Optional[str]] = mapped_column(String(160))
 
     # Private join/control code (hashed)
-    code_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)  # hex sha256
-    code_salt: Mapped[Optional[str]] = mapped_column(String(32))
+    code_hash:     Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    code_salt:     Mapped[Optional[str]] = mapped_column(String(32))
     rotate_secret: Mapped[Optional[str]] = mapped_column(String(64))
 
     is_featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
@@ -103,7 +90,6 @@ class LiveStream(Base):
     last_active_at: Mapped[Optional[dt.datetime]] = mapped_column(
         DateTime(timezone=True), onupdate=func.now()
     )
-
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
@@ -112,18 +98,25 @@ class LiveStream(Base):
     )
     deleted: Mapped[bool] = mapped_column(Boolean, server_default=text("0"), nullable=False, index=True)
 
-    # ---------------- Relationships ----------------
+    # ────────────────────────────── Relationships ──────────────────────────────
+    # ⚠️ MUHIMU: Kwa kila back_populates hapa, upande wa pili lazima u-ref back_populates
+    #          unaolingana na FK sahihi. Ndicho kilichosababisha error yako ya mapper.
 
     guests: Mapped[List["Guest"]] = relationship(
         "Guest",
+        # Guest lazima awe na: live_stream_id = ForeignKey("live_streams.id")  +  live_stream = relationship("LiveStream", back_populates="guests")
+        primaryjoin="LiveStream.id == foreign(Guest.live_stream_id)",
+        foreign_keys="Guest.live_stream_id",
         back_populates="live_stream",
-        cascade="all",
+        cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
     )
 
     co_hosts: Mapped[List["CoHost"]] = relationship(
         "CoHost",
+        primaryjoin="LiveStream.id == foreign(CoHost.stream_id)",
+        foreign_keys="CoHost.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -132,6 +125,8 @@ class LiveStream(Base):
 
     settings: Mapped[Optional["StreamSettings"]] = relationship(
         "StreamSettings",
+        primaryjoin="LiveStream.id == foreign(StreamSettings.stream_id)",
+        foreign_keys="StreamSettings.stream_id",
         back_populates="stream",
         uselist=False,
         cascade="all, delete-orphan",
@@ -141,6 +136,8 @@ class LiveStream(Base):
 
     cohost_invites: Mapped[List["CoHostInvite"]] = relationship(
         "CoHostInvite",
+        primaryjoin="LiveStream.id == foreign(CoHostInvite.stream_id)",
+        foreign_keys="CoHostInvite.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -149,6 +146,8 @@ class LiveStream(Base):
 
     gift_fly_events: Mapped[List["GiftFly"]] = relationship(
         "GiftFly",
+        primaryjoin="LiveStream.id == foreign(GiftFly.stream_id)",
+        foreign_keys="GiftFly.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -167,17 +166,20 @@ class LiveStream(Base):
 
     gift_markers: Mapped[List["GiftMarker"]] = relationship(
         "GiftMarker",
+        primaryjoin="LiveStream.id == foreign(GiftMarker.stream_id)",
+        foreign_keys="GiftMarker.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
     )
 
-    # IMPORTANT: tumia Viewer, na FK yake 'stream_id'
+    # Viewer lazima awe na: stream_id = FK("live_streams.id") + live_stream = relationship("LiveStream", back_populates="viewers")
     viewers: Mapped[List["Viewer"]] = relationship(
         "Viewer",
         primaryjoin="LiveStream.id == foreign(Viewer.stream_id)",
         foreign_keys="Viewer.stream_id",
+        back_populates="live_stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
@@ -185,6 +187,8 @@ class LiveStream(Base):
 
     recorded_streams: Mapped[List["RecordedStream"]] = relationship(
         "RecordedStream",
+        primaryjoin="LiveStream.id == foreign(RecordedStream.stream_id)",
+        foreign_keys="RecordedStream.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -193,6 +197,8 @@ class LiveStream(Base):
 
     post_live_notifications: Mapped[List["PostLiveNotification"]] = relationship(
         "PostLiveNotification",
+        primaryjoin="LiveStream.id == foreign(PostLiveNotification.stream_id)",
+        foreign_keys="PostLiveNotification.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -201,6 +207,8 @@ class LiveStream(Base):
 
     summary_ai: Mapped[Optional["ReplaySummary"]] = relationship(
         "ReplaySummary",
+        primaryjoin="LiveStream.id == foreign(ReplaySummary.stream_id)",
+        foreign_keys="ReplaySummary.stream_id",
         back_populates="stream",
         uselist=False,
         cascade="all, delete-orphan",
@@ -210,6 +218,8 @@ class LiveStream(Base):
 
     captions: Mapped[List["ReplayCaption"]] = relationship(
         "ReplayCaption",
+        primaryjoin="LiveStream.id == foreign(ReplayCaption.stream_id)",
+        foreign_keys="ReplayCaption.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -218,6 +228,8 @@ class LiveStream(Base):
 
     auto_title: Mapped[Optional["ReplayTitle"]] = relationship(
         "ReplayTitle",
+        primaryjoin="LiveStream.id == foreign(ReplayTitle.stream_id)",
+        foreign_keys="ReplayTitle.stream_id",
         back_populates="stream",
         uselist=False,
         cascade="all, delete-orphan",
@@ -227,6 +239,8 @@ class LiveStream(Base):
 
     replay_analytics: Mapped[List["ReplayAnalytics"]] = relationship(
         "ReplayAnalytics",
+        primaryjoin="LiveStream.id == foreign(ReplayAnalytics.stream_id)",
+        foreign_keys="ReplayAnalytics.stream_id",
         back_populates="live_stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -235,14 +249,18 @@ class LiveStream(Base):
 
     goals: Mapped[List["Goal"]] = relationship(
         "Goal",
+        primaryjoin="LiveStream.id == foreign(Goal.stream_id)",
+        foreign_keys="Goal.stream_id",
         back_populates="stream",
-        cascade="all",
+        cascade="all, delete",
         passive_deletes=True,
         lazy="selectin",
     )
 
     leaderboard_notifications: Mapped[List["LeaderboardNotification"]] = relationship(
         "LeaderboardNotification",
+        primaryjoin="LiveStream.id == foreign(LeaderboardNotification.stream_id)",
+        foreign_keys="LeaderboardNotification.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -251,22 +269,28 @@ class LiveStream(Base):
 
     likes: Mapped[List["Like"]] = relationship(
         "Like",
+        primaryjoin="LiveStream.id == foreign(Like.live_stream_id)",
+        foreign_keys="Like.live_stream_id",
         back_populates="live_stream",
-        cascade="all",
+        cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
     )
 
     moderation_actions: Mapped[List["ModerationAction"]] = relationship(
         "ModerationAction",
+        primaryjoin="LiveStream.id == foreign(ModerationAction.live_stream_id)",
+        foreign_keys="ModerationAction.live_stream_id",
         back_populates="live_stream",
-        cascade="all",
+        cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
     )
 
     live_products: Mapped[List["LiveProduct"]] = relationship(
         "LiveProduct",
+        primaryjoin="LiveStream.id == foreign(LiveProduct.stream_id)",
+        foreign_keys="LiveProduct.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -275,13 +299,15 @@ class LiveStream(Base):
 
     top_contributors: Mapped[List["TopContributor"]] = relationship(
         "TopContributor",
+        primaryjoin="LiveStream.id == foreign(TopContributor.stream_id)",
+        foreign_keys="TopContributor.stream_id",
         back_populates="stream",
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
     )
 
-    # ---------------- Hybrid helpers ----------------
+    # ────────────────────────────── Hybrid helpers ──────────────────────────────
     @hybrid_property
     def is_live(self) -> bool:
         return self.started_at is not None and self.ended_at is None
@@ -321,7 +347,7 @@ class LiveStream(Base):
     def featured_and_live(cls):
         return func.coalesce(cls.is_featured, False) & cls.ended_at.is_(None)
 
-    # ---------------- Domain helpers ----------------
+    # ────────────────────────────── Domain helpers ──────────────────────────────
     def mark_active(self) -> None:
         self.last_active_at = dt.datetime.now(dt.timezone.utc)
 
@@ -379,25 +405,19 @@ class LiveStream(Base):
     def __repr__(self) -> str:  # pragma: no cover
         return f"<LiveStream id={self.id} code={self.code!r} title={self.title!r} live={self.is_live}>"
 
-
-
 # ---------- Normalize before insert/update ----------
 @listens_for(LiveStream, "before_insert")
 def _ls_before_insert(_mapper, _conn, t: LiveStream) -> None:
-    if t.code:
-        t.code = t.code.strip()
-    if t.title:
-        t.title = t.title.strip()
-    if t.goal:
-        t.goal = t.goal.strip()
+    for attr in ("code", "title", "goal"):
+        v = getattr(t, attr, None)
+        if v:
+            setattr(t, attr, v.strip())
     if not t.rotate_secret:
         t.rotate_secret = secrets.token_hex(16)
 
 @listens_for(LiveStream, "before_update")
 def _ls_before_update(_mapper, _conn, t: LiveStream) -> None:
-    if t.code:
-        t.code = t.code.strip()
-    if t.title:
-        t.title = t.title.strip()
-    if t.goal:
-        t.goal = t.goal.strip()
+    for attr in ("code", "title", "goal"):
+        v = getattr(t, attr, None)
+        if v:
+            setattr(t, attr, v.strip())
