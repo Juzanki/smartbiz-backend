@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt  # PyJWT
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,7 @@ except Exception:
             try:
                 return _pwd_ctx.verify(pw, hashed)
             except Exception:
+                # malformed/unknown hash → treat as invalid
                 return False
 
 # ──────────────────────────────────────────────────────────────────────
@@ -56,11 +57,12 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    # Dev fallback tu. Kwenye production weka SECRET_KEY/JWT_SECRET kwenye env.
+    # Dev fallback only. Set SECRET_KEY/JWT_SECRET in production (same across replicas).
     SECRET_KEY = base64.urlsafe_b64encode(os.urandom(48)).decode()
 
 JWT_ALG = os.getenv("JWT_ALG", os.getenv("JWT_ALGORITHM", "HS256"))
 ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # default 60 min
+JWT_ISSUER = os.getenv("JWT_ISSUER", "smartbiz-api")
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -76,7 +78,13 @@ def _ensure_str(x: Any) -> str:
 def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, int]:
     now = _now()
     exp = now + timedelta(minutes=minutes)
-    payload = {"typ": "access", "iss": "smartbiz-api", "iat": int(now.timestamp()), "exp": int(exp.timestamp()), **claims}
+    payload = {
+        "typ": "access",
+        "iss": JWT_ISSUER,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        **claims,
+    }
     if "sub" in payload:
         payload["sub"] = str(payload["sub"])
     token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
@@ -84,7 +92,7 @@ def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, i
 
 def decode_token(token: str) -> Dict[str, Any]:
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+        return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG], options={"require": ["exp", "iat"]})
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_or_expired_token") from e
 
@@ -102,8 +110,12 @@ COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
 COOKIE_MAX_AGE = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))  # 7 days
 COOKIE_PATH = os.getenv("AUTH_COOKIE_PATH", "/")
 COOKIE_SECURE = _flag("AUTH_COOKIE_SECURE", "true")
-COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")  # 'lax' | 'strict' | 'none'
+COOKIE_SAMESITE = (os.getenv("AUTH_COOKIE_SAMESITE", "none") or "none").lower()  # 'lax' | 'strict' | 'none'
 COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
+
+# Enforce secure when SameSite=None (required by browsers)
+if COOKIE_SAMESITE == "none":
+    COOKIE_SECURE = True
 
 ALLOW_PHONE_LOGIN = _flag("AUTH_LOGIN_ALLOW_PHONE", "false")
 
@@ -201,25 +213,45 @@ class AuthResponse(BaseModel):
     user: UserOut
 
 # ──────────────────────────────────────────────────────────────────────
-# Query helpers
+# Query helpers (DEFENSIVE + case-insensitive)
 # ──────────────────────────────────────────────────────────────────────
 def _find_user_by_identifier(db: Session, ident: str):
-    ident = ident.strip()
-    phone_norm = _norm_phone(ident) if ALLOW_PHONE_LOGIN else None
+    ident = (ident or "").strip()
+    if not ident:
+        return None
 
-    query = db.query(User)
-    conds = [User.email == ident, User.username == ident]
-    for phone_field in ("phone", "phone_number", "msisdn"):
-        if hasattr(User, phone_field) and phone_norm:
-            conds.append(getattr(User, phone_field) == phone_norm)
-            break
-    return query.filter(or_(*conds)).first()
+    conds = []
+
+    # email (if model has it)
+    if hasattr(User, "email"):
+        conds.append(func.lower(getattr(User, "email")) == func.lower(ident))
+
+    # username (guarded: only add if it exists on the model)
+    if hasattr(User, "username"):
+        conds.append(func.lower(getattr(User, "username")) == func.lower(ident))
+
+    # phone (optional)
+    if ALLOW_PHONE_LOGIN:
+        phone_norm = _norm_phone(ident)
+        if phone_norm:
+            for phone_field in ("phone", "phone_number", "msisdn"):
+                if hasattr(User, phone_field):
+                    conds.append(getattr(User, phone_field) == phone_norm)
+                    break
+
+    if not conds:
+        # Misconfigured User model (no email/username/phone columns)
+        raise HTTPException(status_code=500, detail="server_misconfigured_user_model")
+
+    return db.query(User).filter(or_(*conds)).first()
 
 def _precheck_duplicates(db: Session, email: str, username: str) -> None:
-    if db.query(User).filter(User.email == email).first():
-        raise HTTPException(status_code=409, detail="email_taken")
-    if db.query(User).filter(User.username == username).first():
-        raise HTTPException(status_code=409, detail="username_taken")
+    if hasattr(User, "email"):
+        if db.query(User).filter(func.lower(getattr(User, "email")) == func.lower(email)).first():
+            raise HTTPException(status_code=409, detail="email_taken")
+    if hasattr(User, "username"):
+        if db.query(User).filter(func.lower(getattr(User, "username")) == func.lower(username)).first():
+            raise HTTPException(status_code=409, detail="username_taken")
 
 # ──────────────────────────────────────────────────────────────────────
 # Token / Cookie utilities
@@ -232,7 +264,7 @@ def _maybe_set_cookie(response: Response, token: str) -> None:
         value=token,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
+        samesite=COOKIE_SAMESITE,  # 'none'|'lax'|'strict'
         max_age=COOKIE_MAX_AGE,
         path=COOKIE_PATH,
         domain=COOKIE_DOMAIN,
@@ -263,11 +295,11 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_sub")
 
-    user = None
+    # SA 1.4+ first, legacy fallback
     try:
-        user = db.get(User, uid)  # SA 1.4+
+        user = db.get(User, uid)
     except Exception:
-        user = db.query(User).get(uid)  # legacy
+        user = db.query(User).get(uid)  # type: ignore
 
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user_not_found")
@@ -291,8 +323,8 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
 
     user = User(
         email=email,
-        username=username,
-        full_name=payload.full_name,
+        username=username if hasattr(User, "username") else None,
+        full_name=payload.full_name if hasattr(User, "full_name") else None,
         is_active=True if hasattr(User, "is_active") else None,
     )
     _set_user_password_hash(user, payload.password)
@@ -311,7 +343,7 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         logger.exception("register_failed")
         raise HTTPException(status_code=500, detail="register_failed")
 
-    token, expires_in = create_access_token({"sub": user.id, "email": user.email, "username": user.username})
+    token, expires_in = create_access_token({"sub": user.id, "email": getattr(user, "email", None), "username": getattr(user, "username", None)})
     _maybe_set_cookie(response, token)
 
     return AuthResponse(
@@ -320,21 +352,23 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         user=UserOut.from_orm_user(user),
     )
 
-@router.post("/login", response_model=AuthResponse)
-@router.post("/signin", response_model=AuthResponse)
+@router.post("/login", response_model=AuthResponse, summary="Login")
+@router.post("/signin", response_model=AuthResponse, summary="Login")
 async def login(request: Request, response: Response, db: Session = Depends(get_db)):
     """
-    Inakubali:
+    Accepts:
       - JSON:   { email_or_username | username | email | identifier, password }
       - FORM:   username/email_or_username/email/identifier + password
     """
+    # capture request id for logs if present (Render/CF)
+    req_id = request.headers.get("x-request-id") or request.headers.get("X-Request-ID")
+
     try:
         ct = (request.headers.get("content-type") or "").lower()
         ident = ""
         password = ""
 
         if "json" in ct:
-            # JSON strict: kisha ukishindwa tunarudisha 400 badala ya 500
             try:
                 raw = await request.json()
             except Exception:
@@ -347,7 +381,6 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
                      or "").strip()
             password = str(data.get("password") or "")
         else:
-            # FORM (x-www-form-urlencoded au multipart)
             try:
                 form = await request.form()
             except Exception:
@@ -364,9 +397,9 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
         if not ident or not password:
             raise HTTPException(status_code=400, detail="missing_credentials")
 
-        # Rate limit (per IP + preview ya ident)
+        # Simple per-IP + ident prefix rate limit
         ip = (request.client.host if request.client else "unknown").strip()
-        rl_key = f"{ip}|{ident[:24]}"
+        rl_key = f"{ip}|{ident[:24].lower()}"
         if not _rate_ok(rl_key):
             raise HTTPException(status_code=429, detail="too_many_requests")
 
@@ -381,7 +414,7 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
         if hasattr(user, "is_active") and not getattr(user, "is_active"):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_inactive")
 
-        token, expires_in = create_access_token({"sub": user.id, "email": user.email, "username": user.username})
+        token, expires_in = create_access_token({"sub": user.id, "email": getattr(user, "email", None), "username": getattr(user, "username", None)})
         token = _ensure_str(token)
         _maybe_set_cookie(response, token)
 
@@ -390,10 +423,13 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
             expires_in=expires_in,
             user=UserOut.from_orm_user(user),
         )
-    except HTTPException:
+
+    except HTTPException as he:
+        # Log non-2xx with request id to correlate with your PS script
+        logger.info("login_failed status=%s detail=%s x-request-id=%s", he.status_code, getattr(he, "detail", None), req_id)
         raise
-    except Exception:
-        logger.exception("login_crashed")
+    except Exception as e:
+        logger.exception("login_crashed x-request-id=%s", req_id, exc_info=e)
         raise HTTPException(status_code=500, detail="server_error_login")
 
 @router.get("/me", response_model=UserOut)
