@@ -1,4 +1,4 @@
-﻿# backend/models/live_viewer.py
+# backend/models/live_viewer.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
-    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.event import listens_for
 
 from backend.db import Base
 from backend.models._types import JSON_VARIANT, as_mutable_json
@@ -47,7 +47,7 @@ SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9\-\._]{8,64}$")
 SAFE_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 
-class LiveViewer(Base):
+class Viewer(Base):
     """
     Mtazamaji wa LiveStream (login au mgeni).
 
@@ -71,12 +71,16 @@ class LiveViewer(Base):
         # Guards
         CheckConstraint("(user_id IS NOT NULL) OR (session_key IS NOT NULL)", name="ck_lv_actor_present"),
         CheckConstraint("left_at IS NULL OR joined_at IS NULL OR left_at >= joined_at", name="ck_lv_time_order"),
+        {"extend_existing": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # -------- Target stream --------
-    live_stream_id: Mapped[int] = mapped_column(
+    # NOTE: tunatumia attribute 'stream_id' ili kuendana na LiveStream.viewers primaryjoin,
+    #       lakini jina la kolamu DB linabaki 'live_stream_id' (hakuna migration).
+    stream_id: Mapped[int] = mapped_column(
+        "live_stream_id",
         ForeignKey("live_streams.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
@@ -116,22 +120,23 @@ class LiveViewer(Base):
     # -------- Lifecycle --------
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     joined_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False, index=True
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     last_seen_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), index=True)
     left_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), index=True)
 
     # -------- Relationships --------
-    # NOTE: Hakuna back_populates hapa ili kuepuka error ya reverse_property.
+    # NOTE: Hakuna back_populates hapa ili kuepuka reverse_property error.
     stream: Mapped["LiveStream"] = relationship(
         "LiveStream",
-        foreign_keys=[live_stream_id],
+        primaryjoin="Viewer.stream_id == foreign(LiveStream.id)",
+        foreign_keys=lambda: [Viewer.stream_id],
         passive_deletes=True,
         lazy="selectin",
     )
     user: Mapped[Optional["User"]] = relationship(
         "User",
-        foreign_keys=[user_id],
+        foreign_keys=lambda: [Viewer.user_id],
         passive_deletes=True,
         lazy="selectin",
     )
@@ -187,7 +192,7 @@ class LiveViewer(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         who = self.user_id if self.user_id is not None else f"anon:{self.session_key}"
-        return f"<LiveViewer id={self.id} stream={self.live_stream_id} who={who} active={self.is_active}>"
+        return f"<Viewer id={self.id} stream={self.stream_id} who={who} active={self.is_active}>"
 
 
 # ---------------- Validators / normalizers ----------------
@@ -219,19 +224,16 @@ def _trim_texts(_inst, _key, value: Optional[str]) -> Optional[str]:
 
 # ---------------- Internal helpers ----------------
 def _hash_ip(ip: str) -> str:
-    """
-    Hash IP kwa sha256 + optional secret (pepper) kupitia env IP_HASH_SECRET.
-    """
+    """Hash IP kwa sha256 + optional secret (pepper) kupitia env IP_HASH_SECRET."""
+    import hashlib as _hl, hmac as _hmac
     secret = (os.getenv("IP_HASH_SECRET") or "").encode("utf-8")
     data = ip.encode("utf-8")
-    return hmac.new(secret, data, hashlib.sha256).hexdigest() if secret else hashlib.sha256(data).hexdigest()
+    return _hmac.new(secret, data, _hl.sha256).hexdigest() if secret else _hl.sha256(data).hexdigest()
 
 
 # ---------------- Event hooks ----------------
-from sqlalchemy.event import listens_for
-
-@listens_for(LiveViewer, "before_insert")
-def _lv_before_insert(_mapper, _conn, t: LiveViewer) -> None:
+@listens_for(Viewer, "before_insert")
+def _lv_before_insert(_mapper, _conn, t: Viewer) -> None:  # pragma: no cover
     if t.country:
         t.country = t.country.strip().upper() or None
     if t.user_agent:
@@ -245,8 +247,8 @@ def _lv_before_insert(_mapper, _conn, t: LiveViewer) -> None:
         if os.getenv("STORE_PLAIN_IP", "0").strip().lower() not in {"1", "true", "yes", "on"}:
             t.client_ip = None
 
-@listens_for(LiveViewer, "before_update")
-def _lv_before_update(_mapper, _conn, t: LiveViewer) -> None:
+@listens_for(Viewer, "before_update")
+def _lv_before_update(_mapper, _conn, t: Viewer) -> None:  # pragma: no cover
     if t.country:
         t.country = t.country.strip().upper() or None
     if t.user_agent:
