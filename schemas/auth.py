@@ -1,15 +1,14 @@
-# backend/schemas/auth.py
+# =========================== backend/schemas/auth.py ===========================
 from __future__ import annotations
 
 import os
 import re
 from datetime import datetime
-from typing import Optional, List, Union, Literal
-from uuid import UUID
+from typing import Optional, List, Literal
 
 # ---------------- Pydantic v2 first, fallback to v1 (compat shims) ----------------
-_V2 = True
-try:
+_PYD_V2 = True
+try:  # Pydantic v2
     from pydantic import (
         BaseModel,
         ConfigDict,
@@ -20,26 +19,33 @@ try:
         model_validator,
     )
 except Exception:  # Pydantic v1 fallback
-    _V2 = False
-    from pydantic import BaseModel, EmailStr, Field, root_validator as model_validator  # type: ignore
+    _PYD_V2 = False
+    from pydantic import BaseModel, EmailStr, Field, validator, root_validator  # type: ignore
     ConfigDict = dict  # type: ignore
 
-    # v1 shims
-    def field_validator(_name: str, *, mode: str = "after"):  # type: ignore
+    # Proper decorator shims so validators actually run on v1
+    def field_validator(field_name: str, *, mode: str = "after"):  # type: ignore
         pre = (mode == "before")
         def deco(fn):
-            return fn if not pre else fn
+            return validator(field_name, pre=pre, allow_reuse=True)(fn)  # type: ignore
         return deco
 
-    def field_serializer(*_a, **_k):  # type: ignore
+    def field_serializer(*_fields, **_k):  # type: ignore
+        # No direct equivalent in v1; FastAPI's jsonable_encoder will handle most cases.
         def deco(fn):
             return fn
+        return deco
+
+    def model_validator(*, mode: str = "after"):  # type: ignore
+        pre = (mode == "before")
+        def deco(fn):
+            return root_validator(pre=pre, allow_reuse=True)(fn)  # type: ignore
         return deco
 
 
 # ------------------------------- HELPERS -------------------------------------
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,50}$")
-MIN_PASSWORD_LEN = int(os.getenv("MIN_PASSWORD_LEN", "6"))  # openapi yako ilionyesha min 6
+MIN_PASSWORD_LEN = int(os.getenv("MIN_PASSWORD_LEN", "6"))  # matches your OpenAPI min 6
 
 def _ensure_non_empty_str(v: object, name: str) -> str:
     if v is None:
@@ -54,15 +60,13 @@ def _ensure_non_empty_str(v: object, name: str) -> str:
 
 # ─── Token shells ────────────────────────────────────────────────────────────
 class Token(BaseModel):
-    """
-    OAuth2 access token envelope.
-    """
+    """OAuth2 access token envelope."""
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: Optional[int] = None
     refresh_token: Optional[str] = None
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
             extra="forbid",
             populate_by_name=True,
@@ -92,15 +96,20 @@ class Token(BaseModel):
 
     @field_validator("expires_in")
     def _positive_exp(cls, v):
-        if v is not None and int(v) <= 0:
-            raise ValueError("expires_in must be a positive integer")
+        if v is not None:
+            try:
+                iv = int(v)
+            except Exception:
+                raise ValueError("expires_in must be an integer")
+            if iv <= 0:
+                raise ValueError("expires_in must be a positive integer")
         return v
 
 
 class TokenData(BaseModel):
     """
     Claims decoded from a token or carried in the auth context.
-      - sub: subject/user id
+      - sub: subject/user id (string)
       - scopes: unique lowercased scopes
       - exp/iat: optional timestamps
     """
@@ -109,7 +118,7 @@ class TokenData(BaseModel):
     exp: Optional[datetime] = None
     iat: Optional[datetime] = None
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
             extra="forbid",
             populate_by_name=True,
@@ -146,8 +155,8 @@ class TokenData(BaseModel):
             s = str(s).strip()
             if s:
                 cleaned.append(s.lower())
-        # unique & preserve order
-        seen, out = set(), []
+        seen: set[str] = set()
+        out: List[str] = []
         for s in cleaned:
             if s not in seen:
                 seen.add(s)
@@ -162,7 +171,7 @@ class RegisterRequest(BaseModel):
     password: str
     full_name: Optional[str] = None
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
             extra="forbid",
             populate_by_name=True,
@@ -212,19 +221,19 @@ class RegisterRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     """
-    Inapokea **jozi yoyote** kati ya:
+    Accepts ANY of:
       - identifier
       - email
       - username
       - email_or_username
-    na ku-normalize kuwa `identifier` + `password`.
+    and normalizes to `identifier` + `password`.
     """
     identifier: str
     password: str
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
-            extra="allow",              # ruhusu majina mengine ili tuyakusanye (email/username/...)
+            extra="allow",  # allow alternative keys; we’ll coalesce below
             populate_by_name=True,
             json_schema_extra={
                 "examples": [
@@ -250,15 +259,17 @@ class LoginRequest(BaseModel):
 
     @model_validator(mode="before")
     def _coalesce_identifier(cls, values):
-        # values inaweza kuwa dict ya raw payload
         if not isinstance(values, dict):
             return values
-        ident = values.get("identifier") or values.get("email_or_username") \
-                or values.get("username") or values.get("email")
-        if not ident:
-            # acha Pydantic atoe 422 badala ya 500
-            return values
-        values["identifier"] = str(ident).strip()
+        ident = (
+            values.get("identifier")
+            or values.get("email_or_username")
+            or values.get("username")
+            or values.get("email")
+        )
+        if ident:
+            values["identifier"] = str(ident).strip()
+        # if not present, let Pydantic emit a clean 422 instead of crashing later
         return values
 
     @field_validator("identifier", mode="before")
@@ -272,24 +283,22 @@ class LoginRequest(BaseModel):
 
 # ─── Outbound to clients ─────────────────────────────────────────────────────
 class UserOut(BaseModel):
-    # OpenAPI yako ya sasa inaonyesha id: integer ⇒ tumia int hapa
+    # Your OpenAPI shows id: integer
     id: int
     email: EmailStr
     username: Optional[str] = None
     full_name: Optional[str] = None
     is_active: Optional[bool] = True
-    # hzi mbili ni za bonus—si lazima zirudishwe; zikiwa hazipo, sawa.
-    created_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None  # optional extras
     updated_at: Optional[datetime] = None
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
             extra="ignore",
             populate_by_name=True,
-            from_attributes=True,  # pydantic v2 ORM mode
+            from_attributes=True,  # v2 ORM mode
         )
 
-        # Datetimes → ISO-8601
         @field_serializer("created_at", "updated_at")
         def _ser_dt(self, v):
             return v.isoformat() if isinstance(v, datetime) else v
@@ -301,10 +310,10 @@ class UserOut(BaseModel):
 
 
 class AuthResponse(Token):
-    """Envelope kwa /auth/login, /auth/signin, /auth/register."""
+    """Response envelope for /auth/login, /auth/signin, /auth/register."""
     user: UserOut
 
-    if _V2:
+    if _PYD_V2:
         model_config = ConfigDict(
             extra="forbid",
             populate_by_name=True,
@@ -341,3 +350,12 @@ class AuthResponse(Token):
                     }
                 }
             }
+
+__all__ = [
+    "Token",
+    "TokenData",
+    "RegisterRequest",
+    "LoginRequest",
+    "UserOut",
+    "AuthResponse",
+]
