@@ -11,8 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import jwt  # PyJWT
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Body
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -65,17 +64,20 @@ if not SECRET_KEY:
 JWT_ALG = os.getenv("JWT_ALG", os.getenv("JWT_ALGORITHM", "HS256"))
 ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # default 60 min
 
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def _secs(minutes: int) -> int:
     return int(timedelta(minutes=minutes).total_seconds())
 
+
 def _ensure_str(x: Any) -> str:
-    """Hakikisha token ni str (baadhi ya matoleo ya PyJWT hurudisha bytes)."""
     if isinstance(x, bytes):
         return x.decode("utf-8")
     return str(x)
+
 
 def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, int]:
     now = _now()
@@ -93,11 +95,15 @@ def create_access_token(claims: dict, minutes: int = ACCESS_MIN) -> Tuple[str, i
     token = _ensure_str(token)
     return token, _secs(minutes)
 
+
 def decode_token(token: str) -> Dict[str, Any]:
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_or_expired_token") from e
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_or_expired_token"
+        ) from e
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Config & Flags
@@ -105,8 +111,10 @@ def decode_token(token: str) -> Dict[str, Any]:
 logger = logging.getLogger("smartbiz.auth")
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+
 def _flag(name: str, default: str = "true") -> bool:
     return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
 
 USE_COOKIE_AUTH = _flag("USE_COOKIE_AUTH", "true")
 COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
@@ -129,6 +137,7 @@ LOGIN_RATE_MAX_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
 _RATE_WIN = 60.0
 _LOGIN_BUCKET: Dict[str, List[float]] = {}
 
+
 def _rate_ok(key: str) -> bool:
     now = time.time()
     q = _LOGIN_BUCKET.setdefault(key, [])
@@ -139,25 +148,31 @@ def _rate_ok(key: str) -> bool:
     q.append(now)
     return True
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Normalizers
 # ──────────────────────────────────────────────────────────────────────
 _phone_digits = re.compile(r"\D+")
 
+
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip()
+
 
 def _norm_email(s: Optional[str]) -> str:
     return _norm(s).lower()
 
+
 def _norm_username(s: Optional[str]) -> str:
     return " ".join(_norm(s).split()).lower()
+
 
 def _norm_phone(s: Optional[str]) -> str:
     s = _norm(s)
     if not s:
         return ""
     return "+" + _phone_digits.sub("", s) if s.startswith("+") else _phone_digits.sub("", s)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # User password field helpers
@@ -168,6 +183,7 @@ def _get_user_password_hash(u) -> Optional[str]:
             return getattr(u, attr)
     return None
 
+
 def _set_user_password_hash(u, plain: str) -> None:
     hashed = get_password_hash(plain)
     if hasattr(u, "password_hash"):
@@ -177,7 +193,10 @@ def _set_user_password_hash(u, plain: str) -> None:
     elif hasattr(u, "password"):
         u.password = hashed
     else:
-        raise RuntimeError("User model missing password field (expected: password_hash / hashed_password / password)")
+        raise RuntimeError(
+            "User model missing password field (expected: password_hash / hashed_password / password)"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Pydantic Schemas
@@ -188,10 +207,23 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=6, max_length=128)
     full_name: Optional[str] = Field(default=None, max_length=120)
 
-class LoginJSON(BaseModel):
-    # Inaruhusu email AU username (au phone kama umeweka flag)
-    email_or_username: str
+
+class LoginAny(BaseModel):
+    # Inaruhusu: email_or_username | email | identifier
+    email_or_username: Optional[str] = None
+    email: Optional[EmailStr] = None
+    identifier: Optional[str] = None
     password: str
+
+    # Pydantic v1
+    @classmethod
+    def unify(cls, data: Dict[str, Any]) -> "LoginAny":
+        ident = (
+            (data.get("email_or_username") or data.get("email") or data.get("identifier") or "")
+            .strip()
+        )
+        return cls(email_or_username=ident, password=str(data.get("password") or ""))
+
 
 class UserOut(BaseModel):
     id: int
@@ -210,11 +242,13 @@ class UserOut(BaseModel):
             is_active=getattr(u, "is_active", True),
         )
 
+
 class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
     user: UserOut
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Query helpers
@@ -231,11 +265,13 @@ def _find_user_by_identifier(db: Session, ident: str):
             break
     return query.filter(or_(*conds)).first()
 
+
 def _precheck_duplicates(db: Session, email: str, username: str) -> None:
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=409, detail="email_taken")
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=409, detail="username_taken")
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Token / Cookie utilities
@@ -254,19 +290,18 @@ def _maybe_set_cookie(response: Response, token: str) -> None:
         domain=COOKIE_DOMAIN,
     )
 
+
 def _extract_token(request: Request) -> Optional[str]:
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if auth and auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
     return request.cookies.get(COOKIE_NAME) if USE_COOKIE_AUTH else None
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Dependencies
 # ──────────────────────────────────────────────────────────────────────
-def get_current_user(
-    request: Request,
-    db: Session = Depends(get_db),
-):
+def get_current_user(request: Request, db: Session = Depends(get_db)):
     token = _extract_token(request)
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing_token")
@@ -282,7 +317,6 @@ def get_current_user(
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_sub")
 
-    # SQLAlchemy 1.4/2.0 compatibility
     user = None
     try:
         user = db.get(User, uid)  # SA 1.4+
@@ -295,11 +329,12 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_inactive")
     return user
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-@router.post("/signup",   response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, response: Response, db: Session = Depends(get_db)):
     if not ALLOW_REG:
         raise HTTPException(status_code=403, detail="registration_disabled")
@@ -340,49 +375,60 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         user=UserOut.from_orm_user(user),
     )
 
+
 @router.post("/login", response_model=AuthResponse)
 @router.post("/signin", response_model=AuthResponse)
-def login(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-    # Huenda kupitia JSON *au* form; zote ni optional hapa
-    form_data: Optional[OAuth2PasswordRequestForm] = Depends(None),
-    json_payload: Optional[LoginJSON] = Body(default=None),
-):
+async def login(request: Request, response: Response, db: Session = Depends(get_db)):
     """
     Inakubali:
-    - application/x-www-form-urlencoded  (username=...&password=...)
-    - application/json                   ({ "email_or_username": "...", "password": "..." })
+      - JSON:   {"email_or_username": "...", "password": "..."}  (pia inakubali "email" au "identifier")
+      - FORM:   username=...&password=...  (application/x-www-form-urlencoded/multipart)
     """
     try:
-        # Rate limit (per IP + ident preview)
-        ip = (request.client.host if request.client else "unknown").strip()
-        ident_preview = ""
-        if form_data and getattr(form_data, "username", None):
-            ident_preview = (form_data.username or "")[:32]
-        elif json_payload and getattr(json_payload, "email_or_username", None):
-            ident_preview = (json_payload.email_or_username or "")[:32]
-        rl_key = f"{ip}|{ident_preview}"
-        if not _rate_ok(rl_key):
-            raise HTTPException(status_code=429, detail="too_many_requests")
+        # Soma body kulingana na Content-Type bila kutumia Depends
+        ct = (request.headers.get("content-type") or "").lower()
+        ident = ""
+        password = ""
 
-        # Pata credentials
-        if form_data and getattr(form_data, "username", None):
-            ident = (form_data.username or "").strip()
-            password = (form_data.password or "")
-        elif json_payload:
-            ident = (json_payload.email_or_username or "").strip()
-            password = (json_payload.password or "")
+        if "application/json" in ct:
+            try:
+                raw = await request.json()
+            except Exception:
+                raw = {}
+            data = LoginAny.unify(dict(raw or {}))
+            ident = (data.email_or_username or "").strip()
+            password = str(data.password or "")
+        elif "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+            form = await request.form()
+            ident = (
+                form.get("username")
+                or form.get("email_or_username")
+                or form.get("email")
+                or form.get("identifier")
+                or ""
+            ).strip()
+            password = str(form.get("password") or "")
         else:
-            raise HTTPException(status_code=400, detail="missing_credentials")
+            # Jaribu JSON kama fallback
+            try:
+                raw = await request.json()
+                data = LoginAny.unify(dict(raw or {}))
+                ident = (data.email_or_username or "").strip()
+                password = str(data.password or "")
+            except Exception:
+                pass
 
         if not ident or not password:
             raise HTTPException(status_code=400, detail="missing_credentials")
 
+        # Rate limit (per IP + preview ya ident)
+        ip = (request.client.host if request.client else "unknown").strip()
+        rl_key = f"{ip}|{ident[:24]}"
+        if not _rate_ok(rl_key):
+            raise HTTPException(status_code=429, detail="too_many_requests")
+
         user = _find_user_by_identifier(db, ident)
         if not user:
-            # Linda user enumeration
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
 
         hashed = _get_user_password_hash(user)
@@ -403,13 +449,15 @@ def login(
         )
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("login_crashed")
-        raise HTTPException(status_code=500, detail="server_error_login") from e
+        raise HTTPException(status_code=500, detail="server_error_login")
+
 
 @router.get("/me", response_model=UserOut)
-def me(current = Depends(get_current_user)):
+def me(current=Depends(get_current_user)):
     return UserOut.from_orm_user(current)
+
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(response: Response):
@@ -420,5 +468,6 @@ def logout(response: Response):
             domain=COOKIE_DOMAIN,
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 __all__ = ["router"]
