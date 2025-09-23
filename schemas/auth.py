@@ -1,23 +1,34 @@
+# backend/schemas/auth.py
 from __future__ import annotations
-from typing import Optional, List, Union
-from datetime import datetime
-from typing import Literal
-from uuid import UUID
-import re
 
-# --- Pydantic v2 first, fallback to v1 (compat shims) -----------------------
+import os
+import re
+from datetime import datetime
+from typing import Optional, List, Union, Literal
+from uuid import UUID
+
+# ---------------- Pydantic v2 first, fallback to v1 (compat shims) ----------------
 _V2 = True
 try:
-    from pydantic import BaseModel, ConfigDict, field_validator, field_serializer, EmailStr
+    from pydantic import (
+        BaseModel,
+        ConfigDict,
+        EmailStr,
+        Field,
+        field_validator,
+        field_serializer,
+        model_validator,
+    )
 except Exception:  # Pydantic v1 fallback
     _V2 = False
-    from pydantic import BaseModel, validator, EmailStr  # type: ignore
+    from pydantic import BaseModel, EmailStr, Field, root_validator as model_validator  # type: ignore
     ConfigDict = dict  # type: ignore
 
-    def field_validator(field_name: str, *, mode: str = "after"):  # type: ignore
+    # v1 shims
+    def field_validator(_name: str, *, mode: str = "after"):  # type: ignore
         pre = (mode == "before")
         def deco(fn):
-            return validator(field_name, pre=pre, allow_reuse=True)(fn)  # type: ignore
+            return fn if not pre else fn
         return deco
 
     def field_serializer(*_a, **_k):  # type: ignore
@@ -25,8 +36,10 @@ except Exception:  # Pydantic v1 fallback
             return fn
         return deco
 
+
 # ------------------------------- HELPERS -------------------------------------
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,50}$")
+MIN_PASSWORD_LEN = int(os.getenv("MIN_PASSWORD_LEN", "6"))  # openapi yako ilionyesha min 6
 
 def _ensure_non_empty_str(v: object, name: str) -> str:
     if v is None:
@@ -36,8 +49,10 @@ def _ensure_non_empty_str(v: object, name: str) -> str:
         raise ValueError(f"{name} cannot be empty")
     return s
 
-# ------------------------------- MODELS -------------------------------------
 
+# =============================== SCHEMAS =====================================
+
+# ─── Token shells ────────────────────────────────────────────────────────────
 class Token(BaseModel):
     """
     OAuth2 access token envelope.
@@ -71,7 +86,6 @@ class Token(BaseModel):
                 }
             }
 
-    # --- validators ---
     @field_validator("access_token", mode="before")
     def _strip_token(cls, v):
         return _ensure_non_empty_str(v, "access_token")
@@ -86,12 +100,12 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     """
     Claims decoded from a token or carried in the auth context.
-    - `sub`: subject/user id (e.g., user UUID)
-    - `scopes`: list of granted scopes/permissions (lowercase, unique)
-    - `exp` / `iat`: optional JWT-style timestamps
+      - sub: subject/user id
+      - scopes: unique lowercased scopes
+      - exp/iat: optional timestamps
     """
     sub: Optional[str] = None
-    scopes: List[str] = []
+    scopes: List[str] = Field(default_factory=list)
     exp: Optional[datetime] = None
     iat: Optional[datetime] = None
 
@@ -101,8 +115,8 @@ class TokenData(BaseModel):
             populate_by_name=True,
             json_schema_extra={
                 "example": {
-                    "sub": "b6f7a2e8-0a6b-4a5e-90c3-7a9a6b8a1234",
-                    "scopes": ["read:items", "write:items"],
+                    "sub": "42",
+                    "scopes": ["read:profile", "write:posts"],
                     "exp": "2025-12-31T23:59:59Z",
                     "iat": "2025-12-31T22:59:59Z",
                 }
@@ -114,8 +128,8 @@ class TokenData(BaseModel):
             allow_population_by_field_name = True
             schema_extra = {
                 "example": {
-                    "sub": "b6f7a2e8-0a6b-4a5e-90c3-7a9a6b8a1234",
-                    "scopes": ["read:items", "write:items"],
+                    "sub": "42",
+                    "scopes": ["read:profile", "write:posts"],
                     "exp": "2025-12-31T23:59:59Z",
                     "iat": "2025-12-31T22:59:59Z",
                 }
@@ -127,23 +141,21 @@ class TokenData(BaseModel):
             return []
         if isinstance(v, str):
             v = [v]
-        cleaned = []
+        cleaned: List[str] = []
         for s in v:
             s = str(s).strip()
-            if not s:
-                continue
-            cleaned.append(s.lower())
-        seen = set()
-        unique = []
+            if s:
+                cleaned.append(s.lower())
+        # unique & preserve order
+        seen, out = set(), []
         for s in cleaned:
             if s not in seen:
                 seen.add(s)
-                unique.append(s)
-        return unique
+                out.append(s)
+        return out
 
 
-# ---------- Requests from clients ----------
-
+# ─── Requests from clients ───────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     email: EmailStr
     username: str
@@ -151,11 +163,30 @@ class RegisterRequest(BaseModel):
     full_name: Optional[str] = None
 
     if _V2:
-        model_config = ConfigDict(extra="forbid", populate_by_name=True)
+        model_config = ConfigDict(
+            extra="forbid",
+            populate_by_name=True,
+            json_schema_extra={
+                "example": {
+                    "email": "alice@example.com",
+                    "username": "alice_01",
+                    "password": "pa55Word",
+                    "full_name": "Alice Doe"
+                }
+            },
+        )
     else:
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
+            schema_extra = {
+                "example": {
+                    "email": "alice@example.com",
+                    "username": "alice_01",
+                    "password": "pa55Word",
+                    "full_name": "Alice Doe"
+                }
+            }
 
     @field_validator("username", mode="before")
     def _validate_username(cls, v):
@@ -167,10 +198,8 @@ class RegisterRequest(BaseModel):
     @field_validator("password", mode="before")
     def _validate_password(cls, v):
         v = _ensure_non_empty_str(v, "password")
-        if len(v) < 8:
-            raise ValueError("password must be at least 8 characters")
-        if not (re.search(r"[A-Z]", v) and re.search(r"[a-z]", v) and re.search(r"[0-9]", v)):
-            raise ValueError("password must contain upper, lower, and number")
+        if len(v) < MIN_PASSWORD_LEN:
+            raise ValueError(f"password must be at least {MIN_PASSWORD_LEN} characters")
         return v
 
     @field_validator("full_name", mode="before")
@@ -182,15 +211,55 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    """
+    Inapokea **jozi yoyote** kati ya:
+      - identifier
+      - email
+      - username
+      - email_or_username
+    na ku-normalize kuwa `identifier` + `password`.
+    """
     identifier: str
     password: str
 
     if _V2:
-        model_config = ConfigDict(extra="forbid", populate_by_name=True)
+        model_config = ConfigDict(
+            extra="allow",              # ruhusu majina mengine ili tuyakusanye (email/username/...)
+            populate_by_name=True,
+            json_schema_extra={
+                "examples": [
+                    {"identifier": "you@example.com", "password": "secret"},
+                    {"email_or_username": "you@example.com", "password": "secret"},
+                    {"username": "youuser", "password": "secret"},
+                    {"email": "you@example.com", "password": "secret"},
+                ]
+            },
+        )
     else:
         class Config:  # type: ignore
-            extra = "forbid"
+            extra = "allow"
             allow_population_by_field_name = True
+            schema_extra = {
+                "examples": [
+                    {"identifier": "you@example.com", "password": "secret"},
+                    {"email_or_username": "you@example.com", "password": "secret"},
+                    {"username": "youuser", "password": "secret"},
+                    {"email": "you@example.com", "password": "secret"},
+                ]
+            }
+
+    @model_validator(mode="before")
+    def _coalesce_identifier(cls, values):
+        # values inaweza kuwa dict ya raw payload
+        if not isinstance(values, dict):
+            return values
+        ident = values.get("identifier") or values.get("email_or_username") \
+                or values.get("username") or values.get("email")
+        if not ident:
+            # acha Pydantic atoe 422 badala ya 500
+            return values
+        values["identifier"] = str(ident).strip()
+        return values
 
     @field_validator("identifier", mode="before")
     def _id_required(cls, v):
@@ -201,26 +270,26 @@ class LoginRequest(BaseModel):
         return _ensure_non_empty_str(v, "password")
 
 
-# ---------- Outbound to clients ----------
-
+# ─── Outbound to clients ─────────────────────────────────────────────────────
 class UserOut(BaseModel):
-    id: Union[str, UUID]
+    # OpenAPI yako ya sasa inaonyesha id: integer ⇒ tumia int hapa
+    id: int
     email: EmailStr
-    username: str
+    username: Optional[str] = None
     full_name: Optional[str] = None
     is_active: Optional[bool] = True
+    # hzi mbili ni za bonus—si lazima zirudishwe; zikiwa hazipo, sawa.
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     if _V2:
-        model_config = ConfigDict(extra="ignore", populate_by_name=True)
+        model_config = ConfigDict(
+            extra="ignore",
+            populate_by_name=True,
+            from_attributes=True,  # pydantic v2 ORM mode
+        )
 
-        # Serialize UUID → str
-        @field_serializer("id")
-        def _ser_id(self, v):
-            return str(v) if isinstance(v, (UUID, str)) else str(v)
-
-        # Serialize datetimes → ISO 8601
+        # Datetimes → ISO-8601
         @field_serializer("created_at", "updated_at")
         def _ser_dt(self, v):
             return v.isoformat() if isinstance(v, datetime) else v
@@ -230,23 +299,45 @@ class UserOut(BaseModel):
             allow_population_by_field_name = True
             orm_mode = True
 
-        @field_validator("id")
-        def _v1_id_to_str(cls, v):
-            return str(v)
-
-        @field_validator("created_at", "updated_at")
-        def _v1_dt_iso(cls, v):
-            return v  # v1 will be handled by jsonable_encoder in routes
-
 
 class AuthResponse(Token):
-    """Convenient envelope for /auth/login and /auth/register responses."""
+    """Envelope kwa /auth/login, /auth/signin, /auth/register."""
     user: UserOut
 
     if _V2:
-        model_config = ConfigDict(extra="forbid", populate_by_name=True)
+        model_config = ConfigDict(
+            extra="forbid",
+            populate_by_name=True,
+            json_schema_extra={
+                "example": {
+                    "access_token": "eyJhbGciOi...",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "user": {
+                        "id": 1,
+                        "email": "you@example.com",
+                        "username": "youuser",
+                        "full_name": "You User",
+                        "is_active": True
+                    }
+                }
+            },
+        )
     else:
         class Config:  # type: ignore
             extra = "forbid"
             allow_population_by_field_name = True
-            orm_mode = True
+            schema_extra = {
+                "example": {
+                    "access_token": "eyJhbGciOi...",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "user": {
+                        "id": 1,
+                        "email": "you@example.com",
+                        "username": "youuser",
+                        "full_name": "You User",
+                        "is_active": True
+                    }
+                }
+            }
