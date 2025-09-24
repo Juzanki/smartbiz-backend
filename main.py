@@ -71,20 +71,17 @@ def _find(spec: str) -> bool:
     return False
 
 def _hard_alias(name: str, module_obj) -> None:
-    """Force sys.modules[name] to point to the same module object."""
     sys.modules[name] = module_obj
 
 def ensure_canonical_packages() -> dict:
     """
-    Enforce ONE canonical path for packages:
-      - models: prefer 'backend.models' if exists, else 'models'
-      - routes: prefer 'backend.routes' if exists, else 'routes'
-    Cross-alias the other path to the SAME module object to avoid double imports.
-    Also ensure a concrete 'backend' package if missing (for local layout).
+    Lazimisha njia moja ya packages:
+      - models: 'backend.models' ikipatikana, sivyo 'models'
+      - routes: 'backend.routes' ikipatikana, sivyo 'routes'
+    Na unda/alias moduli zingine zirejee kwa hiyo hiyo object (hakuna double import).
     """
     out: Dict[str, str] = {}
 
-    # ensure 'backend' package object
     if "backend" not in sys.modules:
         backend_pkg = types.ModuleType("backend")
         backend_pkg.__path__ = [str(BACKEND_DIR)]
@@ -92,24 +89,18 @@ def ensure_canonical_packages() -> dict:
 
     # MODELS
     models_canon = "backend.models" if _find("backend.models") else "models"
-    alt_models   = "models" if models_canon == "backend.models" else "backend.models"
-    models_mod   = importlib.import_module(models_canon)  # may create package from folder
-    _hard_alias(alt_models, models_mod)
+    models_mod   = importlib.import_module(models_canon)
     _hard_alias("models", models_mod)
     _hard_alias("backend.models", models_mod)
     out["models"] = models_canon
 
     # ROUTES
     routes_canon = "backend.routes" if _find("backend.routes") else "routes"
-    alt_routes   = "routes" if routes_canon == "backend.routes" else "backend.routes"
-    # create package module if not present and folder exists
     try:
         routes_mod = importlib.import_module(routes_canon)
     except Exception:
-        # create empty package object to allow dynamic imports later
-        routes_mod = types.ModuleType(routes_canon.split(".")[0] if "." not in routes_canon else routes_canon)
+        routes_mod = types.ModuleType(routes_canon)
         routes_mod.__path__ = [str(BACKEND_DIR / "routes")]
-    _hard_alias(alt_routes, routes_mod)
     _hard_alias("routes", routes_mod)
     _hard_alias("backend.routes", routes_mod)
     out["routes"] = routes_canon
@@ -117,21 +108,48 @@ def ensure_canonical_packages() -> dict:
     logger.info("Canonical packages => models=%s routes=%s", out["models"], out["routes"])
     return out
 
+# ====== Dedup policy: prefer “modern” filenames, alias legacy to modern =======
+PREFER_OVER_LEGACY: Dict[str, str] = {
+    # legacy  : modern
+    "viewer": "live_viewer",
+    "livestream": "live_stream",
+    "cohost": "co_host",
+}
+LEGACY_SKIP: set[str] = set(PREFER_OVER_LEGACY.keys())
+
 def import_all_models_once(models_pkg_name: str) -> list[str]:
     """
-    Import *all* model modules exactly once via the canonical package.
-    Returns the list of imported module paths.
+    Import modules za models MARA MOJA via canonical package.
+    - Ikiwa zipo jozi za legacy/modern (k.m. viewer vs live_viewer), tunapendelea modern
+      na KUTO-import legacy kabisa.
+    - Kisha tunaweka ALIASES: 'backend.models.viewer' -> module ya 'live_viewer'
+      ili imports za zamani ziende module ileile (hakuna mapper mpya).
     """
     imported: list[str] = []
     pkg = importlib.import_module(models_pkg_name)
-    # walk through the actual package path (folder)
+
+    # 1) Skani files ili kujua zipo modern/legacy zipi
+    stems: set[str] = set()
+    for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
+        stem = mod.name.rsplit(".", 1)[-1]
+        stems.add(stem)
+
+    # 2) Tengeneza set ya SKIP kwa legacy zinazopatikana pamoja na modern zake
+    to_skip: set[str] = set()
+    for legacy, modern in PREFER_OVER_LEGACY.items():
+        if modern in stems and legacy in stems:
+            to_skip.add(legacy)
+
+    # 3) Import kwa utaratibu: ruka legacy zilizogongana
     for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
         name = mod.name
-        base = name.rsplit(".", 1)[-1]
-        if base.startswith("_"):
+        stem = name.rsplit(".", 1)[-1]
+        if stem.startswith("_"):
+            continue
+        if stem in to_skip:
+            logger.warning("Skipping legacy model module %s in favor of %s", stem, PREFER_OVER_LEGACY[stem])
             continue
         if name in sys.modules:
-            # already imported (good; single object)
             imported.append(name)
             continue
         try:
@@ -139,10 +157,19 @@ def import_all_models_once(models_pkg_name: str) -> list[str]:
             imported.append(name)
         except Exception as e:
             logger.error("Model import failed: %s -> %s", name, e)
+
+    # 4) Weka ALIASES za legacy → modern (hazita-load faili la legacy)
+    for legacy, modern in PREFER_OVER_LEGACY.items():
+        modern_path = f"{models_pkg_name}.{modern}"
+        legacy_path = f"{models_pkg_name}.{legacy}"
+        if modern_path in sys.modules:
+            _hard_alias(legacy_path, sys.modules[modern_path])
+
+    # 5) Alias pia bila-prefix kwa convenience (kama sehemu nyingine zitajaribu)
+    #    Mf: sys.modules['backend.models.viewer'] tayari imewekwa juu; hapa tunahakikisha
     return imported
 
 def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
-    """Return dict of duplicates {ClassName: [module.paths...]}, log if any."""
     dups: Dict[str, List[str]] = {}
     try:
         name_map: Dict[str, set[str]] = {}
@@ -161,9 +188,7 @@ def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
     return dups
 
 # ─────────────────────── DB imports (after canonical) ───────────────────────
-# NOTE: we call canonicalizer first to prevent early imports from splitting packages.
 PKGS = ensure_canonical_packages()
-
 try:
     from backend.db import Base, SessionLocal, engine  # type: ignore
 except Exception:
@@ -284,16 +309,14 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 
 # ─────────────────────── Lifespan helpers ───────────────────────
 def _fail_on_duplicate_mappers_if_configured() -> None:
-    from sqlalchemy.orm import declarative_base  # noqa: F401
     dups = _log_mapper_duplicates(Base)
-    if dups and env_bool("FAIL_ON_DUP_MAPPERS", True):
-        # Fail fast to surface the bug early
+    if dups and (os.getenv("FAIL_ON_DUP_MAPPERS","1").strip().lower() in {"1","true","yes","on"}):
         raise RuntimeError(f"Duplicate ORM mappers detected: {dups}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 0) Canonicalize packages early (already done at import-time), then import models once
-    models_pkg = PKGS["models"]
+    # 0) Canonicalize packages and import models once
+    models_pkg = ensure_canonical_packages()["models"]  # refresh just in case
     imported_models = import_all_models_once(models_pkg)
     logger.info("Models imported canonically: %s", imported_models)
 
@@ -321,6 +344,22 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down SmartBiz")
 
 # ───────────────────────── App ───────────────────────────
+def env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key); return default if v is None else v.strip().lower() in {"1","true","yes","y","on"}
+
+def env_list(key: str) -> List[str]:
+    raw = os.getenv(key, ""); return [x.strip() for x in raw.split(",") if x and x.strip()]
+
+def _uniq(items: Iterable[Optional[str]]) -> List[str]:
+    out, seen = [], set()
+    for x in items:
+        if x and x not in seen: out.append(x); seen.add(x)
+    return out
+
+def _sanitize_db_url(url: str) -> str:
+    if not url: return ""
+    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
+
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
@@ -392,7 +431,7 @@ def _import_router(module_path: str):
 
 def _auto_include_routes():
     included = []
-    routes_pkg = PKGS["routes"]
+    routes_pkg = ensure_canonical_packages()["routes"]
     try:
         pkg = importlib.import_module(routes_pkg)
         for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
@@ -496,7 +535,6 @@ async def cors_diag(request: Request):
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
 
-# Diagnostics (duplicates)
 @app.get("/_diag/orm_registry")
 def diag_orm_registry():
     try:
