@@ -116,7 +116,7 @@ def _users_columns() -> set[str]:
         _USERS_COLS = {c["name"] for c in _sa_inspect(engine).get_columns(USER_TABLE)}
     return _USERS_COLS or set()
 
-# ─────────────────────── DB helpers ──────────────────────
+# ───────────────────── DB helpers ──────────────────────
 def _db_ping() -> Tuple[bool, float, str]:
     t0 = time.perf_counter()
     try:
@@ -189,27 +189,56 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
         return await call_next(request)
 
-# ─────────────────── Model autoload (NEW) ───────────────────
-def _import_models_for_mappers() -> None:
-    """
-    Hakikisha maklasses za SQLAlchemy zime-load kabla ya create_all.
-    Tunajaribu packages zote mbili: 'models' na 'backend.models'.
-    Pia tuna-scan *.py ndani ya folda ya models.
-    """
-    # Direct hits first
-    for mp in ("models", "models.user", "backend.models", "backend.models.user"):
-        with suppress(Exception):
-            __import__(mp)
+# --- juu ya file (imports zingine zipo tayari) ---
+import importlib
+import sys
 
-    # Scan kwa upana
-    for d, prefix in [(BACKEND_DIR / "models", "backend.models"), (ROOT_DIR / "models", "models")]:
-        if d.exists():
-            for p in d.glob("*.py"):
-                if p.name.startswith("_"):
-                    continue
-                mod_path = f"{prefix}.{p.stem}"
-                with suppress(Exception):
-                    __import__(mod_path)
+# ─────────────────────── Lifespan helpers ───────────────────────
+def _import_all_models_canonically() -> list[str]:
+    """
+    Import all model modules ONLY via 'backend.models.<name>'.
+    Also alias 'models' -> 'backend.models' to avoid double imports.
+    Returns the list of imported module paths.
+    """
+    imported: list[str] = []
+
+    models_pkg = BACKEND_DIR / "models"
+    if models_pkg.exists():
+        # Ensure package ipo na ime-load kama 'backend.models'
+        importlib.import_module("backend.models")
+
+        # Alias: kitu chochote kinacho-import 'models' kipate object ile ile
+        sys.modules.setdefault("models", sys.modules["backend.models"])
+
+        for f in sorted(models_pkg.glob("*.py")):
+            name = f.stem
+            if name.startswith("_"):
+                continue
+            mod_path = f"backend.models.{name}"
+            try:
+                importlib.import_module(mod_path)
+                imported.append(mod_path)
+            except Exception as e:
+                logger.error("Failed to import model %s: %s", mod_path, e)
+    else:
+        logger.warning("No backend/models directory found")
+
+    return imported
+
+def _log_mapper_duplicates() -> None:
+    """Ongeza ufuatiliaji: toa onyo kama kuna majina ya mappers yamejirudia."""
+    try:
+        name_map: Dict[str, set[str]] = {}
+        for m in Base.registry.mappers:
+            cls = m.class_
+            name_map.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
+        dups = {k: sorted(v) for k, v in name_map.items() if len(v) > 1}
+        if dups:
+            logger.error("SQLAlchemy duplicate mappers detected: %s", dups)
+        else:
+            logger.info("SQLAlchemy mappers OK (no duplicate names)")
+    except Exception as e:
+        logger.debug("mapper-duplicate-check skipped: %s", e)
 
 # ─────────────────────── Lifespan ────────────────────────
 @asynccontextmanager
@@ -222,15 +251,20 @@ async def lifespan(app: FastAPI):
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
-    # 1) PAKIA MODELS KABLA YA KUJENGA JEDWALI (MUHIMU!)
+    # 1) Pakia models kwa njia moja tu (canonical) kabla ya create_all
     with suppress(Exception):
-        _import_models_for_mappers()
+        imported_models = _import_all_models_canonically()
+        logger.info("Models imported: %s", imported_models)
 
     # 2) Unda/ihakiki jedwali
     if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("Tables verified/created")
+
+    # 3) Angalia marudio ya mappers (helpful kwa 500 za 'Multiple classes found...')
+    with suppress(Exception):
+        _log_mapper_duplicates()
 
     try:
         yield
