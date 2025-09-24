@@ -1,7 +1,7 @@
 # backend/main.py
 from __future__ import annotations
 
-import os, sys, re, json, time, uuid, logging
+import os, sys, re, json, time, uuid, logging, importlib
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple
@@ -50,7 +50,7 @@ except Exception:
 # ───────────────────── Env helpers ───────────────────────
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
-    return default if v is None else v.strip().lower() in {"1","true","yes","y","on"}
+    return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 def env_list(key: str) -> List[str]:
     raw = os.getenv(key, "")
@@ -148,13 +148,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw xrid=%s", rid)
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        response.headers.setdefault("X-Content-Type-Options","nosniff")
-        response.headers.setdefault("X-Frame-Options","DENY")
-        response.headers.setdefault("Referrer-Policy","strict-origin-when-cross-origin")
-        response.headers.setdefault("Permissions-Policy","geolocation=(), microphone=(), camera=()")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         response.headers["Server"] = "SmartBiz"
         if self.enable_hsts and (request.url.scheme == "https"):
-            response.headers.setdefault("Strict-Transport-Security","max-age=31536000; includeSubDomains; preload")
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
         return response
 
 class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
@@ -168,7 +168,7 @@ class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
             response = Response(status_code=499)
         except Exception:
             logger.exception("unhandled xrid=%s", rid)
-            response = JSONResponse(status_code=500, content={"detail":"Internal Server Error"})
+            response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
         dur_ms = (time.perf_counter() - t0) * 1000.0
         response.headers["x-request-id"] = rid
         response.headers["x-process-time-ms"] = f"{int(dur_ms)}"
@@ -176,7 +176,7 @@ class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
         return response
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests that declare a Content-Length larger than MAX_BODY_BYTES (optional)."""
+    """Reject requests whose Content-Length exceeds MAX_BODY_BYTES (optional)."""
     def __init__(self, app: FastAPI, max_bytes: int):
         super().__init__(app)
         self.max_bytes = max(0, int(max_bytes))
@@ -189,15 +189,10 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
         return await call_next(request)
 
-# --- juu ya file (imports zingine zipo tayari) ---
-import importlib
-import sys
-
-# ================== EXTRA: Canonical module aliases (ROBUST) ==================
-# Lengo: kuruhusu 'backend.routes.*' na 'backend.models.*' kufanya kazi hata bila folder 'backend/'
+# ================== Robust aliasing to tolerate both layouts ==================
 with suppress(Exception):
     import types
-    # 1) Hakikisha 'routes' & 'models' zinaweza ku-importiwa
+    # Seed plain packages when folders exist
     if (BACKEND_DIR / "routes").exists():
         try:
             sys.modules.setdefault("routes", importlib.import_module("routes"))
@@ -208,23 +203,18 @@ with suppress(Exception):
             sys.modules.setdefault("models", importlib.import_module("models"))
         except Exception:
             pass
-
-    # 2) Tengeneza package ya bandia 'backend' ikiwa haipo
+    # Ensure a real 'backend' package object
     if "backend" not in sys.modules:
         backend_pkg = types.ModuleType("backend")
-        backend_pkg.__path__ = [str(BACKEND_DIR)]  # iwe package halali
+        backend_pkg.__path__ = [str(BACKEND_DIR)]
         sys.modules["backend"] = backend_pkg
-
-    # 3) Alias subpackages: backend.routes → routes, backend.models → models
+    # Cross-alias subpackages
     if "routes" in sys.modules:
         sys.modules.setdefault("backend.routes", sys.modules["routes"])
     if "models" in sys.modules:
         sys.modules.setdefault("backend.models", sys.modules["models"])
-# ==============================================================================
 
-# ================== EXTRA: weak alias (ok to keep; no harm) ===================
 with suppress(Exception):
-    # Ikiwa 'backend.models' tayari ime-load, alias 'models' → 'backend.models'
     if "backend.models" in sys.modules:
         sys.modules.setdefault("models", sys.modules["backend.models"])
 with suppress(Exception):
@@ -235,32 +225,55 @@ with suppress(Exception):
 # ─────────────────────── Lifespan helpers ───────────────────────
 def _import_all_models_canonically() -> list[str]:
     """
-    Import all model modules ONLY via 'backend.models.<name>'.
-    Also alias 'models' -> 'backend.models' to avoid double imports.
+    Load all SQLAlchemy models from the models package using ONE canonical path.
+    - If 'backend.models' exists, use it and alias 'models' -> that module.
+    - Else use 'models', and alias 'backend.models' -> that module.
     Returns the list of imported module paths.
     """
     imported: list[str] = []
+    models_dir = BACKEND_DIR / "models"
+    if not models_dir.exists():
+        logger.warning("No models directory found at %s", models_dir)
+        return imported
 
-    models_pkg = BACKEND_DIR / "models"
-    if models_pkg.exists():
-        # Ensure package ipo na ime-load kama 'backend.models'
-        importlib.import_module("backend.models")
+    # 1) Pick canonical package path
+    canonical_pkg = None
+    canonical_prefix = ""
+    try:
+        canonical_pkg = importlib.import_module("backend.models")
+        canonical_prefix = "backend.models"
+        # Alias plain 'models' to the same module object
+        sys.modules.setdefault("models", canonical_pkg)
+    except Exception:
+        try:
+            canonical_pkg = importlib.import_module("models")
+            canonical_prefix = "models"
+            # Alias 'backend.models' to the same module object
+            sys.modules.setdefault("backend.models", canonical_pkg)
+        except Exception as e:
+            logger.error("Failed to import models package: %s", e)
+            return imported
 
-        # Alias: kitu chochote kinacho-import 'models' kipate object ile ile
-        sys.modules.setdefault("models", sys.modules["backend.models"])
+    logger.info("Models canonical package in use: %s", canonical_prefix)
 
-        for f in sorted(models_pkg.glob("*.py")):
-            name = f.stem
-            if name.startswith("_"):
-                continue
-            mod_path = f"backend.models.{name}"
-            try:
-                importlib.import_module(mod_path)
-                imported.append(mod_path)
-            except Exception as e:
-                logger.error("Failed to import model %s: %s", mod_path, e)
-    else:
-        logger.warning("No backend/models directory found")
+    # 2) Import each module exactly once via the canonical prefix
+    for f in sorted(models_dir.glob("*.py")):
+        name = f.stem
+        if name.startswith("_"):
+            continue
+        mod_path = f"{canonical_prefix}.{name}"
+        try:
+            importlib.import_module(mod_path)
+            imported.append(mod_path)
+        except Exception as e:
+            logger.error("Failed to import model %s: %s", mod_path, e)
+
+    # 3) Final safety: ensure both names resolve to same package object
+    try:
+        sys.modules.setdefault("models", sys.modules[canonical_prefix])
+        sys.modules.setdefault("backend.models", sys.modules[canonical_prefix])
+    except Exception:
+        pass
 
     return imported
 
@@ -301,7 +314,7 @@ async def lifespan(app: FastAPI):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("Tables verified/created")
 
-    # 3) Angalia marudio ya mappers (helpful kwa 500 za 'Multiple classes found...')
+    # 3) Angalia marudio ya mappers
     with suppress(Exception):
         _log_mapper_duplicates()
 
@@ -313,9 +326,9 @@ async def lifespan(app: FastAPI):
 # ───────────────────────── App ───────────────────────────
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
-    title=os.getenv("APP_NAME","SmartBiz Assistance API"),
+    title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
-    version=os.getenv("APP_VERSION","1.0.0"),
+    version=os.getenv("APP_VERSION", "1.0.0"),
     docs_url=None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
@@ -449,7 +462,7 @@ def _include_whitelisted_routes():
 # ------------------------------------------------------------------
 
 _auto_include_routes()
-_include_whitelisted_routes()  # ← inaongeza juu ya ya awali bila kubadilisha chochote
+_include_whitelisted_routes()  # inaongeza juu ya ya awali bila kubadilisha chochote
 
 # ───────────────── Global error handlers ─────────────────
 @app.exception_handler(HTTPException)
@@ -537,7 +550,7 @@ def diag_routers():
     return {
         "count": len(paths),
         "paths": paths[:300],
-        "whitelist": [x.strip() for x in os.getenv("ENABLED_ROUTERS","auth_routes").split(",") if x.strip()],
+        "whitelist": [x.strip() for x in os.getenv("ENABLED_ROUTERS", "auth_routes").split(",") if x.strip()],
     }
 
 @app.get("/_diag/orm_registry")
@@ -557,7 +570,6 @@ def diag_orm_registry():
         }
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-# =============================================================
 
 # Docs (optional)
 if _docs_enabled:
