@@ -1,23 +1,49 @@
 # backend/models/live_stream.py
 # -*- coding: utf-8 -*-
+"""
+LiveStream model — metadata na uhusiano wa live session.
+
+✔ Layout-safe Base import: jaribu 'backend.db' kisha 'db'
+✔ TYPE_CHECKING kwa references za darasa jingine (hakuna runtime circular import)
+✔ Relationships zote zina primaryjoin/foreign_keys/back_populates iliyo wazi
+✔ Indices, constraints, helpers na hybrid properties
+
+KUMBUKA:
+- Epuka ku-import models package kwa njia mbili tofauti.
+- Pendekezo: kwenye startup, alias 'models' -> 'backend.models' ili kuepusha double mapping.
+"""
 from __future__ import annotations
 
-import re, hmac, hashlib, secrets
 import datetime as dt
-from typing import Optional, List, TYPE_CHECKING
+import hashlib
+import hmac
+import re
+import secrets
+from typing import List, Optional, TYPE_CHECKING
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, Index, Integer, String, UniqueConstraint,
-    func, text
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.event import listens_for
 from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
-from backend.db import Base
+# ── Layout-safe Base import (DO NOT import both paths elsewhere) ───────────────
+try:  # preferred canonical path
+    from backend.db import Base  # type: ignore
+except Exception:  # fallback if project runs without the 'backend.' package
+    from db import Base  # type: ignore
 
 if TYPE_CHECKING:
-    # Hizi ziko kwa type-hints tu; runtime hatuzileti hapa kuepuka circular imports
+    # Hizi ni kwa type hints tu. Hakuna runtime import hapa — hakuna circular import.
     from .guest import Guest
     from .co_host import CoHost
     from .stream_settings import StreamSettings
@@ -39,6 +65,7 @@ if TYPE_CHECKING:
     from .live_product import LiveProduct
     from .top_contributor import TopContributor
 
+__all__ = ["LiveStream"]
 
 SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9\-_]+$")
 
@@ -67,20 +94,20 @@ class LiveStream(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # Public identifiers
-    code:  Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
+    code: Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
     title: Mapped[Optional[str]] = mapped_column(String(160))
-    goal:  Mapped[Optional[str]] = mapped_column(String(160))
+    goal: Mapped[Optional[str]] = mapped_column(String(160))
 
     # Private join/control code (hashed)
-    code_hash:     Mapped[Optional[str]] = mapped_column(String(128), index=True)
-    code_salt:     Mapped[Optional[str]] = mapped_column(String(32))
+    code_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    code_salt: Mapped[Optional[str]] = mapped_column(String(32))
     rotate_secret: Mapped[Optional[str]] = mapped_column(String(64))
 
     is_featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     is_recorded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     viewers_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
-    likes_count:   Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    likes_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
 
     # Timestamps
     started_at: Mapped[dt.datetime] = mapped_column(
@@ -99,12 +126,8 @@ class LiveStream(Base):
     deleted: Mapped[bool] = mapped_column(Boolean, server_default=text("0"), nullable=False, index=True)
 
     # ────────────────────────────── Relationships ──────────────────────────────
-    # ⚠️ MUHIMU: Kwa kila back_populates hapa, upande wa pili lazima u-ref back_populates
-    #          unaolingana na FK sahihi. Ndicho kilichosababisha error yako ya mapper.
-
     guests: Mapped[List["Guest"]] = relationship(
         "Guest",
-        # Guest lazima awe na: live_stream_id = ForeignKey("live_streams.id")  +  live_stream = relationship("LiveStream", back_populates="guests")
         primaryjoin="LiveStream.id == foreign(Guest.live_stream_id)",
         foreign_keys="Guest.live_stream_id",
         back_populates="live_stream",
@@ -174,7 +197,6 @@ class LiveStream(Base):
         lazy="selectin",
     )
 
-    # Viewer lazima awe na: stream_id = FK("live_streams.id") + live_stream = relationship("LiveStream", back_populates="viewers")
     viewers: Mapped[List["Viewer"]] = relationship(
         "Viewer",
         primaryjoin="LiveStream.id == foreign(Viewer.stream_id)",
