@@ -193,7 +193,36 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 import importlib
 import sys
 
-# ================== EXTRA: Canonical module aliases ==================
+# ================== EXTRA: Canonical module aliases (ROBUST) ==================
+# Lengo: kuruhusu 'backend.routes.*' na 'backend.models.*' kufanya kazi hata bila folder 'backend/'
+with suppress(Exception):
+    import types
+    # 1) Hakikisha 'routes' & 'models' zinaweza ku-importiwa
+    if (BACKEND_DIR / "routes").exists():
+        try:
+            sys.modules.setdefault("routes", importlib.import_module("routes"))
+        except Exception:
+            pass
+    if (BACKEND_DIR / "models").exists():
+        try:
+            sys.modules.setdefault("models", importlib.import_module("models"))
+        except Exception:
+            pass
+
+    # 2) Tengeneza package ya bandia 'backend' ikiwa haipo
+    if "backend" not in sys.modules:
+        backend_pkg = types.ModuleType("backend")
+        backend_pkg.__path__ = [str(BACKEND_DIR)]  # iwe package halali
+        sys.modules["backend"] = backend_pkg
+
+    # 3) Alias subpackages: backend.routes → routes, backend.models → models
+    if "routes" in sys.modules:
+        sys.modules.setdefault("backend.routes", sys.modules["routes"])
+    if "models" in sys.modules:
+        sys.modules.setdefault("backend.models", sys.modules["models"])
+# ==============================================================================
+
+# ================== EXTRA: weak alias (ok to keep; no harm) ===================
 with suppress(Exception):
     # Ikiwa 'backend.models' tayari ime-load, alias 'models' → 'backend.models'
     if "backend.models" in sys.modules:
@@ -201,7 +230,7 @@ with suppress(Exception):
 with suppress(Exception):
     if "backend.routes" in sys.modules:
         sys.modules.setdefault("routes", sys.modules["backend.routes"])
-# =====================================================================
+# ==============================================================================
 
 # ─────────────────────── Lifespan helpers ───────────────────────
 def _import_all_models_canonically() -> list[str]:
