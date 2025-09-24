@@ -1,7 +1,8 @@
 # backend/main.py
 from __future__ import annotations
 
-import os, sys, re, json, time, uuid, logging, importlib, importlib.util, pkgutil, types
+import os, sys, re, json, time, uuid, logging, importlib, pkgutil, types
+from importlib import util as importlib_util
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple
@@ -64,132 +65,124 @@ logger = logging.getLogger("smartbiz.main")
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
 
-# ─────────────────────── Canonical imports ───────────────────────
-def _find(spec: str) -> bool:
-    with suppress(Exception):
-        return importlib.util.find_spec(spec) is not None
-    return False
-
-def _hard_alias(name: str, module_obj) -> None:
-    sys.modules[name] = module_obj
-
-def ensure_canonical_packages() -> dict:
-    """Lazimisha package moja (backend.models / backend.routes) na u-alias nyingine."""
-    out: Dict[str, str] = {}
-
-    if "backend" not in sys.modules:
-        backend_pkg = types.ModuleType("backend")
-        backend_pkg.__path__ = [str(BACKEND_DIR)]
-        sys.modules["backend"] = backend_pkg
-
-    # MODELS
-    models_canon = "backend.models" if _find("backend.models") else "models"
-    models_mod   = importlib.import_module(models_canon)
-    _hard_alias("models", models_mod)
-    _hard_alias("backend.models", models_mod)
-    out["models"] = models_canon
-
-    # ROUTES
-    routes_canon = "backend.routes" if _find("backend.routes") else "routes"
-    try:
-        routes_mod = importlib.import_module(routes_canon)
-    except Exception:
-        routes_mod = types.ModuleType(routes_canon)
-        routes_mod.__path__ = [str(BACKEND_DIR / "routes")]
-    _hard_alias("routes", routes_mod)
-    _hard_alias("backend.routes", routes_mod)
-    out["routes"] = routes_canon
-
-    logger.info("Canonical packages => models=%s routes=%s", out["models"], out["routes"])
-    return out
-
-# ====== Dedup policy & legacy shims ===================================================
+# ─────────────────────── Canonical/Namespace packages ───────────────────────
 PREFER_OVER_LEGACY: Dict[str, str] = {
+    # legacy  : modern
     "viewer": "live_viewer",
     "livestream": "live_stream",
     "cohost": "co_host",
 }
 
-def _install_stub(name: str, target: str) -> None:
+def _ns_package(name: str, path: Path) -> types.ModuleType:
     """
-    Weka STUB module yenye __getattr__ inayoforward kwa target.
-    Mara ya kwanza itakapoguswa, ita-import target na kubadili sys.modules[name]=target_mod.
+    Tengeneza 'namespace package' (bila kutekeleza __init__.py) kwa jina lilotolewa.
+    Hii inazuia side-effects za models/__init__.py.
     """
     if name in sys.modules:
+        return sys.modules[name]  # type: ignore[return-value]
+    mod = types.ModuleType(name)
+    mod.__path__ = [str(path)]  # type: ignore[attr-defined]
+    sys.modules[name] = mod
+    return mod
+
+def _install_attr_forward_stub(stub_name: str, target_mod_path: str) -> None:
+    """
+    Weka STUB yenye __getattr__ inayoforward kwa module lengwa.
+    Mara ya kwanza inapoguswa, tunabadilisha sys.modules[stub_name] → target module.
+    """
+    if stub_name in sys.modules:
         return
-    stub = types.ModuleType(name)
+    stub = types.ModuleType(stub_name)
 
     def __getattr__(attr):  # PEP 562
-        mod = importlib.import_module(target)
-        sys.modules[name] = mod
+        mod = importlib.import_module(target_mod_path)
+        sys.modules[stub_name] = mod
         return getattr(mod, attr)
 
-    # pia __dir__ nzuri
     def __dir__():
         try:
-            mod = importlib.import_module(target)
-            return dir(mod)
+            return dir(importlib.import_module(target_mod_path))
         except Exception:
             return []
 
     stub.__getattr__ = __getattr__  # type: ignore[attr-defined]
     stub.__dir__ = __dir__          # type: ignore[attr-defined]
-    sys.modules[name] = stub
+    sys.modules[stub_name] = stub
 
-def install_legacy_module_shims(models_pkg_name: str) -> None:
+def _bootstrap_namespaces() -> Dict[str, str]:
     """
-    KABLA ya ku-load chochote, weka shims kwa majina ya legacy→modern
-    kwenye namespaces zote mbili: 'backend.models.*' na 'models.*'.
-    Hii inazuia kabisa loader kufungua faili la legacy (mf. viewer.py).
+    1) Unda 'backend' kama package kama haipo.
+    2) UNDANI: USI-import 'backend.models' wala 'models' — tengeneza namespace packages
+       kwa mikono ili kuepuka ku-run models/__init__.py.
+    3) Alias 'models' ↔ 'backend.models' (module object ile ile).
+    4) Install LEGACY SHIMS kabla ya module yoyote kuguswa.
     """
+    if "backend" not in sys.modules:
+        backend_pkg = types.ModuleType("backend")
+        backend_pkg.__path__ = [str(BACKEND_DIR)]  # type: ignore[attr-defined]
+        sys.modules["backend"] = backend_pkg
+
+    models_dir = BACKEND_DIR / "models"
+    routes_dir = BACKEND_DIR / "routes"
+
+    backend_models = _ns_package("backend.models", models_dir)
+    sys.modules["models"] = backend_models  # alias to SAME object
+
+    backend_routes = _ns_package("backend.routes", routes_dir)
+    sys.modules["routes"] = backend_routes  # alias to SAME object
+
+    # Legacy shims (viewer → live_viewer, nk.) katika namespaces zote mbili
     for legacy, modern in PREFER_OVER_LEGACY.items():
-        modern_path = f"{models_pkg_name}.{modern}"
-        # namespace mbili zinazoweza kutumiwa na code nyingine
-        for ns in {"backend.models", "models"}:
-            legacy_path = f"{ns}.{legacy}"
-            target_path = modern_path if ns == models_pkg_name else f"{ns}.{modern}"
-            _install_stub(legacy_path, target_path)
+        _install_attr_forward_stub(f"backend.models.{legacy}", f"backend.models.{modern}")
+        _install_attr_forward_stub(f"models.{legacy}",          f"models.{modern}")
 
-def import_all_models_once(models_pkg_name: str) -> list[str]:
-    """
-    Import modules za models mara moja kupitia canonical package.
-    - Ruka faili za legacy endapo modern ipo.
-    - Baada ya hapo, legacy names tayari zimewekewa stubs (hazitafunguliwa).
-    """
-    imported: list[str] = []
-    pkg = importlib.import_module(models_pkg_name)
+    logger.info("Canonical packages => models=backend.models routes=backend.routes")
+    return {"models": "backend.models", "routes": "backend.routes"}
 
-    # Tambua stem zilizopo
-    stems: set[str] = set()
-    for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
-        stems.add(mod.name.rsplit(".", 1)[-1])
+PKGS = _bootstrap_namespaces()
 
-    # Legacy za kuruka
-    to_skip: set[str] = {legacy for legacy, modern in PREFER_OVER_LEGACY.items() if (modern in stems and legacy in stems)}
-
-    # Import modern/others
-    for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
-        name = mod.name
-        stem = name.rsplit(".", 1)[-1]
-        if stem.startswith("_") or stem in to_skip:
-            if stem in to_skip:
-                logger.warning("Skipping legacy model module %s (using %s)", stem, PREFER_OVER_LEGACY[stem])
+# ───────────────────── Utilities za ku-scan & import models ───────────────────
+def _list_model_modules(models_pkg: str) -> List[str]:
+    pkg = sys.modules[models_pkg]
+    names: List[str] = []
+    for mod in pkgutil.walk_packages(pkg.__path__, prefix=models_pkg + "."):  # type: ignore[attr-defined]
+        base = mod.name.rsplit(".", 1)[-1]
+        if base.startswith("_"):
             continue
-        if name in sys.modules:
-            imported.append(name); continue
+        names.append(mod.name)
+    return sorted(names)
+
+def _skip_legacy_set(all_names: List[str]) -> set[str]:
+    stems = {n.rsplit(".", 1)[-1] for n in all_names}
+    return {legacy for legacy, modern in PREFER_OVER_LEGACY.items() if legacy in stems and modern in stems}
+
+def import_all_models_once(models_pkg: str) -> List[str]:
+    """
+    Import *file modules* chini ya `backend.models` bila kugusa models/__init__.py.
+    - Ruka legacy kama modern ipo (mf. ruka 'viewer' ukiona 'live_viewer')
+    - Shims tayari zipo, hivyo import za legacy zikiwahi kutokea zitaelekezwa kwa modern.
+    """
+    imported: List[str] = []
+    candidates = _list_model_modules(models_pkg)
+    to_skip = _skip_legacy_set(candidates)
+
+    for fq in candidates:
+        stem = fq.rsplit(".", 1)[-1]
+        if stem in to_skip:
+            logger.warning("Skipping legacy model module %s (using %s)", stem, PREFER_OVER_LEGACY[stem])
+            continue
+        if fq in sys.modules:
+            imported.append(fq)
+            continue
         try:
-            importlib.import_module(name); imported.append(name)
+            importlib.import_module(fq)
+            imported.append(fq)
         except Exception as e:
-            logger.error("Model import failed: %s -> %s", name, e)
+            logger.error("Model import failed: %s -> %s", fq, e)
 
     return imported
 
-# ─────────────────────── Prepare packages early ───────────────────────
-PKGS = ensure_canonical_packages()
-# >>> CRITICAL: weka shims KABLA ya import yoyote ya models
-install_legacy_module_shims(PKGS["models"])
-
-# ─────────────────────── DB imports ───────────────────────
+# ─────────────────────── DB imports (now safe) ───────────────────────
 try:
     from backend.db import Base, SessionLocal, engine  # type: ignore
 except Exception:
@@ -229,15 +222,6 @@ with suppress(Exception):
     os.environ.setdefault("SMARTBIZ_PWHASH_COL", chosen)
     PW_COL = chosen
     logger.info("Users cols: %s | PW col: %s", sorted(_USERS_COLS or []), PW_COL)
-
-def _users_columns() -> set[str]:
-    global _USERS_COLS
-    if _USERS_COLS is not None:
-        return _USERS_COLS
-    with suppress(Exception):
-        from sqlalchemy import inspect as _sa_inspect
-        _USERS_COLS = {c["name"] for c in _sa_inspect(engine).get_columns(USER_TABLE)}
-    return _USERS_COLS or set()
 
 # ───────────────────── DB helpers ──────────────────────
 def _db_ping() -> Tuple[bool, float, str]:
@@ -327,18 +311,20 @@ def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
     return dups
 
 def _fail_on_duplicate_mappers_if_configured() -> None:
+    if os.getenv("FAIL_ON_DUP_MAPPERS", "1").strip().lower() not in {"1","true","yes","on"}:
+        return
     dups = _log_mapper_duplicates(Base)
-    if dups and (os.getenv("FAIL_ON_DUP_MAPPERS","1").strip().lower() in {"1","true","yes","on"}):
+    if dups:
         raise RuntimeError(f"Duplicate ORM mappers detected: {dups}")
 
 # ─────────────────────── Lifespan ───────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Import models via canonical path, legacy shims already installed.
+    # 0) Import models kupitia namespace tuliyounda (hakuna models/__init__.py)
     imported_models = import_all_models_once(PKGS["models"])
     logger.info("Models imported canonically: %s", imported_models)
 
-    # DB test
+    # 1) DB test
     db_ok, db_ms, db_err = _db_ping()
     logger.info(
         "Starting SmartBiz (env=%s, starlette=%s, db=%s, db_ok=%s, db_ms=%.1fms)",
@@ -347,13 +333,14 @@ async def lifespan(app: FastAPI):
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
-    # Create tables if allowed
-    if (os.getenv("AUTO_CREATE_TABLES","0").strip().lower() in {"1","true","yes","on"}) or (ENVIRONMENT != "production" and os.getenv("AUTO_CREATE_TABLES") is None):
+    # 2) Create tables if allowed
+    auto_create = os.getenv("AUTO_CREATE_TABLES")
+    if (auto_create is None and ENVIRONMENT != "production") or (auto_create or "").strip().lower() in {"1","true","yes","on"}:
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("Tables verified/created")
 
-    # Check duplicate mappers
+    # 3) Check duplicate mappers
     _fail_on_duplicate_mappers_if_configured()
 
     try:
@@ -427,17 +414,17 @@ max_body = int(os.getenv("MAX_BODY_BYTES", "0") or "0")
 if max_body > 0:
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body)
 
-# ───────────────────── Include Routers (canonical) ───────────────────
+# ───────────────────── Include Routers (namespace) ───────────────────
 def _import_router(module_path: str):
     mod = __import__(module_path, fromlist=["router"])
     return getattr(mod, "router", None)
 
 def _auto_include_routes():
     included = []
-    routes_pkg = ensure_canonical_packages()["routes"]
+    routes_pkg = "backend.routes"
     try:
-        pkg = importlib.import_module(routes_pkg)
-        for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
+        pkg = sys.modules[routes_pkg]
+        for mod in pkgutil.walk_packages(pkg.__path__, prefix=routes_pkg + "."):  # type: ignore[attr-defined]
             name = mod.name.rsplit(".", 1)[-1]
             if not name.endswith("_routes"):
                 continue
@@ -454,14 +441,13 @@ def _auto_include_routes():
     # Whitelist ya ziada
     names = [x.strip() for x in os.getenv("ENABLED_ROUTERS", "auth_routes").split(",") if x.strip()]
     for name in names:
-        for cand in (f"{routes_pkg}.{name}", f"{routes_pkg}.{name.removesuffix('.py')}"):
-            try:
-                r = _import_router(cand)
-                if r is not None and cand not in included:
-                    app.include_router(r); included.append(cand)
-                    break
-            except Exception:
-                continue
+        cand = f"{routes_pkg}.{name}"
+        try:
+            r = _import_router(cand)
+            if r is not None and cand not in included:
+                app.include_router(r); included.append(cand)
+        except Exception:
+            pass
 
     logger.info("Routers included: %s", included)
 
@@ -505,47 +491,4 @@ def health():
 
     git_sha = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
     return {
-        "status": "healthy",
-        "db": {"ok": db_ok, "latency_ms": int(db_ms), "err": db_err or None},
-        "deps": {"passlib": _passlib, "bcrypt": _bcrypt},
-        "ts": time.time(),
-        "env": {
-            "environment": ENVIRONMENT,
-            "starlette": _STARLETTE_VER,
-            "app_version": os.getenv("APP_VERSION", "1.0.0"),
-            "log_json": LOG_JSON,
-            "db_url": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
-            "git_sha": git_sha,
-        },
-        "base_url": BACKEND_PUBLIC_URL,
-    }
-
-@app.get("/health/db")
-def health_db(db: Session = Depends(get_db)):
-    t0 = time.perf_counter()
-    try:
-        db.execute(text("SELECT 1"))
-        return {"ok": True, "latency_ms": int((time.perf_counter() - t0) * 1000)}
-    except Exception as e:
-        logger.exception("DB health failed")
-        return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=500)
-
-@app.get("/auth/_diag_cors")
-async def cors_diag(request: Request):
-    return {
-        "origin_header": request.headers.get("origin"),
-        "allowed_origins": _resolve_cors_origins() if not CORS_ALLOW_ALL else ["* (regex)"],
-        "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
-    }
-
-@app.get("/_diag/orm_registry")
-def diag_orm_registry():
-    try:
-        info: Dict[str, set[str]] = {}
-        for m in Base.registry.mappers:
-            c = m.class_
-            info.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
-        duplicates = {k: sorted(v) for k, v in info.items() if len(v) > 1}
-        return {"ok": True, "duplicates": duplicates, "total_mapped": sum(len(v) for v in info.values())}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+      
