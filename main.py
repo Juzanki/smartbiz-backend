@@ -74,12 +74,7 @@ def _hard_alias(name: str, module_obj) -> None:
     sys.modules[name] = module_obj
 
 def ensure_canonical_packages() -> dict:
-    """
-    Lazimisha njia moja ya packages:
-      - models: 'backend.models' ikipatikana, sivyo 'models'
-      - routes: 'backend.routes' ikipatikana, sivyo 'routes'
-    Na unda/alias moduli zingine zirejee kwa hiyo hiyo object (hakuna double import).
-    """
+    """Lazimisha package moja (backend.models / backend.routes) na u-alias nyingine."""
     out: Dict[str, str] = {}
 
     if "backend" not in sys.modules:
@@ -108,87 +103,93 @@ def ensure_canonical_packages() -> dict:
     logger.info("Canonical packages => models=%s routes=%s", out["models"], out["routes"])
     return out
 
-# ====== Dedup policy: prefer “modern” filenames, alias legacy to modern =======
+# ====== Dedup policy & legacy shims ===================================================
 PREFER_OVER_LEGACY: Dict[str, str] = {
-    # legacy  : modern
     "viewer": "live_viewer",
     "livestream": "live_stream",
     "cohost": "co_host",
 }
-LEGACY_SKIP: set[str] = set(PREFER_OVER_LEGACY.keys())
+
+def _install_stub(name: str, target: str) -> None:
+    """
+    Weka STUB module yenye __getattr__ inayoforward kwa target.
+    Mara ya kwanza itakapoguswa, ita-import target na kubadili sys.modules[name]=target_mod.
+    """
+    if name in sys.modules:
+        return
+    stub = types.ModuleType(name)
+
+    def __getattr__(attr):  # PEP 562
+        mod = importlib.import_module(target)
+        sys.modules[name] = mod
+        return getattr(mod, attr)
+
+    # pia __dir__ nzuri
+    def __dir__():
+        try:
+            mod = importlib.import_module(target)
+            return dir(mod)
+        except Exception:
+            return []
+
+    stub.__getattr__ = __getattr__  # type: ignore[attr-defined]
+    stub.__dir__ = __dir__          # type: ignore[attr-defined]
+    sys.modules[name] = stub
+
+def install_legacy_module_shims(models_pkg_name: str) -> None:
+    """
+    KABLA ya ku-load chochote, weka shims kwa majina ya legacy→modern
+    kwenye namespaces zote mbili: 'backend.models.*' na 'models.*'.
+    Hii inazuia kabisa loader kufungua faili la legacy (mf. viewer.py).
+    """
+    for legacy, modern in PREFER_OVER_LEGACY.items():
+        modern_path = f"{models_pkg_name}.{modern}"
+        # namespace mbili zinazoweza kutumiwa na code nyingine
+        for ns in {"backend.models", "models"}:
+            legacy_path = f"{ns}.{legacy}"
+            target_path = modern_path if ns == models_pkg_name else f"{ns}.{modern}"
+            _install_stub(legacy_path, target_path)
 
 def import_all_models_once(models_pkg_name: str) -> list[str]:
     """
-    Import modules za models MARA MOJA via canonical package.
-    - Ikiwa zipo jozi za legacy/modern (k.m. viewer vs live_viewer), tunapendelea modern
-      na KUTO-import legacy kabisa.
-    - Kisha tunaweka ALIASES: 'backend.models.viewer' -> module ya 'live_viewer'
-      ili imports za zamani ziende module ileile (hakuna mapper mpya).
+    Import modules za models mara moja kupitia canonical package.
+    - Ruka faili za legacy endapo modern ipo.
+    - Baada ya hapo, legacy names tayari zimewekewa stubs (hazitafunguliwa).
     """
     imported: list[str] = []
     pkg = importlib.import_module(models_pkg_name)
 
-    # 1) Skani files ili kujua zipo modern/legacy zipi
+    # Tambua stem zilizopo
     stems: set[str] = set()
     for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
-        stem = mod.name.rsplit(".", 1)[-1]
-        stems.add(stem)
+        stems.add(mod.name.rsplit(".", 1)[-1])
 
-    # 2) Tengeneza set ya SKIP kwa legacy zinazopatikana pamoja na modern zake
-    to_skip: set[str] = set()
-    for legacy, modern in PREFER_OVER_LEGACY.items():
-        if modern in stems and legacy in stems:
-            to_skip.add(legacy)
+    # Legacy za kuruka
+    to_skip: set[str] = {legacy for legacy, modern in PREFER_OVER_LEGACY.items() if (modern in stems and legacy in stems)}
 
-    # 3) Import kwa utaratibu: ruka legacy zilizogongana
+    # Import modern/others
     for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
         name = mod.name
         stem = name.rsplit(".", 1)[-1]
-        if stem.startswith("_"):
-            continue
-        if stem in to_skip:
-            logger.warning("Skipping legacy model module %s in favor of %s", stem, PREFER_OVER_LEGACY[stem])
+        if stem.startswith("_") or stem in to_skip:
+            if stem in to_skip:
+                logger.warning("Skipping legacy model module %s (using %s)", stem, PREFER_OVER_LEGACY[stem])
             continue
         if name in sys.modules:
-            imported.append(name)
-            continue
+            imported.append(name); continue
         try:
-            importlib.import_module(name)
-            imported.append(name)
+            importlib.import_module(name); imported.append(name)
         except Exception as e:
             logger.error("Model import failed: %s -> %s", name, e)
 
-    # 4) Weka ALIASES za legacy → modern (hazita-load faili la legacy)
-    for legacy, modern in PREFER_OVER_LEGACY.items():
-        modern_path = f"{models_pkg_name}.{modern}"
-        legacy_path = f"{models_pkg_name}.{legacy}"
-        if modern_path in sys.modules:
-            _hard_alias(legacy_path, sys.modules[modern_path])
-
-    # 5) Alias pia bila-prefix kwa convenience (kama sehemu nyingine zitajaribu)
-    #    Mf: sys.modules['backend.models.viewer'] tayari imewekwa juu; hapa tunahakikisha
     return imported
 
-def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
-    dups: Dict[str, List[str]] = {}
-    try:
-        name_map: Dict[str, set[str]] = {}
-        for m in Base_obj.registry.mappers:
-            c = m.class_
-            name_map.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
-        for k, v in name_map.items():
-            if len(v) > 1:
-                dups[k] = sorted(v)
-        if dups:
-            logger.error("SQLAlchemy duplicate mappers detected: %s", dups)
-        else:
-            logger.info("SQLAlchemy mappers OK (no duplicates)")
-    except Exception as e:
-        logger.warning("duplicate-check failed: %s", e)
-    return dups
-
-# ─────────────────────── DB imports (after canonical) ───────────────────────
+# ─────────────────────── Prepare packages early ───────────────────────
 PKGS = ensure_canonical_packages()
+# >>> CRITICAL: weka shims KABLA ya import yoyote ya models
+install_legacy_module_shims(PKGS["models"])
+
+# ─────────────────────── DB imports ───────────────────────
 try:
     from backend.db import Base, SessionLocal, engine  # type: ignore
 except Exception:
@@ -258,8 +259,7 @@ def get_db() -> Session:
 # ───────────────────── Middlewares ───────────────────────
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: FastAPI, *, enable_hsts: bool = False):
-        super().__init__(app)
-        self.enable_hsts = enable_hsts
+        super().__init__(app); self.enable_hsts = enable_hsts
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         rid = request.headers.get("x-request-id") or "-"
         try:
@@ -307,20 +307,38 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
         return await call_next(request)
 
-# ─────────────────────── Lifespan helpers ───────────────────────
+# ───────────────────── Helper: mapper duplicates ─────────────────────
+def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
+    dups: Dict[str, List[str]] = {}
+    try:
+        name_map: Dict[str, set[str]] = {}
+        for m in Base_obj.registry.mappers:
+            c = m.class_
+            name_map.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
+        for k, v in name_map.items():
+            if len(v) > 1:
+                dups[k] = sorted(v)
+        if dups:
+            logger.error("SQLAlchemy duplicate mappers detected: %s", dups)
+        else:
+            logger.info("SQLAlchemy mappers OK (no duplicates)")
+    except Exception as e:
+        logger.warning("duplicate-check failed: %s", e)
+    return dups
+
 def _fail_on_duplicate_mappers_if_configured() -> None:
     dups = _log_mapper_duplicates(Base)
     if dups and (os.getenv("FAIL_ON_DUP_MAPPERS","1").strip().lower() in {"1","true","yes","on"}):
         raise RuntimeError(f"Duplicate ORM mappers detected: {dups}")
 
+# ─────────────────────── Lifespan ───────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 0) Canonicalize packages and import models once
-    models_pkg = ensure_canonical_packages()["models"]  # refresh just in case
-    imported_models = import_all_models_once(models_pkg)
+    # Import models via canonical path, legacy shims already installed.
+    imported_models = import_all_models_once(PKGS["models"])
     logger.info("Models imported canonically: %s", imported_models)
 
-    # 1) DB test
+    # DB test
     db_ok, db_ms, db_err = _db_ping()
     logger.info(
         "Starting SmartBiz (env=%s, starlette=%s, db=%s, db_ok=%s, db_ms=%.1fms)",
@@ -329,13 +347,13 @@ async def lifespan(app: FastAPI):
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
-    # 2) Create tables if allowed
+    # Create tables if allowed
     if (os.getenv("AUTO_CREATE_TABLES","0").strip().lower() in {"1","true","yes","on"}) or (ENVIRONMENT != "production" and os.getenv("AUTO_CREATE_TABLES") is None):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("Tables verified/created")
 
-    # 3) Check duplicate mappers
+    # Check duplicate mappers
     _fail_on_duplicate_mappers_if_configured()
 
     try:
@@ -344,23 +362,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down SmartBiz")
 
 # ───────────────────────── App ───────────────────────────
-def env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key); return default if v is None else v.strip().lower() in {"1","true","yes","y","on"}
-
-def env_list(key: str) -> List[str]:
-    raw = os.getenv(key, ""); return [x.strip() for x in raw.split(",") if x and x.strip()]
-
-def _uniq(items: Iterable[Optional[str]]) -> List[str]:
-    out, seen = [], set()
-    for x in items:
-        if x and x not in seen: out.append(x); seen.add(x)
-    return out
-
-def _sanitize_db_url(url: str) -> str:
-    if not url: return ""
-    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
-
-_docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
+_docs_enabled = (os.getenv("ENABLE_DOCS","").strip().lower() in {"1","true","yes","on"} or ENVIRONMENT != "production")
 app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
@@ -372,13 +374,13 @@ app = FastAPI(
 )
 
 # Proxy/Host safety
-ENABLE_PROXY_HEADERS = env_bool("ENABLE_PROXY_HEADERS", True)
+ENABLE_PROXY_HEADERS = (os.getenv("ENABLE_PROXY_HEADERS","1").strip().lower() in {"1","true","yes","on"})
 if ENABLE_PROXY_HEADERS and _ProxyHeadersMiddleware:
     app.add_middleware(_ProxyHeadersMiddleware, trusted_hosts="*")
 elif ENABLE_PROXY_HEADERS and not _ProxyHeadersMiddleware:
     logger.warning("ProxyHeadersMiddleware missing (starlette=%s). Using Uvicorn --proxy-headers.", _STARLETTE_VER)
 
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS") or ["*"]
+ALLOWED_HOSTS = [x.strip() for x in (os.getenv("ALLOWED_HOSTS","") or "").split(",") if x.strip()] or ["*"]
 if ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
@@ -390,10 +392,11 @@ def _resolve_cors_origins() -> List[str]:
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ]
-    return _uniq(hardcoded + env_list("CORS_ORIGINS") + env_list("ALLOWED_ORIGINS"))
+    extra = [x.strip() for x in (os.getenv("CORS_ORIGINS","") + "," + os.getenv("ALLOWED_ORIGINS","")).split(",") if x.strip()]
+    return list({*hardcoded, *extra})
 
 ALLOW_ORIGINS = _resolve_cors_origins()
-CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
+CORS_ALLOW_ALL = (os.getenv("CORS_ALLOW_ALL","0").strip().lower() in {"1","true","yes","on"})
 if CORS_ALLOW_ALL:
     app.add_middleware(
         CORSMiddleware,
@@ -418,7 +421,7 @@ else:
 
 # Compression + Security + Request ID + Body-limit
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.add_middleware(SecurityHeadersMiddleware, enable_hsts=env_bool("ENABLE_HSTS", True))
+app.add_middleware(SecurityHeadersMiddleware, enable_hsts=(os.getenv("ENABLE_HSTS","1").strip().lower() in {"1","true","yes","on"}))
 app.add_middleware(RequestIDAndTimingMiddleware)
 max_body = int(os.getenv("MAX_BODY_BYTES", "0") or "0")
 if max_body > 0:
@@ -482,7 +485,7 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 # ───────────────────────── Routes ─────────────────────────
 @app.get("/")
 def root_redirect():
-    return RedirectResponse("/docs" if (os.getenv("ENABLE_DOCS","0").strip().lower() in {"1","true","yes","on"} or ENVIRONMENT!="production") else "/health", status_code=302)
+    return RedirectResponse("/docs" if _docs_enabled else "/health", status_code=302)
 
 @app.get("/health")
 @app.head("/health")
