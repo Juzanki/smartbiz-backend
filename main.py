@@ -25,14 +25,24 @@ from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
-from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+# ── ProxyHeadersMiddleware: optional (older Starlette haina module hii)
+try:
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware as _ProxyHeadersMiddleware  # type: ignore
+except Exception:
+    _ProxyHeadersMiddleware = None  # fallback → rely on Uvicorn --proxy-headers
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
+
+# (hiari) version logging
+try:
+    import starlette as _st
+    _STARLETTE_VER = getattr(_st, "__version__", "?")
+except Exception:
+    _STARLETTE_VER = "?"
 
 # ──────────────────────── DB imports ─────────────────────
 try:
@@ -53,8 +63,7 @@ def _uniq(items: Iterable[Optional[str]]) -> List[str]:
     out, seen = [], set()
     for x in items:
         if x and x not in seen:
-            out.append(x)
-            seen.add(x)
+            out.append(x); seen.add(x)
     return out
 
 def _sanitize_db_url(url: str) -> str:
@@ -142,14 +151,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw xrid=%s", rid)
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        # Security headers
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-        # Hide server signature if possible
         response.headers["Server"] = "SmartBiz"
-        # HSTS (only if enabled and https)
         if self.enable_hsts and (request.url.scheme == "https"):
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
         return response
@@ -189,14 +195,14 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 # ─────────────────────── Lifespan ────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup checks
     db_ok, db_ms, db_err = _db_ping()
-    logger.info("Starting SmartBiz (env=%s, db=%s, db_ok=%s, db_ms=%.1fms)",
-                ENVIRONMENT, _sanitize_db_url(os.getenv("DATABASE_URL", "")), db_ok, db_ms)
+    logger.info(
+        "Starting SmartBiz (env=%s, starlette=%s, db=%s, db_ok=%s, db_ms=%.1fms)",
+        ENVIRONMENT, _STARLETTE_VER, _sanitize_db_url(os.getenv("DATABASE_URL", "")), db_ok, db_ms
+    )
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
-    # Auto create tables (dev by default)
     if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -213,15 +219,22 @@ app = FastAPI(
     title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
     version=os.getenv("APP_VERSION", "1.0.0"),
-    docs_url=None,  # we provide /docs manually if enabled
+    docs_url=None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan,
 )
 
-# Proxy/Host safety (useful on Render)
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS") or ["*"]  # set comma list in prod
+# Proxy/Host safety
+ENABLE_PROXY_HEADERS = env_bool("ENABLE_PROXY_HEADERS", True)
+if ENABLE_PROXY_HEADERS and _ProxyHeadersMiddleware:
+    # Newer Starlette: safe to enable
+    app.add_middleware(_ProxyHeadersMiddleware, trusted_hosts="*")
+elif ENABLE_PROXY_HEADERS and not _ProxyHeadersMiddleware:
+    # Older Starlette → rely on Uvicorn --proxy-headers (Render default)
+    logger.warning("ProxyHeadersMiddleware missing (starlette=%s). Using Uvicorn proxy-headers.", _STARLETTE_VER)
+
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS") or ["*"]
 if ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
@@ -264,7 +277,7 @@ else:
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityHeadersMiddleware, enable_hsts=env_bool("ENABLE_HSTS", True))
 app.add_middleware(RequestIDAndTimingMiddleware)
-max_body = int(os.getenv("MAX_BODY_BYTES", "0") or "0")  # 0 = unlimited
+max_body = int(os.getenv("MAX_BODY_BYTES", "0") or "0")
 if max_body > 0:
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body)
 
@@ -274,17 +287,12 @@ def _import_router(module_path: str):
     return getattr(mod, "router", None)
 
 def _auto_include_routes():
-    """
-    Auto-discover all *_routes.py under backend/routes (or routes) and include router if present.
-    Avoid double prefixes; each router must define its own prefix (e.g., prefix='/auth').
-    """
     candidates: List[str] = []
     search_dirs = [BACKEND_DIR / "routes", ROOT_DIR / "routes"]
     for d in search_dirs:
         if not d.exists():
             continue
         for p in d.glob("*_routes.py"):
-            # build import path like 'backend.routes.auth_routes'
             if d == BACKEND_DIR / "routes":
                 module_path = f"backend.routes.{p.stem}"
             else:
@@ -302,7 +310,6 @@ def _auto_include_routes():
             logger.error("Failed to include router %s: %s", mod, e)
 
     if not included:
-        # Fallback: try known path for auth router
         with suppress(Exception):
             from backend.routes.auth_routes import router as _r1
             app.include_router(_r1)
@@ -334,7 +341,6 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 # ───────────────────────── Routes ─────────────────────────
 @app.get("/")
 def root_redirect():
-    # Prefer health; if docs enabled, redirect to docs for convenience
     return RedirectResponse("/docs" if _docs_enabled else "/health", status_code=302)
 
 @app.get("/health")
@@ -342,7 +348,6 @@ def root_redirect():
 @app.get("/api/health")
 def health():
     db_ok, db_ms, db_err = _db_ping()
-    # dependencies check (useful for /auth/login 500 root-cause)
     try:
         import passlib  # type: ignore
         _passlib = True
@@ -362,6 +367,7 @@ def health():
         "ts": time.time(),
         "env": {
             "environment": ENVIRONMENT,
+            "starlette": _STARLETTE_VER,
             "app_version": os.getenv("APP_VERSION", "1.0.0"),
             "log_json": LOG_JSON,
             "allowed_hosts": ALLOWED_HOSTS,
