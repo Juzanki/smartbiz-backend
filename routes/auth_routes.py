@@ -10,7 +10,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import jwt  # MUST be PyJWT, not the 'jwt' stub package
+# ──────────────────────────────────────────────────────────────────────
+# Third-party deps
+# ──────────────────────────────────────────────────────────────────────
+# MUST be PyJWT (pip install PyJWT) — not the 'jwt' stub package
+import jwt  # type: ignore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import or_
@@ -34,14 +38,14 @@ except Exception:  # pragma: no cover
 # ──────────────────────────────────────────────────────────────────────
 # Security helpers (hash/verify)
 # ──────────────────────────────────────────────────────────────────────
+# Priority: your project util → fallback: passlib[bcrypt]
 try:
     from backend.utils.security import verify_password, get_password_hash  # type: ignore
 except Exception:
     try:
         from utils.security import verify_password, get_password_hash  # type: ignore
     except Exception:
-        from passlib.context import CryptContext
-
+        from passlib.context import CryptContext  # type: ignore
         _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
         def get_password_hash(pw: str) -> str:
@@ -58,11 +62,11 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    # Dev-only fallback; set SECRET_KEY/JWT_SECRET in production.
+    # Dev fallback (DON'T use in prod): generate ephemeral secret
     SECRET_KEY = base64.urlsafe_b64encode(os.urandom(48)).decode()
 
 JWT_ALG = os.getenv("JWT_ALG", os.getenv("JWT_ALGORITHM", "HS256"))
-ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # default 60 min
+ACCESS_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))  # default 60
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -71,21 +75,15 @@ def _secs(minutes: int) -> int:
     return int(timedelta(minutes=minutes).total_seconds())
 
 def _ensure_str(x: Any) -> str:
-    if isinstance(x, bytes):
-        return x.decode("utf-8")
-    return str(x)
+    return x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
 
 def _check_pyjwt_health() -> None:
-    """
-    Warn loudly if the wrong 'jwt' library is installed,
-    or if encode/decode are not functioning.
-    """
     lg = logging.getLogger("smartbiz.auth")
     try:
         t = jwt.encode({"t": 1, "iat": int(_now().timestamp())}, SECRET_KEY, algorithm=JWT_ALG)
         jwt.decode(t, SECRET_KEY, algorithms=[JWT_ALG])
     except Exception as e:
-        lg.error("PyJWT self-check failed. Ensure 'PyJWT' is installed (not the 'jwt' stub). Error: %s", e)
+        lg.error("PyJWT self-check failed: ensure 'PyJWT' is installed. Error: %s", e)
 
 _check_pyjwt_health()
 
@@ -124,8 +122,11 @@ COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "sb_access")
 COOKIE_MAX_AGE = int(os.getenv("AUTH_COOKIE_MAX_AGE", str(7 * 24 * 3600)))  # 7 days
 COOKIE_PATH = os.getenv("AUTH_COOKIE_PATH", "/")
 COOKIE_SECURE = _flag("AUTH_COOKIE_SECURE", "true")
-COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "none")  # 'lax' | 'strict' | 'none'
+COOKIE_SAMESITE = (os.getenv("AUTH_COOKIE_SAMESITE", "none") or "none").lower()  # 'lax'|'strict'|'none'
 COOKIE_DOMAIN = (os.getenv("AUTH_COOKIE_DOMAIN") or "").strip() or None
+# If SameSite=None, browsers require Secure
+if COOKIE_SAMESITE == "none":
+    COOKIE_SECURE = True
 
 ALLOW_PHONE_LOGIN = _flag("AUTH_LOGIN_ALLOW_PHONE", "false")
 DIAG_AUTH_ENABLED = _flag("DIAG_AUTH_ENABLED", "false")
@@ -177,7 +178,7 @@ def _norm_phone(s: Optional[str]) -> str:
 def _has_column(model, name: str) -> bool:
     """
     Robustly check if a SQLAlchemy mapped column exists on a model.
-    Uses SA inspection first, then falls back to __table__ and hasattr.
+    Works across SA 1.4/2.0 and avoids AttributeError→500.
     """
     try:
         mapper = sa_inspect(model)
@@ -188,7 +189,7 @@ def _has_column(model, name: str) -> bool:
     except Exception:
         pass
     try:
-        return name in model.__table__.c  # SA 1.4/2.0 mapped table
+        return name in model.__table__.c
     except Exception:
         return hasattr(model, name)
 
@@ -232,16 +233,18 @@ class RegisterRequest(BaseModel):
 
 class UserOut(BaseModel):
     id: int
-    email: EmailStr
+    email: Optional[EmailStr] = None
     username: Optional[str] = None
     full_name: Optional[str] = None
     is_active: Optional[bool] = True
 
     @staticmethod
     def from_orm_user(u) -> "UserOut":
+        # Email/username may be absent on some schemas — fill safely
+        email_val = getattr(u, "email", None)
         return UserOut(
             id=int(getattr(u, "id")),
-            email=getattr(u, "email"),
+            email=email_val if email_val else None,
             username=getattr(u, "username", None),
             full_name=getattr(u, "full_name", None),
             is_active=getattr(u, "is_active", True),
@@ -254,13 +257,12 @@ class AuthResponse(BaseModel):
     user: UserOut
 
 # ──────────────────────────────────────────────────────────────────────
-# Query helpers (COLUMN-SAFE; fixes 500s from missing attributes)
+# Query helpers (COLUMN-SAFE; prevents 500s)
 # ──────────────────────────────────────────────────────────────────────
 def _find_user_by_identifier(db: Session, ident: str):
     """
     Look up by email/username/phone ONLY if those columns exist.
-    This prevents AttributeError → 500 crashes on deployments where
-    'username' or phone fields are absent.
+    Prevents crashes when username/phone columns aren't present.
     """
     ident = (ident or "").strip()
     if not ident:
@@ -278,7 +280,7 @@ def _find_user_by_identifier(db: Session, ident: str):
     if username_col is not None:
         conds.append(username_col == ident)
 
-    # Optional phone fields (first present)
+    # Optional phone fields
     if ALLOW_PHONE_LOGIN:
         phone_norm = _norm_phone(ident)
         if phone_norm:
@@ -289,7 +291,6 @@ def _find_user_by_identifier(db: Session, ident: str):
                     break
 
     if not conds:
-        # No identifier columns on model — return a clear, actionable error
         logger.error("User model has no identifier columns (email/username/phone). Check models & migrations.")
         raise HTTPException(status_code=500, detail="user_model_missing_identifier_columns")
 
@@ -298,7 +299,6 @@ def _find_user_by_identifier(db: Session, ident: str):
 def _precheck_duplicates(db: Session, email: str, username: str) -> None:
     email_col = _safe_col(User, "email")
     if email_col is None:
-        # If the model doesn't even have email, registration cannot proceed coherently
         logger.error("User model has no 'email' column; registration cannot validate uniqueness.")
         raise HTTPException(status_code=500, detail="user_model_missing_email_column")
 
@@ -321,7 +321,7 @@ def _maybe_set_cookie(response: Response, token: str) -> None:
         value=token,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
+        samesite=COOKIE_SAMESITE,  # none|lax|strict
         max_age=COOKIE_MAX_AGE,
         path=COOKIE_PATH,
         domain=COOKIE_DOMAIN,
@@ -332,6 +332,9 @@ def _extract_token(request: Request) -> Optional[str]:
     if auth and auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
     return request.cookies.get(COOKIE_NAME) if USE_COOKIE_AUTH else None
+
+def _req_id(req: Request) -> str:
+    return getattr(getattr(req, "state", None), "request_id", None) or req.headers.get("x-request-id") or "-"
 
 # ──────────────────────────────────────────────────────────────────────
 # Dependencies
@@ -345,7 +348,7 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_token_type")
     sub = data.get("sub")
     if not sub:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_token_payload")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_sub")
 
     try:
         uid = int(sub)
@@ -377,7 +380,9 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
 
     _precheck_duplicates(db, email, username)
 
-    user_kwargs = {"email": email}
+    user_kwargs = {}
+    if _has_column(User, "email"):
+        user_kwargs["email"] = email
     if _has_column(User, "username"):
         user_kwargs["username"] = username
     if _has_column(User, "full_name"):
@@ -402,10 +407,12 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
         logger.exception("register_failed")
         raise HTTPException(status_code=500, detail="register_failed")
 
-    claims = {"sub": user.id, "email": user.email}
-    un = getattr(user, "username", None)
-    if un:
-        claims["username"] = un
+    claims: Dict[str, Any] = {"sub": getattr(user, "id")}
+    if _has_column(User, "email"):
+        claims["email"] = getattr(user, "email", None)
+    if _has_column(User, "username"):
+        claims["username"] = getattr(user, "username", None)
+
     token, expires_in = create_access_token(claims)
     _maybe_set_cookie(response, token)
 
@@ -420,16 +427,15 @@ def register(payload: RegisterRequest, response: Response, db: Session = Depends
 async def login(request: Request, response: Response, db: Session = Depends(get_db)):
     """
     Accepts:
-      - JSON:   { email_or_username | username | email | identifier, password }
-      - FORM:   username/email_or_username/email/identifier + password
+      - JSON: { email_or_username | username | email | identifier, password }
+      - FORM: username/email_or_username/email/identifier + password
+    Returns 400 for bad JSON/missing fields, 401 for bad credentials, no 500s.
     """
+    ct = (request.headers.get("content-type") or "").lower()
+    ident = ""
+    password = ""
     try:
-        ct = (request.headers.get("content-type") or "").lower()
-        ident = ""
-        password = ""
-
         if "json" in ct:
-            # Strict JSON parsing → return 400 (not 500) on bad JSON
             try:
                 raw = await request.json()
             except Exception:
@@ -442,7 +448,6 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
                      or "").strip()
             password = str(data.get("password") or "")
         else:
-            # FORM (x-www-form-urlencoded or multipart)
             try:
                 form = await request.form()
             except Exception:
@@ -459,12 +464,13 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
         if not ident or not password:
             raise HTTPException(status_code=400, detail="missing_credentials")
 
-        # IP-scoped rate limit
+        # Simple IP+identifier rate limit
         ip = (request.client.host if request.client else "unknown").strip()
         rl_key = f"{ip}|{ident[:24]}"
         if not _rate_ok(rl_key):
             raise HTTPException(status_code=429, detail="too_many_requests")
 
+        # Find user using column-safe logic
         user = _find_user_by_identifier(db, ident)
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
@@ -476,10 +482,11 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
         if hasattr(user, "is_active") and not getattr(user, "is_active"):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_inactive")
 
-        claims = {"sub": user.id, "email": user.email}
-        un = getattr(user, "username", None)
-        if un:
-            claims["username"] = un
+        claims: Dict[str, Any] = {"sub": getattr(user, "id")}
+        if _has_column(User, "email"):
+            claims["email"] = getattr(user, "email", None)
+        if _has_column(User, "username"):
+            claims["username"] = getattr(user, "username", None)
 
         token, expires_in = create_access_token(claims)
         token = _ensure_str(token)
@@ -493,10 +500,11 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
     except HTTPException:
         raise
     except Exception:
-        # Richer context for Render/Cloudflare log correlation
+        # Rich context for correlation on Render
         try:
+            xrid = _req_id(request)
             ip = (request.client.host if request.client else "unknown").strip()
-            logger.exception("login_crashed ct='%s' ident_preview='%s' ip='%s'", ct, ident[:12], ip)
+            logger.exception("login_crashed ct='%s' ident_preview='%s' ip='%s' xrid=%s", ct, ident[:12], ip, xrid)
         except Exception:
             logger.exception("login_crashed")
         raise HTTPException(status_code=500, detail="server_error_login")
