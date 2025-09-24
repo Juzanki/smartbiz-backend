@@ -17,23 +17,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt  # type: ignore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_, text   # ← added text for diag_orm
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.inspection import inspect as sa_inspect
 
 # ──────────────────────────────────────────────────────────────────────
-# DB & Models (layout-safe imports)
+# Canonical DB & Models (avoid double imports)
 # ──────────────────────────────────────────────────────────────────────
-try:
-    from db import get_db  # type: ignore
-except Exception:  # pragma: no cover
-    from backend.db import get_db  # type: ignore
-
-try:
-    from models.user import User  # type: ignore
-except Exception:  # pragma: no cover
-    from backend.models.user import User  # type: ignore
+from backend.db import get_db, Base
+from backend.models.user import User  # canonical path only!
 
 # ──────────────────────────────────────────────────────────────────────
 # Security helpers (hash/verify)
@@ -240,7 +233,6 @@ class UserOut(BaseModel):
 
     @staticmethod
     def from_orm_user(u) -> "UserOut":
-        # Email/username may be absent on some schemas — fill safely
         email_val = getattr(u, "email", None)
         return UserOut(
             id=int(getattr(u, "id")),
@@ -429,7 +421,7 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
     Accepts:
       - JSON: { email_or_username | username | email | identifier, password }
       - FORM: username/email_or_username/email/identifier + password
-    Returns 400 for bad JSON/missing fields, 401 for bad credentials, no 500s.
+    Returns 400 for bad JSON/missing fields, 401 for bad credentials.
     """
     ct = (request.headers.get("content-type") or "").lower()
     ident = ""
@@ -500,7 +492,6 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
     except HTTPException:
         raise
     except Exception:
-        # Rich context for correlation on Render
         try:
             xrid = _req_id(request)
             ip = (request.client.host if request.client else "unknown").strip()
@@ -524,39 +515,27 @@ def logout(response: Response):
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 # ──────────────────────────────────────────────────────────────────────
-# Optional diagnostics (enable with DIAG_AUTH_ENABLED=1)
+# Diagnostics (enable with DIAG_AUTH_ENABLED=1)
 # ──────────────────────────────────────────────────────────────────────
 @router.get("/_diag_model")
 def diag_model():
     if not DIAG_AUTH_ENABLED:
         raise HTTPException(status_code=404, detail="not_enabled")
     fields = (
-        "id",
-        "email",
-        "username",
-        "phone",
-        "phone_number",
-        "msisdn",
-        "password",
-        "password_hash",
-        "hashed_password",
-        "is_active",
-        "full_name",
-        "created_at",
-        "updated_at",
+        "id", "email", "username",
+        "phone", "phone_number", "msisdn",
+        "password", "password_hash", "hashed_password",
+        "is_active", "full_name",
+        "created_at", "updated_at",
     )
     present = {name: bool(_has_column(User, name)) for name in fields}
     return {"model": "User", "columns_present": present}
 
 @router.get("/_diag_orm")
 def diag_orm(db: Session = Depends(get_db)):
-    """
-    Dev-only: hukagua kama class User imemapishwa na ORM na kama DB iko reachable.
-    Weka DIAG_AUTH_ENABLED=1 ili itumike.
-    """
     if not DIAG_AUTH_ENABLED:
         raise HTTPException(status_code=404, detail="not_enabled")
-    from sqlalchemy.orm import inspect as _insp  # local import to avoid clashes
+    from sqlalchemy.orm import inspect as _insp
     info: Dict[str, Any] = {}
     try:
         m = _insp(User)  # raises kama haijamapishwa
@@ -577,5 +556,28 @@ def diag_orm(db: Session = Depends(get_db)):
         info["module"] = getattr(User, "__module__", "?")
         info["repr"] = repr(User)
     return info
+
+@router.get("/_diag_registry")
+def diag_registry():
+    if not DIAG_AUTH_ENABLED:
+        raise HTTPException(status_code=404, detail="not_enabled")
+
+    names: Dict[str, set[str]] = {}
+    try:
+        for m in Base.registry.mappers:
+            cls = m.class_
+            names.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    duplicates = {k: sorted(v) for k, v in names.items() if len(v) > 1}
+    all_classes = sorted([f for vs in names.values() for f in vs])
+
+    return {
+        "ok": True,
+        "duplicate_names": duplicates,
+        "total_mapped": len(all_classes),
+        "classes": all_classes[:200],
+    }
 
 __all__ = ["router"]
