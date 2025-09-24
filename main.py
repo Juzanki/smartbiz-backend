@@ -21,19 +21,16 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.openapi.docs import (
-    get_swagger_ui_html,
-    get_swagger_ui_oauth2_redirect_html,
-)
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-# ── ProxyHeadersMiddleware: optional (older Starlette haina module hii)
+# Proxy headers: ipo kwenye Starlette mpya tu
 try:
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware as _ProxyHeadersMiddleware  # type: ignore
 except Exception:
-    _ProxyHeadersMiddleware = None  # fallback → rely on Uvicorn --proxy-headers
+    _ProxyHeadersMiddleware = None
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
 
@@ -53,7 +50,7 @@ except Exception:
 # ───────────────────── Env helpers ───────────────────────
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
-    return default if v is None else v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default if v is None else v.strip().lower() in {"1","true","yes","y","on"}
 
 def env_list(key: str) -> List[str]:
     raw = os.getenv(key, "")
@@ -151,13 +148,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         except Exception:
             logger.exception("security-mw xrid=%s", rid)
             return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        response.headers.setdefault("X-Content-Type-Options","nosniff")
+        response.headers.setdefault("X-Frame-Options","DENY")
+        response.headers.setdefault("Referrer-Policy","strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy","geolocation=(), microphone=(), camera=()")
         response.headers["Server"] = "SmartBiz"
         if self.enable_hsts and (request.url.scheme == "https"):
-            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+            response.headers.setdefault("Strict-Transport-Security","max-age=31536000; includeSubDomains; preload")
         return response
 
 class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
@@ -171,7 +168,7 @@ class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
             response = Response(status_code=499)
         except Exception:
             logger.exception("unhandled xrid=%s", rid)
-            response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+            response = JSONResponse(status_code=500, content={"detail":"Internal Server Error"})
         dur_ms = (time.perf_counter() - t0) * 1000.0
         response.headers["x-request-id"] = rid
         response.headers["x-process-time-ms"] = f"{int(dur_ms)}"
@@ -192,6 +189,28 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
         return await call_next(request)
 
+# ─────────────────── Model autoload (NEW) ───────────────────
+def _import_models_for_mappers() -> None:
+    """
+    Hakikisha maklasses za SQLAlchemy zime-load kabla ya create_all.
+    Tunajaribu packages zote mbili: 'models' na 'backend.models'.
+    Pia tuna-scan *.py ndani ya folda ya models.
+    """
+    # Direct hits first
+    for mp in ("models", "models.user", "backend.models", "backend.models.user"):
+        with suppress(Exception):
+            __import__(mp)
+
+    # Scan kwa upana
+    for d, prefix in [(BACKEND_DIR / "models", "backend.models"), (ROOT_DIR / "models", "models")]:
+        if d.exists():
+            for p in d.glob("*.py"):
+                if p.name.startswith("_"):
+                    continue
+                mod_path = f"{prefix}.{p.stem}"
+                with suppress(Exception):
+                    __import__(mod_path)
+
 # ─────────────────────── Lifespan ────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -203,6 +222,11 @@ async def lifespan(app: FastAPI):
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
+    # 1) PAKIA MODELS KABLA YA KUJENGA JEDWALI (MUHIMU!)
+    with suppress(Exception):
+        _import_models_for_mappers()
+
+    # 2) Unda/ihakiki jedwali
     if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -216,9 +240,9 @@ async def lifespan(app: FastAPI):
 # ───────────────────────── App ───────────────────────────
 _docs_enabled = env_bool("ENABLE_DOCS", ENVIRONMENT != "production")
 app = FastAPI(
-    title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
+    title=os.getenv("APP_NAME","SmartBiz Assistance API"),
     description="SmartBiz Assistance Backend (Render + Netlify)",
-    version=os.getenv("APP_VERSION", "1.0.0"),
+    version=os.getenv("APP_VERSION","1.0.0"),
     docs_url=None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
@@ -228,11 +252,9 @@ app = FastAPI(
 # Proxy/Host safety
 ENABLE_PROXY_HEADERS = env_bool("ENABLE_PROXY_HEADERS", True)
 if ENABLE_PROXY_HEADERS and _ProxyHeadersMiddleware:
-    # Newer Starlette: safe to enable
     app.add_middleware(_ProxyHeadersMiddleware, trusted_hosts="*")
 elif ENABLE_PROXY_HEADERS and not _ProxyHeadersMiddleware:
-    # Older Starlette → rely on Uvicorn --proxy-headers (Render default)
-    logger.warning("ProxyHeadersMiddleware missing (starlette=%s). Using Uvicorn proxy-headers.", _STARLETTE_VER)
+    logger.warning("ProxyHeadersMiddleware missing (starlette=%s). Using Uvicorn --proxy-headers.", _STARLETTE_VER)
 
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS") or ["*"]
 if ALLOWED_HOSTS != ["*"]:
@@ -293,10 +315,7 @@ def _auto_include_routes():
         if not d.exists():
             continue
         for p in d.glob("*_routes.py"):
-            if d == BACKEND_DIR / "routes":
-                module_path = f"backend.routes.{p.stem}"
-            else:
-                module_path = f"routes.{p.stem}"
+            module_path = f"backend.routes.{p.stem}" if d == BACKEND_DIR / "routes" else f"routes.{p.stem}"
             candidates.append(module_path)
 
     included = []
