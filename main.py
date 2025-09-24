@@ -1,7 +1,7 @@
 # backend/main.py
 from __future__ import annotations
 
-import os, sys, re, json, time, uuid, logging, importlib
+import os, sys, re, json, time, uuid, logging, importlib, importlib.util, pkgutil, types
 from pathlib import Path
 from contextlib import asynccontextmanager, suppress
 from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple
@@ -26,7 +26,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-# Proxy headers: ipo kwenye Starlette mpya tu
 try:
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware as _ProxyHeadersMiddleware  # type: ignore
 except Exception:
@@ -34,16 +33,139 @@ except Exception:
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, Response, RedirectResponse
 
-# (hiari) version logging
 try:
     import starlette as _st
     _STARLETTE_VER = getattr(_st, "__version__", "?")
 except Exception:
     _STARLETTE_VER = "?"
 
-# ──────────────────────── DB imports ─────────────────────
+# ─────────────────────── Logging ─────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_JSON  = (os.getenv("LOG_JSON","0").strip().lower() in {"1","true","yes","on"})
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "lvl": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+root_logger = logging.getLogger()
+root_logger.handlers = [_handler]
+root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("smartbiz.main")
+
+ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
+
+# ─────────────────────── Canonical imports ───────────────────────
+def _find(spec: str) -> bool:
+    with suppress(Exception):
+        return importlib.util.find_spec(spec) is not None
+    return False
+
+def _hard_alias(name: str, module_obj) -> None:
+    """Force sys.modules[name] to point to the same module object."""
+    sys.modules[name] = module_obj
+
+def ensure_canonical_packages() -> dict:
+    """
+    Enforce ONE canonical path for packages:
+      - models: prefer 'backend.models' if exists, else 'models'
+      - routes: prefer 'backend.routes' if exists, else 'routes'
+    Cross-alias the other path to the SAME module object to avoid double imports.
+    Also ensure a concrete 'backend' package if missing (for local layout).
+    """
+    out: Dict[str, str] = {}
+
+    # ensure 'backend' package object
+    if "backend" not in sys.modules:
+        backend_pkg = types.ModuleType("backend")
+        backend_pkg.__path__ = [str(BACKEND_DIR)]
+        sys.modules["backend"] = backend_pkg
+
+    # MODELS
+    models_canon = "backend.models" if _find("backend.models") else "models"
+    alt_models   = "models" if models_canon == "backend.models" else "backend.models"
+    models_mod   = importlib.import_module(models_canon)  # may create package from folder
+    _hard_alias(alt_models, models_mod)
+    _hard_alias("models", models_mod)
+    _hard_alias("backend.models", models_mod)
+    out["models"] = models_canon
+
+    # ROUTES
+    routes_canon = "backend.routes" if _find("backend.routes") else "routes"
+    alt_routes   = "routes" if routes_canon == "backend.routes" else "backend.routes"
+    # create package module if not present and folder exists
+    try:
+        routes_mod = importlib.import_module(routes_canon)
+    except Exception:
+        # create empty package object to allow dynamic imports later
+        routes_mod = types.ModuleType(routes_canon.split(".")[0] if "." not in routes_canon else routes_canon)
+        routes_mod.__path__ = [str(BACKEND_DIR / "routes")]
+    _hard_alias(alt_routes, routes_mod)
+    _hard_alias("routes", routes_mod)
+    _hard_alias("backend.routes", routes_mod)
+    out["routes"] = routes_canon
+
+    logger.info("Canonical packages => models=%s routes=%s", out["models"], out["routes"])
+    return out
+
+def import_all_models_once(models_pkg_name: str) -> list[str]:
+    """
+    Import *all* model modules exactly once via the canonical package.
+    Returns the list of imported module paths.
+    """
+    imported: list[str] = []
+    pkg = importlib.import_module(models_pkg_name)
+    # walk through the actual package path (folder)
+    for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
+        name = mod.name
+        base = name.rsplit(".", 1)[-1]
+        if base.startswith("_"):
+            continue
+        if name in sys.modules:
+            # already imported (good; single object)
+            imported.append(name)
+            continue
+        try:
+            importlib.import_module(name)
+            imported.append(name)
+        except Exception as e:
+            logger.error("Model import failed: %s -> %s", name, e)
+    return imported
+
+def _log_mapper_duplicates(Base_obj) -> Dict[str, List[str]]:
+    """Return dict of duplicates {ClassName: [module.paths...]}, log if any."""
+    dups: Dict[str, List[str]] = {}
+    try:
+        name_map: Dict[str, set[str]] = {}
+        for m in Base_obj.registry.mappers:
+            c = m.class_
+            name_map.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
+        for k, v in name_map.items():
+            if len(v) > 1:
+                dups[k] = sorted(v)
+        if dups:
+            logger.error("SQLAlchemy duplicate mappers detected: %s", dups)
+        else:
+            logger.info("SQLAlchemy mappers OK (no duplicates)")
+    except Exception as e:
+        logger.warning("duplicate-check failed: %s", e)
+    return dups
+
+# ─────────────────────── DB imports (after canonical) ───────────────────────
+# NOTE: we call canonicalizer first to prevent early imports from splitting packages.
+PKGS = ensure_canonical_packages()
+
 try:
-    from backend.db import Base, SessionLocal, engine
+    from backend.db import Base, SessionLocal, engine  # type: ignore
 except Exception:
     from db import Base, SessionLocal, engine  # type: ignore
 
@@ -68,32 +190,7 @@ def _sanitize_db_url(url: str) -> str:
         return ""
     return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
 
-ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").lower()
-
-# ─────────────────────── Logging ─────────────────────────
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_JSON = env_bool("LOG_JSON", False)
-
-class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "lvl": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
-        if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(_JsonFormatter() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-root_logger = logging.getLogger()
-root_logger.handlers = [_handler]
-root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-logger = logging.getLogger("smartbiz.main")
-
-# ─────────────── User table introspection ────────────────
+# ─────────────── User table introspection (optional) ───────────────
 USER_TABLE = os.getenv("USER_TABLE", "users")
 PW_COL = os.getenv("SMARTBIZ_PWHASH_COL", "password_hash")
 _USERS_COLS: Optional[set[str]] = None
@@ -138,7 +235,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: FastAPI, *, enable_hsts: bool = False):
         super().__init__(app)
         self.enable_hsts = enable_hsts
-
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         rid = request.headers.get("x-request-id") or "-"
         try:
@@ -176,11 +272,8 @@ class RequestIDAndTimingMiddleware(BaseHTTPMiddleware):
         return response
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose Content-Length exceeds MAX_BODY_BYTES (optional)."""
     def __init__(self, app: FastAPI, max_bytes: int):
-        super().__init__(app)
-        self.max_bytes = max(0, int(max_bytes))
-
+        super().__init__(app); self.max_bytes = max(0, int(max_bytes))
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if self.max_bytes > 0:
             cl = request.headers.get("content-length")
@@ -189,112 +282,22 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
         return await call_next(request)
 
-# ================== Robust aliasing to tolerate both layouts ==================
-with suppress(Exception):
-    import types
-    # Seed plain packages when folders exist
-    if (BACKEND_DIR / "routes").exists():
-        try:
-            sys.modules.setdefault("routes", importlib.import_module("routes"))
-        except Exception:
-            pass
-    if (BACKEND_DIR / "models").exists():
-        try:
-            sys.modules.setdefault("models", importlib.import_module("models"))
-        except Exception:
-            pass
-    # Ensure a real 'backend' package object
-    if "backend" not in sys.modules:
-        backend_pkg = types.ModuleType("backend")
-        backend_pkg.__path__ = [str(BACKEND_DIR)]
-        sys.modules["backend"] = backend_pkg
-    # Cross-alias subpackages
-    if "routes" in sys.modules:
-        sys.modules.setdefault("backend.routes", sys.modules["routes"])
-    if "models" in sys.modules:
-        sys.modules.setdefault("backend.models", sys.modules["models"])
-
-with suppress(Exception):
-    if "backend.models" in sys.modules:
-        sys.modules.setdefault("models", sys.modules["backend.models"])
-with suppress(Exception):
-    if "backend.routes" in sys.modules:
-        sys.modules.setdefault("routes", sys.modules["backend.routes"])
-# ==============================================================================
-
 # ─────────────────────── Lifespan helpers ───────────────────────
-def _import_all_models_canonically() -> list[str]:
-    """
-    Load all SQLAlchemy models from the models package using ONE canonical path.
-    - If 'backend.models' exists, use it and alias 'models' -> that module.
-    - Else use 'models', and alias 'backend.models' -> that module.
-    Returns the list of imported module paths.
-    """
-    imported: list[str] = []
-    models_dir = BACKEND_DIR / "models"
-    if not models_dir.exists():
-        logger.warning("No models directory found at %s", models_dir)
-        return imported
+def _fail_on_duplicate_mappers_if_configured() -> None:
+    from sqlalchemy.orm import declarative_base  # noqa: F401
+    dups = _log_mapper_duplicates(Base)
+    if dups and env_bool("FAIL_ON_DUP_MAPPERS", True):
+        # Fail fast to surface the bug early
+        raise RuntimeError(f"Duplicate ORM mappers detected: {dups}")
 
-    # 1) Pick canonical package path
-    canonical_pkg = None
-    canonical_prefix = ""
-    try:
-        canonical_pkg = importlib.import_module("backend.models")
-        canonical_prefix = "backend.models"
-        # Alias plain 'models' to the same module object
-        sys.modules.setdefault("models", canonical_pkg)
-    except Exception:
-        try:
-            canonical_pkg = importlib.import_module("models")
-            canonical_prefix = "models"
-            # Alias 'backend.models' to the same module object
-            sys.modules.setdefault("backend.models", canonical_pkg)
-        except Exception as e:
-            logger.error("Failed to import models package: %s", e)
-            return imported
-
-    logger.info("Models canonical package in use: %s", canonical_prefix)
-
-    # 2) Import each module exactly once via the canonical prefix
-    for f in sorted(models_dir.glob("*.py")):
-        name = f.stem
-        if name.startswith("_"):
-            continue
-        mod_path = f"{canonical_prefix}.{name}"
-        try:
-            importlib.import_module(mod_path)
-            imported.append(mod_path)
-        except Exception as e:
-            logger.error("Failed to import model %s: %s", mod_path, e)
-
-    # 3) Final safety: ensure both names resolve to same package object
-    try:
-        sys.modules.setdefault("models", sys.modules[canonical_prefix])
-        sys.modules.setdefault("backend.models", sys.modules[canonical_prefix])
-    except Exception:
-        pass
-
-    return imported
-
-def _log_mapper_duplicates() -> None:
-    """Ongeza ufuatiliaji: toa onyo kama kuna majina ya mappers yamejirudia."""
-    try:
-        name_map: Dict[str, set[str]] = {}
-        for m in Base.registry.mappers:
-            cls = m.class_
-            name_map.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
-        dups = {k: sorted(v) for k, v in name_map.items() if len(v) > 1}
-        if dups:
-            logger.error("SQLAlchemy duplicate mappers detected: %s", dups)
-        else:
-            logger.info("SQLAlchemy mappers OK (no duplicate names)")
-    except Exception as e:
-        logger.debug("mapper-duplicate-check skipped: %s", e)
-
-# ─────────────────────── Lifespan ────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 0) Canonicalize packages early (already done at import-time), then import models once
+    models_pkg = PKGS["models"]
+    imported_models = import_all_models_once(models_pkg)
+    logger.info("Models imported canonically: %s", imported_models)
+
+    # 1) DB test
     db_ok, db_ms, db_err = _db_ping()
     logger.info(
         "Starting SmartBiz (env=%s, starlette=%s, db=%s, db_ok=%s, db_ms=%.1fms)",
@@ -303,20 +306,14 @@ async def lifespan(app: FastAPI):
     if not db_ok:
         logger.error("Database connection failed at startup (%s)", db_err)
 
-    # 1) Pakia models kwa njia moja tu (canonical) kabla ya create_all
-    with suppress(Exception):
-        imported_models = _import_all_models_canonically()
-        logger.info("Models imported: %s", imported_models)
-
-    # 2) Unda/ihakiki jedwali
-    if env_bool("AUTO_CREATE_TABLES", ENVIRONMENT != "production"):
+    # 2) Create tables if allowed
+    if (os.getenv("AUTO_CREATE_TABLES","0").strip().lower() in {"1","true","yes","on"}) or (ENVIRONMENT != "production" and os.getenv("AUTO_CREATE_TABLES") is None):
         with suppress(Exception):
             Base.metadata.create_all(bind=engine, checkfirst=True)
             logger.info("Tables verified/created")
 
-    # 3) Angalia marudio ya mappers
-    with suppress(Exception):
-        _log_mapper_duplicates()
+    # 3) Check duplicate mappers
+    _fail_on_duplicate_mappers_if_configured()
 
     try:
         yield
@@ -358,7 +355,6 @@ def _resolve_cors_origins() -> List[str]:
 
 ALLOW_ORIGINS = _resolve_cors_origins()
 CORS_ALLOW_ALL = env_bool("CORS_ALLOW_ALL", False)
-
 if CORS_ALLOW_ALL:
     app.add_middleware(
         CORSMiddleware,
@@ -389,80 +385,45 @@ max_body = int(os.getenv("MAX_BODY_BYTES", "0") or "0")
 if max_body > 0:
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=max_body)
 
-# ───────────────────── Include Routers ───────────────────
+# ───────────────────── Include Routers (canonical) ───────────────────
 def _import_router(module_path: str):
     mod = __import__(module_path, fromlist=["router"])
     return getattr(mod, "router", None)
 
 def _auto_include_routes():
-    candidates: List[str] = []
-    search_dirs = [BACKEND_DIR / "routes", ROOT_DIR / "routes"]
-    for d in search_dirs:
-        if not d.exists():
-            continue
-        for p in d.glob("*_routes.py"):
-            module_path = f"backend.routes.{p.stem}" if d == BACKEND_DIR / "routes" else f"routes.{p.stem}"
-            candidates.append(module_path)
-
     included = []
-    for mod in candidates:
-        try:
-            r = _import_router(mod)
-            if r is not None:
-                app.include_router(r)
-                included.append(mod)
-        except Exception as e:
-            logger.error("Failed to include router %s: %s", mod, e)
+    routes_pkg = PKGS["routes"]
+    try:
+        pkg = importlib.import_module(routes_pkg)
+        for mod in pkgutil.walk_packages(pkg.__path__, prefix=pkg.__name__ + "."):
+            name = mod.name.rsplit(".", 1)[-1]
+            if not name.endswith("_routes"):
+                continue
+            try:
+                r = _import_router(mod.name)
+                if r is not None:
+                    app.include_router(r)
+                    included.append(mod.name)
+            except Exception as e:
+                logger.error("Failed to include router %s: %s", mod.name, e)
+    except Exception as e:
+        logger.error("Routes scan failed: %s", e)
 
-    if not included:
-        with suppress(Exception):
-            from backend.routes.auth_routes import router as _r1
-            app.include_router(_r1)
-            included.append("backend.routes.auth_routes")
-        with suppress(Exception):
-            from routes.auth_routes import router as _r2
-            app.include_router(_r2)
-            included.append("routes.auth_routes")
-
-    logger.info("Routers included: %s", included or [])
-
-# -------- EXTRA: Router bootstrap (phase 2 via whitelist) --------
-def _import_router_variants(name: str):
-    """
-    Jaribu import routes.<name> kisha backend.routes.<name>.
-    Inarudisha (router, origin_module) au (None, None)
-    """
-    for mod in (f"routes.{name}", f"backend.routes.{name}"):
-        try:
-            pkg = __import__(mod, fromlist=["router"])
-            return getattr(pkg, "router", None), mod
-        except Exception:
-            continue
-    return None, None
-
-def _include_whitelisted_routes():
-    """
-    Whitelist ya ziada kupitia env ENABLED_ROUTERS (comma-separated).
-    Mfano: ENABLED_ROUTERS=auth_routes,comment_routes
-    """
+    # Whitelist ya ziada
     names = [x.strip() for x in os.getenv("ENABLED_ROUTERS", "auth_routes").split(",") if x.strip()]
-    included2 = []
     for name in names:
-        r, origin = _import_router_variants(name)
-        if r is None:
-            logger.error("Whitelist include failed for %s (tried routes.%s / backend.routes.%s)", name, name, name)
-            continue
-        try:
-            app.include_router(r)
-            included2.append(origin or name)
-        except Exception as e:
-            logger.error("Whitelist include crashed for %s from %s: %s", name, origin, e)
-    if included2:
-        logger.info("Whitelist routers included (phase2): %s", included2)
-# ------------------------------------------------------------------
+        for cand in (f"{routes_pkg}.{name}", f"{routes_pkg}.{name.removesuffix('.py')}"):
+            try:
+                r = _import_router(cand)
+                if r is not None and cand not in included:
+                    app.include_router(r); included.append(cand)
+                    break
+            except Exception:
+                continue
+
+    logger.info("Routers included: %s", included)
 
 _auto_include_routes()
-_include_whitelisted_routes()  # inaongeza juu ya ya awali bila kubadilisha chochote
 
 # ───────────────── Global error handlers ─────────────────
 @app.exception_handler(HTTPException)
@@ -482,7 +443,7 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 # ───────────────────────── Routes ─────────────────────────
 @app.get("/")
 def root_redirect():
-    return RedirectResponse("/docs" if _docs_enabled else "/health", status_code=302)
+    return RedirectResponse("/docs" if (os.getenv("ENABLE_DOCS","0").strip().lower() in {"1","true","yes","on"} or ENVIRONMENT!="production") else "/health", status_code=302)
 
 @app.get("/health")
 @app.head("/health")
@@ -511,9 +472,6 @@ def health():
             "starlette": _STARLETTE_VER,
             "app_version": os.getenv("APP_VERSION", "1.0.0"),
             "log_json": LOG_JSON,
-            "allowed_hosts": ALLOWED_HOSTS,
-            "cors_allow_all": CORS_ALLOW_ALL,
-            "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["*"],
             "db_url": _sanitize_db_url(os.getenv("DATABASE_URL", "")),
             "git_sha": git_sha,
         },
@@ -530,53 +488,23 @@ def health_db(db: Session = Depends(get_db)):
         logger.exception("DB health failed")
         return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=500)
 
-# CORS diagnostics (optional)
 @app.get("/auth/_diag_cors")
 async def cors_diag(request: Request):
     return {
         "origin_header": request.headers.get("origin"),
-        "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["* (regex)"],
+        "allowed_origins": _resolve_cors_origins() if not CORS_ALLOW_ALL else ["* (regex)"],
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
 
-# ================== EXTRA: Main diagnostics ==================
-DIAG_MAIN_ENABLED = env_bool("DIAG_MAIN_ENABLED", False)
-
-@app.get("/_diag/routers")
-def diag_routers():
-    if not DIAG_MAIN_ENABLED:
-        raise HTTPException(status_code=404, detail="not_enabled")
-    paths = sorted({getattr(r, "path", None) for r in app.routes if hasattr(r, "path") and getattr(r, "path")})
-    return {
-        "count": len(paths),
-        "paths": paths[:300],
-        "whitelist": [x.strip() for x in os.getenv("ENABLED_ROUTERS", "auth_routes").split(",") if x.strip()],
-    }
-
+# Diagnostics (duplicates)
 @app.get("/_diag/orm_registry")
 def diag_orm_registry():
-    if not DIAG_MAIN_ENABLED:
-        raise HTTPException(status_code=404, detail="not_enabled")
     try:
-        names: Dict[str, set[str]] = {}
+        info: Dict[str, set[str]] = {}
         for m in Base.registry.mappers:
-            cls = m.class_
-            names.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
-        duplicates = {k: sorted(v) for k, v in names.items() if len(v) > 1}
-        return {
-            "ok": True,
-            "duplicates": duplicates,
-            "total_mapped": sum(len(v) for v in names.values()),
-        }
+            c = m.class_
+            info.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
+        duplicates = {k: sorted(v) for k, v in info.items() if len(v) > 1}
+        return {"ok": True, "duplicates": duplicates, "total_mapped": sum(len(v) for v in info.values())}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-# Docs (optional)
-if _docs_enabled:
-    @app.get("/docs", include_in_schema=False)
-    async def custom_swagger_ui_html():
-        return get_swagger_ui_html(openapi_url=app.openapi_url, title="SmartBiz API Docs")
-
-    @app.get("/docs/oauth2-redirect", include_in_schema=False)
-    async def swagger_ui_redirect():
-        return get_swagger_ui_oauth2_redirect_html()
