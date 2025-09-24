@@ -1,14 +1,24 @@
 # backend/models/live_viewer.py
 # -*- coding: utf-8 -*-
+"""
+Viewer (mtazamaji) wa LiveStream.
+
+- Mstari mmoja "hai" (is_active=true) huruhusiwa kwa (live_stream_id, user_id) AU (live_stream_id, session_key)
+- Inahifadhi IP kwa usiri: ip_hash (daima), client_ip ikiwa STORE_PLAIN_IP=true
+- Ina heartbeats (last_seen_at) na helpers za ku-mark inactive ikiwa stale
+- Ina pointer sahihi kwa LiveStream kwa jina: live_stream (back_populates="viewers" upande wa LS)
+
+KUMBUKA: Hakikisha una "canonical import" ya models (mf. 'backend.models') ili kuepuka double-mapping.
+"""
 from __future__ import annotations
 
+import datetime as dt
 import enum
 import hashlib
 import hmac
 import os
 import re
-import datetime as dt
-from typing import Optional, TYPE_CHECKING, Dict, Any
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -22,52 +32,61 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
-from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.event import listens_for
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
-from backend.db import Base
-from backend.models._types import JSON_VARIANT, as_mutable_json
+# ── Layout-safe Base import ────────────────────────────────────────────────────
+try:
+    from backend.db import Base  # type: ignore
+except Exception:  # pragma: no cover
+    from db import Base  # type: ignore
+
+# JSON helper
+try:
+    from backend.models._types import JSON_VARIANT, as_mutable_json  # type: ignore
+except Exception:  # pragma: no cover
+    from models._types import JSON_VARIANT, as_mutable_json  # type: ignore
 
 if TYPE_CHECKING:
     from .user import User
     from .live_stream import LiveStream  # __tablename__ = "live_streams"
 
+__all__ = ["Viewer", "LiveViewer"]
 
-# ───────────────────────── Enums ─────────────────────────
+# ───────────────────────── Enums & regex ──────────────────────────────────────
 class ViewerPlatform(str, enum.Enum):
-    web     = "web"
+    web = "web"
     android = "android"
-    ios     = "ios"
-    tv      = "tv"
-    other   = "other"
+    ios = "ios"
+    tv = "tv"
+    other = "other"
 
 
-SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9\-\._]{8,64}$")
+SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9\-._]{8,64}$")
 SAFE_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 
+# ───────────────────────── Model ──────────────────────────────────────────────
 class Viewer(Base):
     """
-    Mtazamaji wa LiveStream (mtumiaji aliyeingia au mgeni).
-    - Dedupe: (live_stream_id, user_id, is_active) *au* (live_stream_id, session_key, is_active)
-    - Heartbeat: `last_seen_at` + helpers (`heartbeat`, `mark_inactive_if_stale`)
-    - Faragha: tunahifadhi `ip_hash`; `client_ip` huhifadhiwa tu ukiweka env STORE_PLAIN_IP=true
+    Mtazamaji wa LiveStream (anaweza kuwa user au mgeni).
+    Dedupe "hai": (live_stream_id + user_id) AU (live_stream_id + session_key).
     """
     __tablename__ = "live_viewers"
     __mapper_args__ = {"eager_defaults": True}
     __table_args__ = (
-        # Uniques (ruhusu mstari mmoja tu "hai" kwa actor/stream)
+        # Dedupe ya "hai"
         UniqueConstraint("live_stream_id", "user_id", "is_active", name="uq_lv_stream_user_active"),
         UniqueConstraint("live_stream_id", "session_key", "is_active", name="uq_lv_stream_session_active"),
-        # Indexes za kawaida
+        # Kawaida
         Index("ix_lv_stream_joined", "live_stream_id", "joined_at"),
         Index("ix_lv_user_joined", "user_id", "joined_at"),
         Index("ix_lv_active", "live_stream_id", "is_active", "last_seen_at"),
         Index("ix_lv_room", "room_id"),
         Index("ix_lv_last_seen", "last_seen_at"),
         Index("ix_lv_ip_hash", "ip_hash"),
-        # Guards
+        # Ulinzi wa mantiki
         CheckConstraint("(user_id IS NOT NULL) OR (session_key IS NOT NULL)", name="ck_lv_actor_present"),
         CheckConstraint("left_at IS NULL OR joined_at IS NULL OR left_at >= joined_at", name="ck_lv_time_order"),
         {"extend_existing": True},
@@ -75,8 +94,8 @@ class Viewer(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
-    # -------- Target stream --------
-    # NOTE: jina la attribute ni stream_id; linamap kwenye kolamu ya DB 'live_stream_id'
+    # -------- Stream target --------
+    # NOTE: Attribute ni stream_id lakini DB column ni 'live_stream_id'
     stream_id: Mapped[int] = mapped_column(
         "live_stream_id",
         ForeignKey("live_streams.id", ondelete="CASCADE"),
@@ -85,12 +104,12 @@ class Viewer(Base):
     )
     room_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
 
-    # -------- Actor (user au mgeni) --------
+    # -------- Actor --------
     user_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),
         index=True,
         nullable=True,
-        doc="Inaweza kuwa NULL kwa anonymous",
+        doc="NULL kama ni mgeni (anonymous)",
     )
     session_key: Mapped[Optional[str]] = mapped_column(
         String(64),
@@ -108,7 +127,7 @@ class Viewer(Base):
     )
     device: Mapped[Optional[str]] = mapped_column(String(100))
     client_ip: Mapped[Optional[str]] = mapped_column(String(64))
-    ip_hash:   Mapped[Optional[str]] = mapped_column(String(128), index=True)  # sha256 hex
+    ip_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)  # sha256 hex
     user_agent: Mapped[Optional[str]] = mapped_column(String(400))
     country: Mapped[Optional[str]] = mapped_column(String(2))  # ISO-3166-1 alpha-2
     city: Mapped[Optional[str]] = mapped_column(String(80))
@@ -124,8 +143,8 @@ class Viewer(Base):
     left_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), index=True)
 
     # -------- Relationships --------
-    # Muhimu: back_populates lazima lilingane na LiveStream.viewers
-    stream: Mapped["LiveStream"] = relationship(
+    # MUHIMU: Jina la attr hapa ni 'live_stream' ili lilingane na LiveStream.viewers(back_populates="live_stream")
+    live_stream: Mapped["LiveStream"] = relationship(
         "LiveStream",
         back_populates="viewers",
         primaryjoin="Viewer.stream_id == foreign(LiveStream.id)",
@@ -133,7 +152,8 @@ class Viewer(Base):
         passive_deletes=True,
         lazy="selectin",
     )
-    # Hatuna back_populates upande wa User (User hakuwa na "viewers"); salama kuacha hivi
+
+    # Kwa User hatuhitaji back_populates maalum (si lazima kuwa na User.viewers)
     user: Mapped[Optional["User"]] = relationship(
         "User",
         foreign_keys=lambda: [Viewer.user_id],
@@ -194,8 +214,7 @@ class Viewer(Base):
         who = self.user_id if self.user_id is not None else f"anon:{self.session_key}"
         return f"<Viewer id={self.id} stream={self.stream_id} who={who} active={self.is_active}>"
 
-
-# ─────────────────────── Validators / normalizers ───────────────────────
+# ───────────────────── Validators / normalizers ───────────────────────────────
 @validates("session_key")
 def _normalize_session_key(_inst, _key, value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -221,16 +240,14 @@ def _trim_texts(_inst, _key, value: Optional[str]) -> Optional[str]:
     v = value.strip()
     return v or None
 
-
-# ───────────────────────── Internal helpers ─────────────────────────
+# ───────────────────────── Internal helpers ───────────────────────────────────
 def _hash_ip(ip: str) -> str:
-    """Hash IP kwa sha256 + optional secret (pepper) kupitia env IP_HASH_SECRET."""
+    """Hash IP kwa sha256 + optional pepper kupitia env IP_HASH_SECRET."""
     secret = (os.getenv("IP_HASH_SECRET") or "").encode("utf-8")
     data = ip.encode("utf-8")
     return hmac.new(secret, data, hashlib.sha256).hexdigest() if secret else hashlib.sha256(data).hexdigest()
 
-
-# ───────────────────────── Event hooks ─────────────────────────
+# ───────────────────────── Event hooks ────────────────────────────────────────
 @listens_for(Viewer, "before_insert")
 def _lv_before_insert(_mapper, _conn, t: Viewer) -> None:  # pragma: no cover
     if t.country:
@@ -261,9 +278,6 @@ def _lv_before_update(_mapper, _conn, t: Viewer) -> None:  # pragma: no cover
         if os.getenv("STORE_PLAIN_IP", "0").strip().lower() not in {"1", "true", "yes", "on"}:
             t.client_ip = None
 
-
-# ───────────────────────── Backward-compat ─────────────────────────
-# Ruhusu import za zamani kama "from backend.models.live_viewer import LiveViewer"
+# ───────────────────────── Backward-compat ────────────────────────────────────
+# Ruhusu import ya zamani: from backend.models.live_viewer import LiveViewer
 LiveViewer = Viewer
-
-__all__ = ["Viewer", "LiveViewer"]
