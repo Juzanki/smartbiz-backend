@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt  # type: ignore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_
+from sqlalchemy import or_, text   # ← added text for diag_orm
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.inspection import inspect as sa_inspect
@@ -547,5 +547,35 @@ def diag_model():
     )
     present = {name: bool(_has_column(User, name)) for name in fields}
     return {"model": "User", "columns_present": present}
+
+@router.get("/_diag_orm")
+def diag_orm(db: Session = Depends(get_db)):
+    """
+    Dev-only: hukagua kama class User imemapishwa na ORM na kama DB iko reachable.
+    Weka DIAG_AUTH_ENABLED=1 ili itumike.
+    """
+    if not DIAG_AUTH_ENABLED:
+        raise HTTPException(status_code=404, detail="not_enabled")
+    from sqlalchemy.orm import inspect as _insp  # local import to avoid clashes
+    info: Dict[str, Any] = {}
+    try:
+        m = _insp(User)  # raises kama haijamapishwa
+        info["mapped"] = True
+        info["module"] = User.__module__
+        info["class"] = User.__name__
+        info["table"] = str(m.local_table)
+        info["columns"] = [c.key for c in m.columns]
+        try:
+            db.execute(text("SELECT 1"))
+            info["db_ok"] = True
+        except Exception as e:
+            info["db_ok"] = False
+            info["db_err"] = type(e).__name__
+    except Exception as e:
+        info["mapped"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+        info["module"] = getattr(User, "__module__", "?")
+        info["repr"] = repr(User)
+    return info
 
 __all__ = ["router"]
