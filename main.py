@@ -193,6 +193,16 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 import importlib
 import sys
 
+# ================== EXTRA: Canonical module aliases ==================
+with suppress(Exception):
+    # Ikiwa 'backend.models' tayari ime-load, alias 'models' → 'backend.models'
+    if "backend.models" in sys.modules:
+        sys.modules.setdefault("models", sys.modules["backend.models"])
+with suppress(Exception):
+    if "backend.routes" in sys.modules:
+        sys.modules.setdefault("routes", sys.modules["backend.routes"])
+# =====================================================================
+
 # ─────────────────────── Lifespan helpers ───────────────────────
 def _import_all_models_canonically() -> list[str]:
     """
@@ -374,7 +384,43 @@ def _auto_include_routes():
 
     logger.info("Routers included: %s", included or [])
 
+# -------- EXTRA: Router bootstrap (phase 2 via whitelist) --------
+def _import_router_variants(name: str):
+    """
+    Jaribu import routes.<name> kisha backend.routes.<name>.
+    Inarudisha (router, origin_module) au (None, None)
+    """
+    for mod in (f"routes.{name}", f"backend.routes.{name}"):
+        try:
+            pkg = __import__(mod, fromlist=["router"])
+            return getattr(pkg, "router", None), mod
+        except Exception:
+            continue
+    return None, None
+
+def _include_whitelisted_routes():
+    """
+    Whitelist ya ziada kupitia env ENABLED_ROUTERS (comma-separated).
+    Mfano: ENABLED_ROUTERS=auth_routes,comment_routes
+    """
+    names = [x.strip() for x in os.getenv("ENABLED_ROUTERS", "auth_routes").split(",") if x.strip()]
+    included2 = []
+    for name in names:
+        r, origin = _import_router_variants(name)
+        if r is None:
+            logger.error("Whitelist include failed for %s (tried routes.%s / backend.routes.%s)", name, name, name)
+            continue
+        try:
+            app.include_router(r)
+            included2.append(origin or name)
+        except Exception as e:
+            logger.error("Whitelist include crashed for %s from %s: %s", name, origin, e)
+    if included2:
+        logger.info("Whitelist routers included (phase2): %s", included2)
+# ------------------------------------------------------------------
+
 _auto_include_routes()
+_include_whitelisted_routes()  # ← inaongeza juu ya ya awali bila kubadilisha chochote
 
 # ───────────────── Global error handlers ─────────────────
 @app.exception_handler(HTTPException)
@@ -450,6 +496,39 @@ async def cors_diag(request: Request):
         "allowed_origins": ALLOW_ORIGINS if not CORS_ALLOW_ALL else ["* (regex)"],
         "auth_header_present": bool(request.headers.get("authorization") or request.headers.get("Authorization")),
     }
+
+# ================== EXTRA: Main diagnostics ==================
+DIAG_MAIN_ENABLED = env_bool("DIAG_MAIN_ENABLED", False)
+
+@app.get("/_diag/routers")
+def diag_routers():
+    if not DIAG_MAIN_ENABLED:
+        raise HTTPException(status_code=404, detail="not_enabled")
+    paths = sorted({getattr(r, "path", None) for r in app.routes if hasattr(r, "path") and getattr(r, "path")})
+    return {
+        "count": len(paths),
+        "paths": paths[:300],
+        "whitelist": [x.strip() for x in os.getenv("ENABLED_ROUTERS","auth_routes").split(",") if x.strip()],
+    }
+
+@app.get("/_diag/orm_registry")
+def diag_orm_registry():
+    if not DIAG_MAIN_ENABLED:
+        raise HTTPException(status_code=404, detail="not_enabled")
+    try:
+        names: Dict[str, set[str]] = {}
+        for m in Base.registry.mappers:
+            cls = m.class_
+            names.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
+        duplicates = {k: sorted(v) for k, v in names.items() if len(v) > 1}
+        return {
+            "ok": True,
+            "duplicates": duplicates,
+            "total_mapped": sum(len(v) for v in names.values()),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+# =============================================================
 
 # Docs (optional)
 if _docs_enabled:
