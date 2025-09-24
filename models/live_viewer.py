@@ -3,12 +3,15 @@
 """
 Viewer (mtazamaji) wa LiveStream.
 
-- Mstari mmoja "hai" (is_active=true) huruhusiwa kwa (live_stream_id, user_id) AU (live_stream_id, session_key)
-- Inahifadhi IP kwa usiri: ip_hash (daima), client_ip ikiwa STORE_PLAIN_IP=true
-- Ina heartbeats (last_seen_at) na helpers za ku-mark inactive ikiwa stale
-- Ina pointer sahihi kwa LiveStream kwa jina: live_stream (back_populates="viewers" upande wa LS)
+- Entry moja "hai" (is_active=true) huruhusiwa kwa:
+    (live_stream_id, user_id) AU (live_stream_id, session_key)
+- Faragha ya IP: tunahifadhi daima ip_hash; client_ip huhifadhiwa tu
+  ikiwa STORE_PLAIN_IP=true
+- Heartbeat: last_seen_at + helpers (heartbeat, mark_inactive_if_stale)
+- Rel: Viewer.live_stream ↔ LiveStream.viewers (back_populates)
 
-KUMBUKA: Hakikisha una "canonical import" ya models (mf. 'backend.models') ili kuepuka double-mapping.
+NB: Tumia canonical import ya models ('backend.models' au alias yake)
+ili kuepuka double-mapping ya ORM.
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ try:
 except Exception:  # pragma: no cover
     from db import Base  # type: ignore
 
-# JSON helper
+# JSON helper (layout-safe)
 try:
     from backend.models._types import JSON_VARIANT, as_mutable_json  # type: ignore
 except Exception:  # pragma: no cover
@@ -86,6 +89,7 @@ class Viewer(Base):
         Index("ix_lv_room", "room_id"),
         Index("ix_lv_last_seen", "last_seen_at"),
         Index("ix_lv_ip_hash", "ip_hash"),
+        Index("ix_lv_platform", "platform"),
         # Ulinzi wa mantiki
         CheckConstraint("(user_id IS NOT NULL) OR (session_key IS NOT NULL)", name="ck_lv_actor_present"),
         CheckConstraint("left_at IS NULL OR joined_at IS NULL OR left_at >= joined_at", name="ck_lv_time_order"),
