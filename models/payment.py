@@ -1,4 +1,4 @@
-﻿# backend/models/payment.py
+# backend/models/payment.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -35,10 +35,10 @@ if TYPE_CHECKING:
 
 # ---------------- Enums ----------------
 class PaymentMethod(str, enum.Enum):
-    mobile_money = "mobile_money"  # M-Pesa/TigoPesa/AirtelMoney
+    mobile_money = "mobile_money"
     card         = "card"
     bank         = "bank"
-    wallet       = "wallet"        # in-app wallet
+    wallet       = "wallet"
     cash         = "cash"
     other        = "other"
 
@@ -57,9 +57,9 @@ class PaymentProvider(str, enum.Enum):
     other       = "other"
 
 class PaymentStatus(str, enum.Enum):
-    pending    = "pending"     # created, not authorized yet / awaiting user action
-    processing = "processing"  # in-flight with PSP
-    succeeded  = "succeeded"   # completed with capture amount > 0 OR wallet/cash settled
+    pending    = "pending"
+    processing = "processing"
+    succeeded  = "succeeded"
     failed     = "failed"
     canceled   = "canceled"
     refunded   = "refunded"
@@ -96,14 +96,13 @@ def normalize_phone_e164(phone: Optional[str]) -> Optional[str]:
 # ---------------- Model ----------------
 class Payment(Base):
     """
-    Rekodi ya malipo (portable, production-grade):
+    Rekodi ya malipo:
       - UUID PK
       - method/provider/status/environment
-      - NUMERIC(…): authorized/captured/refunded/fees + net
-      - E.164 phone normalization (MM)
-      - Idempotency/dedupe + provider refs + collapse_key
-      - Reconciliation: settlement flags, payout batch, risk flags
-      - JSON payloads (mutable) & lifecycle helpers
+      - authorized/captured/refunded/fees + net
+      - E.164 phone normalization
+      - dedupe/refs/collapse_key
+      - JSON payloads & helpers
     """
     __tablename__ = "payments"
     __mapper_args__ = {"eager_defaults": True}
@@ -116,7 +115,7 @@ class Payment(Base):
         Index("ix_payment_provider_method", "provider", "method"),
         Index("ix_payment_phone", "payer_phone_e164"),
         Index("ix_payment_collapse", "collapse_key"),
-        # Lifecyle invariants (light, cross-DB friendly)
+        # Lifecycle invariants
         CheckConstraint("(status <> 'succeeded') OR (succeeded_at IS NOT NULL)", name="ck_payment_succeeded_ts"),
         CheckConstraint("(status <> 'refunded') OR (refunded_at IS NOT NULL)", name="ck_payment_refunded_ts"),
         CheckConstraint("(status <> 'partially_refunded') OR (refunded_at IS NOT NULL)", name="ck_payment_pr_ts"),
@@ -137,7 +136,7 @@ class Payment(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     user: Mapped["User"] = relationship(
         "User",
-        back_populates="payments",
+        back_populates="payments",   # ← lazima i-match na User.payments
         passive_deletes=True,
         lazy="selectin",
     )
@@ -165,51 +164,51 @@ class Payment(Base):
     )
 
     # Currency & amounts
-    currency:        Mapped[str]     = mapped_column(String(3), default="TZS", nullable=False, index=True)
-    amount_authorized: Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
-    amount_captured:   Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
-    amount_refunded:   Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
-    fee_total:         Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
+    currency:            Mapped[str]     = mapped_column(String(3), default="TZS", nullable=False, index=True)
+    amount_authorized:   Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
+    amount_captured:     Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
+    amount_refunded:     Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
+    fee_total:           Mapped[Decimal] = mapped_column(DECIMAL_TYPE, nullable=False, server_default=text("0"))
 
     # Phone & payer info
-    payer_phone:      Mapped[Optional[str]] = mapped_column(String(32))   # raw
-    payer_phone_e164: Mapped[Optional[str]] = mapped_column(String(32), index=True)
-    payer_name:       Mapped[Optional[str]] = mapped_column(String(160))
-    payer_email:      Mapped[Optional[str]] = mapped_column(String(160), index=True)
+    payer_phone:         Mapped[Optional[str]] = mapped_column(String(32))   # raw
+    payer_phone_e164:    Mapped[Optional[str]] = mapped_column(String(32), index=True)
+    payer_name:          Mapped[Optional[str]] = mapped_column(String(160))
+    payer_email:         Mapped[Optional[str]] = mapped_column(String(160), index=True)
 
     # References / dedupe
-    reference:       Mapped[str] = mapped_column(String(100), nullable=False, index=True)   # merchant reference
-    provider_txn_id: Mapped[Optional[str]] = mapped_column(String(160), index=True)         # PSP txn id / receipt no
-    idempotency_key: Mapped[Optional[str]] = mapped_column(String(120), unique=True, index=True)
-    request_id:      Mapped[Optional[str]] = mapped_column(String(64), index=True)
-    collapse_key:    Mapped[Optional[str]] = mapped_column(String(120), index=True, doc="Coalesce duplicate PSP callbacks")
+    reference:           Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # merchant reference
+    provider_txn_id:     Mapped[Optional[str]] = mapped_column(String(160), index=True)        # PSP receipt no
+    idempotency_key:     Mapped[Optional[str]] = mapped_column(String(120), unique=True, index=True)
+    request_id:          Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    collapse_key:        Mapped[Optional[str]] = mapped_column(String(120), index=True, doc="Coalesce duplicate PSP callbacks")
 
-    # Provider payloads / metadata (mutable JSON for in-place changes)
-    provider_response: Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
-    meta:              Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
-    statement_descriptor: Mapped[Optional[str]] = mapped_column(String(64))
+    # Provider payloads / metadata
+    provider_response:   Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
+    meta:                Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
+    statement_descriptor:Mapped[Optional[str]] = mapped_column(String(64))
 
     # Risk & reconciliation
-    risk_score:  Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))  # 0..100
-    risk_flags:  Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
-    settlement_date:  Mapped[Optional[dt.date]] = mapped_column()
-    payout_batch_id:  Mapped[Optional[str]] = mapped_column(String(120), index=True)
-    settled:          Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    risk_score:          Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))  # 0..100
+    risk_flags:          Mapped[Optional[Dict[str, Any]]] = mapped_column(as_mutable_json(JSON_VARIANT))
+    settlement_date:     Mapped[Optional[dt.date]] = mapped_column()
+    payout_batch_id:     Mapped[Optional[str]] = mapped_column(String(120), index=True)
+    settled:             Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
     # Timestamps
-    created_at: Mapped[dt.datetime] = mapped_column(
+    created_at:          Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
-    updated_at: Mapped[dt.datetime] = mapped_column(
+    updated_at:          Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
-    authorized_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    captured_at:   Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    succeeded_at:  Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    failed_at:     Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    canceled_at:   Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    refunded_at:   Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    expires_at:    Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    authorized_at:       Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    captured_at:         Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    succeeded_at:        Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    failed_at:           Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    canceled_at:         Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    refunded_at:         Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    expires_at:          Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
 
     # ---------------- Hybrids ----------------
     @hybrid_property
@@ -253,9 +252,11 @@ class Payment(Base):
             raise ValueError("currency must be a 3-letter ISO code")
         return v
 
-    @validates("reference", "provider_txn_id", "idempotency_key", "request_id",
-               "collapse_key", "payer_name", "payer_email", "statement_descriptor",
-               "payout_batch_id")
+    @validates(
+        "reference", "provider_txn_id", "idempotency_key", "request_id",
+        "collapse_key", "payer_name", "payer_email", "statement_descriptor",
+        "payout_batch_id"
+    )
     def _v_trim(self, _k: str, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
@@ -287,17 +288,14 @@ class Payment(Base):
         self.status = PaymentStatus.processing
 
     def capture(self, amount: Optional[Decimal | int | float | str] = None, *, allow_over_capture: bool = False) -> None:
-        """Capture (single-shot). If amount=None, capture up to authorized."""
         target = _q(amount if amount is not None else (self.amount_authorized or 0))
         if (not allow_over_capture) and target > _q(self.amount_authorized):
             target = _q(self.amount_authorized)
-        # prevent double-growing beyond target on repeated calls:
         self.amount_captured = target
         self.captured_at = _utcnow()
         self.status = PaymentStatus.processing
 
     def capture_incremental(self, amount: Decimal | int | float | str, *, allow_over_capture: bool = False) -> None:
-        """Add to previously captured amount (for PSPs supporting multiple captures)."""
         inc = _q(amount)
         new_total = _q(self.amount_captured) + inc
         if (not allow_over_capture) and new_total > _q(self.amount_authorized):
@@ -323,11 +321,10 @@ class Payment(Base):
         self.fee_total = _q((self.fee_total or Decimal("0.00")) + max(Decimal("0.00"), amt))
 
     def refund(self, amount: Optional[Decimal | int | float | str] = None) -> None:
-        """Partial/full refund. Caps at amount_captured."""
         if amount is not None:
             amt = _q(amount)
         else:
-            amt = _q(self.amount_captured) - _q(self.amount_refunded)  # remaining to full
+            amt = _q(self.amount_captured) - _q(self.amount_refunded)
         if amt <= 0:
             return
         new_total = _q(self.amount_refunded) + amt
