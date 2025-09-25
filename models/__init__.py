@@ -2,22 +2,7 @@
 """
 Auto-register all SQLAlchemy models in a safe, deterministic order.
 
-Features
-- Single canonical models package (prevents double-imports like 'models.*' vs 'backend.models.*').
-- Strong debug tracing (load order + ms + errors).
-- Fail-fast on dev / STRICT_MODE=1.
-- Early mapper verification (configure_mappers()).
-- Flexible allow/deny via env: MODELS_ONLY, MODELS_EXCLUDE, MODELS_HARD_ORDER.
-- Stable import order for cross-linked models.
-- Exports mapped classes into backend.models globals (__all__), so:
-    from backend.models import LiveStream
-
-Env vars (optional)
-- ENVIRONMENT=development|production
-- STRICT_MODE=1 (raise on any skip/dup)
-- MODELS_ONLY="live_stream,user"
-- MODELS_EXCLUDE="legacy_model,old_stuff"
-- MODELS_HARD_ORDER="live_stream,gift_movement,gift_transaction,user"
+[... sehemu zako zote bila mabadiliko hapo juu ...]
 """
 from __future__ import annotations
 
@@ -51,8 +36,6 @@ if _pkg_obj is not None:
     sys.modules.setdefault("models", _pkg_obj)
 
 # ─────────────────────────── Base / engine import ──────────────────────────────
-# IMPORTANT: Every model file should import Base from backend.models (this module).
-#            Never create another Declarative Base elsewhere.
 try:
     from ..db import Base, engine  # when imported as backend.models
 except Exception:  # noqa: BLE001
@@ -80,7 +63,6 @@ _EXCL = set(_env_list("MODELS_EXCLUDE"))
 _ENV_HARD_ORDER = _env_list("MODELS_HARD_ORDER")
 
 # ───────────────────────────── Import ordering ─────────────────────────────────
-# Tweak to your domain: these help with inter-dependent models
 _CRITICAL_FIRST: Tuple[str, ...] = (
     "live_stream",
     "gift_movement",
@@ -90,7 +72,6 @@ _CRITICAL_FIRST: Tuple[str, ...] = (
 _PREFERRED_NEXT: Tuple[str, ...] = ("guest", "guests", "co_host")
 _PREFERRED_LATE: Tuple[str, ...] = ("order", "product", "products_live")
 
-# Soft constraints (a before b)
 _ORDER_RULES: Tuple[Tuple[str, str], ...] = (
     ("live_stream", "gift_movement"),
     ("gift_movement", "gift_transaction"),
@@ -113,7 +94,6 @@ def _discover() -> List[str]:
         mods = [m for m in mods if m in _ONLY]
     if _EXCL:
         mods = [m for m in mods if m not in _EXCL]
-    # Prefer 'guest' over 'guests' if both exist
     if "guest" in mods and "guests" in mods:
         mods.remove("guests")
         log.warning("Both 'guest' and 'guests' modules found; preferring 'guest'.")
@@ -128,7 +108,7 @@ def _apply_rules(seq: List[str], rules: Iterable[Tuple[str, str]]) -> None:
                 ia, ib = seq.index(a), seq.index(b)
                 if ia > ib:
                     item = seq.pop(ia)
-                    ib = seq.index(b)  # index might change
+                    ib = seq.index(b)
                     seq.insert(ib, item)
                     changed = True
 
@@ -154,35 +134,27 @@ def _order_modules(found: Iterable[str]) -> List[str]:
 def _safe_import(module_basename: str) -> None:
     fq = f"{_PKG_NAME}.{module_basename}"
     t0 = time.perf_counter()
-    importlib.import_module(fq)   # idempotent if already imported
+    importlib.import_module(fq)
     dt_ms = (time.perf_counter() - t0) * 1000.0
     log.debug("Loaded model module: %s (%.1f ms)", fq, dt_ms)
 
 # ───────────────────── Duplicates & mapper verification ───────────────────────
 def _collect_registry_names() -> Dict[str, List[str]]:
-    """
-    Return mapping of ClassName -> [fully.qualified.module.ClassName, ...]
-    Only for entries that look like user classes (capitalized names).
-    """
     out: Dict[str, List[str]] = {}
     reg = getattr(Base, "registry", None)
     class_registry = getattr(reg, "_class_registry", {}) if reg else {}
     for key, val in class_registry.items():
         if not isinstance(key, str):
             continue
-        if not key[:1].isupper():  # skip internals
+        if not key[:1].isupper():
             continue
-        cls = val  # SQLAlchemy stores class itself
+        cls = val
         mod = getattr(cls, "__module__", "<unknown>")
         name = getattr(cls, "__name__", key)
         out.setdefault(name, []).append(f"{mod}.{name}")
     return out
 
 def _fail_on_duplicates() -> None:
-    """
-    Detect same ClassName mapped from different modules (common cause:
-    package imported as both 'models.*' and 'backend.models.*').
-    """
     dupes = {k: v for k, v in _collect_registry_names().items() if len(v) > 1}
     if dupes:
         lines = ["Duplicate mapped class names detected:"]
@@ -210,7 +182,6 @@ def _configure_mappers_now() -> None:
     log.info("SQLAlchemy mapper configuration OK.")
 
 def _post_verify(loaded: List[str]) -> None:
-    # Minimal sanity checks for key classes
     reg_names = _collect_registry_names()
     expected = []
     if "gift_movement" in loaded:
@@ -235,7 +206,6 @@ def _rebuild_exports() -> None:
     __all__.clear()
     seen = set()
     mappers = getattr(Base.registry, "mappers", [])
-    # In some SQLAlchemy versions, .mappers may be a set; sort by class name
     for mapper in sorted(mappers, key=lambda m: m.class_.__name__):
         cls = mapper.class_
         name = cls.__name__
@@ -250,15 +220,10 @@ _LOADED: List[str] = []
 _SKIPPED: List[str] = []
 
 def load_models() -> tuple[List[str], List[str]]:
-    """
-    Import all model modules and configure mappers. Safe to call multiple times.
-    Returns (loaded_modules, skipped_modules_with_errors).
-    """
     global _LOADED_ONCE, _LOADED, _SKIPPED
     if _LOADED_ONCE:
         return _LOADED, _SKIPPED
 
-    # Log engine URL if available (masked elsewhere)
     try:
         log.info("Using DB engine: %s (env=%s)", engine.url, _ENV)
     except Exception:
@@ -283,9 +248,7 @@ def load_models() -> tuple[List[str], List[str]]:
                     m, e.__class__.__name__, e, tb
                 )
 
-        # Before configuring, detect duplicates proactively
         _fail_on_duplicates()
-
         _configure_mappers_now()
         _post_verify(_LOADED)
 
@@ -306,3 +269,31 @@ def load_models() -> tuple[List[str], List[str]]:
 
 # Run immediately on import (common usage)
 load_models()
+
+# ───────────────── Manual promotions & backward-compat exports ────────────────
+def _promote(name: str, obj) -> None:
+    """
+    Put a symbol into module globals and __all__ if not already exported.
+    Safe even if load_models() already ran.
+    """
+    if obj is None:
+        return
+    globals()[name] = obj
+    if name not in __all__:
+        __all__.append(name)
+
+# 1) Ensure `TeamMember` is exported: `from backend.models import TeamMember`
+try:
+    from .team_member import TeamMember as _TeamMember  # noqa: F401
+    _promote("TeamMember", _TeamMember)
+except Exception as e:
+    log.debug("TeamMember export not available: %s", e)
+
+# 2) (Optional) Back-compat for `Settings` imports
+#    Some routers import Settings, while model is singular `Setting`.
+try:
+    from .setting import Setting as _Setting  # noqa: F401
+    _promote("Setting", _Setting)
+    _promote("Settings", _Setting)  # alias
+except Exception:
+    pass
