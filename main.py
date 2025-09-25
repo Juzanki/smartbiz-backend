@@ -13,7 +13,7 @@ from __future__ import annotations
 import os, sys, re, json, time, uuid, logging, importlib, pkgutil, types
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Callable, Iterable, Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 
 # ───────────────────────── Paths ─────────────────────────
 _THIS = Path(__file__).resolve()
@@ -50,7 +50,6 @@ log = logging.getLogger("smartbiz.main")
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").strip().lower()
 
 # ───────────────────── Canonical namespaces ─────────────────────
-# Tunaunda 'backend' kama namespace package ili imports kama `backend.models.*` zifanye kazi
 def _ns_package(name: str, path: Path) -> types.ModuleType:
     mod = sys.modules.get(name)
     if mod is None:
@@ -60,12 +59,10 @@ def _ns_package(name: str, path: Path) -> types.ModuleType:
     return mod
 
 def _bootstrap_namespaces() -> None:
-    # backend/
     _ns_package("backend", _BACKEND_DIR)
-    # backend/models/, backend/routes/
     _ns_package("backend.models", _BACKEND_DIR / "models")
     _ns_package("backend.routes", _BACKEND_DIR / "routes")
-    # Pia alias zisizovunja code za kale (optional)
+    # Aliases ili code za zamani zisi-break
     sys.modules.setdefault("models", sys.modules["backend.models"])
     sys.modules.setdefault("routes", sys.modules["backend.routes"])
     log.info("Canonical packages set: backend.models, backend.routes")
@@ -221,8 +218,10 @@ async def lifespan(app: FastAPI):
 
     # 2) DB ping
     ok, ms, err = _db_ping()
-    log.info("Starting SmartBiz (env=%s, starlette=%s, db_ok=%s, db_ms=%.1f, db=%s)",
-             ENVIRONMENT, _STARLETTE_VER, ok, ms, _sanitize_db_url(os.getenv("DATABASE_URL","")))
+    log.info(
+        "Starting SmartBiz (env=%s, starlette=%s, db_ok=%s, db_ms=%.1f, db=%s)",
+        ENVIRONMENT, _STARLETTE_VER, ok, ms, _sanitize_db_url(os.getenv("DATABASE_URL",""))
+    )
     if not ok:
         log.error("Database ping failed at startup (%s)", err)
 
@@ -299,7 +298,24 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityHeaders, enable_hsts=env_bool("ENABLE_HSTS", True))
 app.add_middleware(RequestIDAndTiming)
 
-# ───────────────────── Router auto-include ─────────────────────
+# ───────────────────── Include auth (direct, once) ─────────────────────
+# Hii inahakikisha /auth/* ipo hata kama auto-loader chini haijamwona.
+_auth_included = False
+try:
+    from backend.routes.auth import router as auth_router  # shim/mpya
+    app.include_router(auth_router)
+    _auth_included = True
+    log.info("Included router: backend.routes.auth")
+except Exception:
+    try:
+        from routes.auth import router as auth_router  # fallback
+        app.include_router(auth_router)
+        _auth_included = True
+        log.info("Included router: routes.auth")
+    except Exception as e:
+        log.warning("Auth router not found yet (%s) — relying on auto-loader.", e)
+
+# ───────────────────── Router auto-include (kwa zingine) ─────────────────────
 def _include_routes():
     included: List[str] = []
     for pkg_name in ("backend.routes", "routes"):  # scan canonical then alias
@@ -331,6 +347,9 @@ def _include_routes():
                 m = importlib.import_module(modpath)
                 r = getattr(m, "router", None)
                 if r is not None:
+                    # Epuka kurudia auth ikiwa tayari tuli-include moja kwa moja
+                    if _auth_included and name in {"auth", "auth_routes"}:
+                        continue
                     app.include_router(r); included.append(modpath)
             except Exception:
                 pass
@@ -397,4 +416,4 @@ if __name__ == "__main__":  # pragma: no cover
         reload=env_bool("RELOAD", default=(ENVIRONMENT != "production")),
         proxy_headers=True,
         forwarded_allow_ips="*",
-    )
+)
