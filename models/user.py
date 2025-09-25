@@ -7,12 +7,12 @@ import hashlib
 import datetime as dt
 import re
 from contextlib import suppress
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean, CheckConstraint, DateTime, Index, Integer, String, func, text
 )
-from sqlalchemy.orm import Mapped, mapped_column, synonym, validates
+from sqlalchemy.orm import Mapped, mapped_column, synonym, validates, relationship
 from sqlalchemy import inspect as _sa_inspect
 
 # Chukua Base/engine kutoka db.py (iwe layouts zote)
@@ -20,6 +20,9 @@ try:
     from backend.db import Base, engine  # type: ignore
 except Exception:  # pragma: no cover
     from db import Base, engine  # type: ignore
+
+if TYPE_CHECKING:
+    from .payment import Payment  # kwa type hints tu
 
 # ──────────────────────────────────────────────────────
 # Chagua jina la safu ya password kulingana na ENV au DB
@@ -105,20 +108,31 @@ class User(Base):
         password_hash: Mapped[Optional[str]] = mapped_column("password_hash", String(255), nullable=True)
         hashed_password = synonym("password_hash")
 
+    # ───── Relationships ─────
+    # HII ndiyo inayolingana na Payment.user (back_populates="payments")
+    payments: Mapped[list["Payment"]] = relationship(
+        "Payment",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        passive_deletes=True,
+    )
+
     # Hali/nafasi
     role: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'user'"))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
     # Nyakati
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False,
-                                                    server_default=func.now(), index=True)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False,
-                                                    server_default=func.now(), onupdate=func.now(), index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now(), index=True
+    )
 
     __table_args__ = (
         CheckConstraint("length(email) >= 3", name="ck_user_email_len"),
-        # Functional indexes (zinasaidia utafutaji case-insensitive)
         Index("ix_users_email_lower", func.lower(email), unique=False),
         Index("ix_users_username_lower", func.lower(username), unique=False),
         {"extend_existing": True},
