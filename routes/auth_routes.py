@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import jwt  # type: ignore
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_, text
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.inspection import inspect as sa_inspect
@@ -201,7 +201,9 @@ def _safe_col(model, name: str):
 def _get_user_password_hash(u) -> Optional[str]:
     for attr in ("password_hash", "hashed_password", "password"):
         if hasattr(u, attr):
-            return getattr(u, attr)
+            v = getattr(u, attr)
+            if v:
+                return v
     return None
 
 def _set_user_password_hash(u, plain: str) -> None:
@@ -468,6 +470,7 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
 
         hashed = _get_user_password_hash(user)
+        # Never crash on unknown/None hashes; just fail auth.
         if not hashed or not verify_password(password, hashed):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
 
@@ -521,63 +524,10 @@ def logout(response: Response):
 def diag_model():
     if not DIAG_AUTH_ENABLED:
         raise HTTPException(status_code=404, detail="not_enabled")
+
     fields = (
         "id", "email", "username",
         "phone", "phone_number", "msisdn",
         "password", "password_hash", "hashed_password",
         "is_active", "full_name",
-        "created_at", "updated_at",
-    )
-    present = {name: bool(_has_column(User, name)) for name in fields}
-    return {"model": "User", "columns_present": present}
-
-@router.get("/_diag_orm")
-def diag_orm(db: Session = Depends(get_db)):
-    if not DIAG_AUTH_ENABLED:
-        raise HTTPException(status_code=404, detail="not_enabled")
-    from sqlalchemy.orm import inspect as _insp
-    info: Dict[str, Any] = {}
-    try:
-        m = _insp(User)  # raises kama haijamapishwa
-        info["mapped"] = True
-        info["module"] = User.__module__
-        info["class"] = User.__name__
-        info["table"] = str(m.local_table)
-        info["columns"] = [c.key for c in m.columns]
-        try:
-            db.execute(text("SELECT 1"))
-            info["db_ok"] = True
-        except Exception as e:
-            info["db_ok"] = False
-            info["db_err"] = type(e).__name__
-    except Exception as e:
-        info["mapped"] = False
-        info["error"] = f"{type(e).__name__}: {e}"
-        info["module"] = getattr(User, "__module__", "?")
-        info["repr"] = repr(User)
-    return info
-
-@router.get("/_diag_registry")
-def diag_registry():
-    if not DIAG_AUTH_ENABLED:
-        raise HTTPException(status_code=404, detail="not_enabled")
-
-    names: Dict[str, set[str]] = {}
-    try:
-        for m in Base.registry.mappers:
-            cls = m.class_
-            names.setdefault(cls.__name__, set()).add(f"{cls.__module__}.{cls.__name__}")
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    duplicates = {k: sorted(v) for k, v in names.items() if len(v) > 1}
-    all_classes = sorted([f for vs in names.values() for f in vs])
-
-    return {
-        "ok": True,
-        "duplicate_names": duplicates,
-        "total_mapped": len(all_classes),
-        "classes": all_classes[:200],
-    }
-
-__all__ = ["router"]
+        "created_at", "updat
