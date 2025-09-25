@@ -3,20 +3,23 @@
 """
 LiveStream model — metadata na uhusiano wa live session.
 
-✔ Layout-safe Base import: jaribu 'backend.db' kisha 'db'
-✔ TYPE_CHECKING kwa references za darasa jingine (hakuna runtime circular import)
-✔ Relationships zote zina primaryjoin/foreign_keys/back_populates iliyo wazi
-✔ Indices, constraints, helpers na hybrid properties
+- Imports salama (backend.db → db) kuzuia migongano ya packages.
+- Relationships thabiti + back_populates na foreign_keys zilizo wazi.
+- Hybrid properties (is_live, duration_seconds, engagement_score).
+- Helpers: start(), end(), feature(), record(), add_viewers/likes(),
+  mark_active(), ensure_code(), set_private_code(), verify_private_code(),
+  end_and_deactivate_viewers(), recompute_counters() n.k.
+- Query helpers: by_code(), live_featured().
 
-KUMBUKA:
-- Epuka ku-import models package kwa njia mbili tofauti.
-- Pendekezo: kwenye startup, alias 'models' -> 'backend.models' ili kuepusha double mapping.
+NB: Epuka ku-import models package kwa njia mbili tofauti. Tumia canonical
+'backend.models' (au alias yake 'models') tu kwenye mradi mzima.
 """
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
 import hmac
+import os
 import re
 import secrets
 from typing import List, Optional, TYPE_CHECKING
@@ -30,13 +33,15 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    select,
+    update,
     text,
 )
 from sqlalchemy.event import listens_for
 from sqlalchemy.ext.hybrid import hybrid_property
-from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates, Session
 
-# ── Layout-safe Base import (DO NOT import both paths elsewhere) ───────────────
+# ── Layout-safe Base import (USI-import njia zote mbili kwingineko) ───────────
 try:  # preferred canonical path
     from backend.db import Base  # type: ignore
 except Exception:  # fallback if project runs without the 'backend.' package
@@ -65,7 +70,7 @@ if TYPE_CHECKING:
     from .live_product import LiveProduct
     from .top_contributor import TopContributor
 
-__all__ = ["LiveStream"]
+__all__ = ["LiveStream", "LiveSession"]
 
 SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9\-_]+$")
 
@@ -98,7 +103,7 @@ class LiveStream(Base):
     title: Mapped[Optional[str]] = mapped_column(String(160))
     goal: Mapped[Optional[str]] = mapped_column(String(160))
 
-    # Private join/control code (hashed)
+    # Private join/control code (hashed + salted per-row)
     code_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)
     code_salt: Mapped[Optional[str]] = mapped_column(String(32))
     rotate_secret: Mapped[Optional[str]] = mapped_column(String(64))
@@ -370,6 +375,13 @@ class LiveStream(Base):
         return func.coalesce(cls.is_featured, False) & cls.ended_at.is_(None)
 
     # ────────────────────────────── Domain helpers ──────────────────────────────
+    def start(self) -> None:
+        """Anzisha live (kama tayari live, haibadilishi started_at)."""
+        if not self.started_at:
+            self.started_at = dt.datetime.now(dt.timezone.utc)
+        self.ended_at = None
+        self.mark_active()
+
     def mark_active(self) -> None:
         self.last_active_at = dt.datetime.now(dt.timezone.utc)
 
@@ -389,6 +401,15 @@ class LiveStream(Base):
         self.is_recorded = bool(on)
 
     # ---- Private code (security) ----
+    def ensure_code(self, *, length: int = 8) -> None:
+        """Hakikisha `code` ya umma ipo (alfanumeriki + -/_)."""
+        if self.code:
+            return
+        rng = secrets.token_urlsafe(length + 2).replace("=", "")
+        # safisha kwa SAFE_CODE_RE
+        cleaned = "".join(ch for ch in rng if SAFE_CODE_RE.match(ch))
+        self.code = cleaned[: max(3, min(50, length))]
+
     def set_private_code(self, raw_code: str) -> None:
         raw = (raw_code or "").strip()
         if len(raw) < 6:
@@ -405,6 +426,57 @@ class LiveStream(Base):
         digest = hashlib.sha256(salt + (candidate or "").encode("utf-8")).hexdigest()
         return hmac.compare_digest(digest, self.code_hash)
 
+    # ---- Counter recompute & bulk operations (lazy imports to avoid cycles) ---
+    def end_and_deactivate_viewers(self, session: Session) -> int:
+        """
+        Mmalize stream na uwaweke inactive watazamaji waliopo (active=true).
+        Inarudisha idadi ya rows zilizoguswa.
+        """
+        try:
+            from backend.models.viewer import Viewer  # lazy canonical import
+        except Exception:  # pragma: no cover
+            from models.viewer import Viewer  # type: ignore
+
+        self.end()
+        res = session.execute(
+            update(Viewer)
+            .where(Viewer.stream_id == self.id, Viewer.is_active.is_(True))
+            .values(is_active=False, left_at=func.coalesce(Viewer.last_seen_at, func.now()))
+        )
+        return int(res.rowcount or 0)
+
+    def recompute_counters(self, session: Session) -> None:
+        """
+        Hesabu upya viewers_count/likes_count kutoka kwenye tables husika.
+        Hii ni ya usahihi wa takwimu (si lazima kuitwa kila request).
+        """
+        try:
+            from backend.models.viewer import Viewer  # lazy
+        except Exception:  # pragma: no cover
+            from models.viewer import Viewer  # type: ignore
+
+        likes_ct = None
+        try:
+            from backend.models.like import Like  # type: ignore
+        except Exception:  # pragma: no cover
+            try:
+                from models.like import Like  # type: ignore
+            except Exception:
+                Like = None  # type: ignore
+
+        viewers_ct = session.execute(
+            select(func.count()).select_from(Viewer).where(Viewer.stream_id == self.id)
+        ).scalar_one()
+
+        if Like is not None:  # type: ignore
+            likes_ct = session.execute(
+                select(func.count()).select_from(Like).where(Like.live_stream_id == self.id)
+            ).scalar_one()
+
+        self.viewers_count = int(viewers_ct or 0)
+        if likes_ct is not None:
+            self.likes_count = int(likes_ct or 0)
+
     # ---------------- Validators & normalizers ----------------
     @validates("code")
     def _normalize_code(self, _key, value: Optional[str]) -> Optional[str]:
@@ -415,6 +487,8 @@ class LiveStream(Base):
             return None
         if not SAFE_CODE_RE.match(v):
             raise ValueError("code must be alphanumeric with '-' or '_' only.")
+        if len(v) < 3 or len(v) > 50:
+            raise ValueError("code length must be between 3 and 50.")
         return v
 
     @validates("title", "goal")
@@ -426,6 +500,16 @@ class LiveStream(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<LiveStream id={self.id} code={self.code!r} title={self.title!r} live={self.is_live}>"
+
+    # ---------------- Query helpers (class methods) ----------------
+    @classmethod
+    def by_code(cls, session: Session, code: str) -> Optional["LiveStream"]:
+        return session.execute(select(cls).where(cls.code == (code or "").strip()).limit(1)).scalar_one_or_none()
+
+    @classmethod
+    def live_featured(cls, session: Session) -> List["LiveStream"]:
+        return list(session.execute(select(cls).where(cls.is_featured.is_(True), cls.ended_at.is_(None))).scalars())
+
 
 # ---------- Normalize before insert/update ----------
 @listens_for(LiveStream, "before_insert")
@@ -443,3 +527,7 @@ def _ls_before_update(_mapper, _conn, t: LiveStream) -> None:
         v = getattr(t, attr, None)
         if v:
             setattr(t, attr, v.strip())
+
+
+# ── Back-compat alias (kama kulikuwa na jina la zamani kwenye code) ───────────
+LiveSession = LiveStream
