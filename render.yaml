@@ -14,84 +14,45 @@ services:
     plan: free
     region: oregon
     autoDeploy: true
+    rootDir: .
     pythonVersion: 3.11
-
-    # (hiari) kama repo yako ina folda ya mizizi yenye 'backend/', acha rootDir: ./
-    rootDir: ./
 
     buildCommand: |
       set -e
       python -m pip install --upgrade pip
-      # Jaribu backend/requirements.txt kisha fallback kwenye mzizi
-      if [ -f backend/requirements.txt ]; then
-        pip install --no-cache-dir -r backend/requirements.txt
-      elif [ -f requirements.txt ]; then
-        pip install --no-cache-dir -r requirements.txt
-      else
-        echo "[warn] Hakuna requirements.txt iliyopatikana; ukitaka, weka moja."
-      fi
+      # Soma requirements kwenye ROOT (rahisisha)
+      pip install --no-cache-dir -r requirements.txt
+      python -m compileall backend
 
-    startCommand: |
-      bash -lc '
-        set -e
+    startCommand: >
+      uvicorn backend.main:app
+      --host 0.0.0.0 --port $PORT
+      --proxy-headers --forwarded-allow-ips="*"
+      --log-level info
+      --workers 1
 
-        # Normaliza postgres:// → postgresql+psycopg2:// (SQLAlchemy)
-        if [ -n "$DATABASE_URL" ]; then
-          export DATABASE_URL="${DATABASE_URL/postgres:\/\//postgresql+psycopg2:\/\/}"
-          case "$DATABASE_URL" in
-            *"sslmode="*) : ;;                      # ipo tayari
-            *) export DATABASE_URL="${DATABASE_URL}?sslmode=require" ;;
-          esac
-        fi
-
-        # (hiari) Alembic kama ipo (huta-break deploy kama haipo)
-        if command -v alembic >/dev/null 2>&1 && [ -f alembic.ini ]; then
-          echo "[start] Alembic upgrade head…"
-          alembic upgrade head || echo "[warn] Alembic failed; continuing"
-        fi
-
-        # Hakikisha Python anaona mzizi wa repo (backend.main:app ipatikane)
-        export PYTHONPATH=.
-
-        # Endesha uvicorn (FastAPI)
-        exec uvicorn backend.main:app \
-          --host 0.0.0.0 --port "$PORT" \
-          --proxy-headers --forwarded-allow-ips="*" \
-          --log-level info
-      '
-
-    # Healthcheck ya Render
     healthCheckPath: /health
     healthCheckTimeout: 10
     healthCheckInterval: 15
 
     envVars:
-      # ==== DB (kuchotwa moja kwa moja kutoka kwenye resource ya juu) ====
+      # ---- Python/Runtime ----
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PYTHONPATH
+        value: /opt/render/project/src
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "1"
+
+      # ---- DB (auto from database resource) ----
       - key: DATABASE_URL
         fromDatabase:
           name: smartbiz-db-01
           property: connectionString
-      # (hiari) fallbacks ikiwa code nyingine inahitaji:
-      - key: DB_HOST
-        fromDatabase:
-          name: smartbiz-db-01
-          property: host
-      - key: DB_NAME
-        fromDatabase:
-          name: smartbiz-db-01
-          property: database
-      - key: DB_USER
-        fromDatabase:
-          name: smartbiz-db-01
-          property: user
-      - key: DB_PASSWORD
-        fromDatabase:
-          name: smartbiz-db-01
-          property: password
-      - key: DB_PORT
-        value: "5432"
 
-      # ==== App env ====
+      # ---- App env ----
       - key: ENVIRONMENT
         value: production
       - key: LOG_LEVEL
@@ -99,47 +60,24 @@ services:
       - key: DEBUG
         value: "false"
       - key: AUTO_CREATE_TABLES
-        value: "true"       # zima ukitegemea Alembic pekee
+        value: "true"   # zima ukitegemea Alembic pekee
 
-      # ==== JWT / Security ====
+      # ---- Security / JWT ----
       - key: JWT_SECRET
-        generateValue: true
-      - key: JWT_ISS
-        value: smartbiz
-      - key: JWT_AUD
-        value: smartbiz-web
-      - key: JWT_EXPIRE_DAYS
-        value: "7"
+        sync: false        # weka value kupitia UI (dashboard)
 
-      # ==== CORS ====
-      # Tumia moja kati ya hizi mbili: (a) whitelist (salama) au (b) ruhusu zote (kwa test)
-      - key: CORS_ALLOW_ALL
-        value: "0"
-      - key: CORS_ORIGINS
-        value: https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site,http://localhost:5173,http://127.0.0.1:5173
-
-      # ==== Cookies (ikiwa unatumia cookie-auth mahali pengine) ====
-      - key: USE_COOKIE_AUTH
-        value: "false"
-      - key: AUTH_COOKIE_NAME
-        value: sb_access
-      - key: AUTH_COOKIE_SECURE
+      # ---- CORS ----
+      - key: ALLOW_ORIGINS
+        value: "https://smartbizsite.netlify.app,https://smartbiz.site,https://www.smartbiz.site,http://localhost:5173"
+      - key: ALLOW_CREDENTIALS
         value: "true"
-      - key: AUTH_COOKIE_SAMESITE
-        value: none
-      - key: AUTH_COOKIE_PATH
-        value: "/"
 
-      # ==== Docs & Introspection (hiari) ====
-      - key: ENABLE_DOCS
-        value: "1"          # /docs na /openapi.json upatikane
-      - key: ENABLE_INTROSPECT
-        value: "1"          # kama umeongeza route za /_routes n.k.
-
-      # ==== Misc ====
+      # ---- URLs ----
+      - key: NETLIFY_PUBLIC_URL
+        value: https://smartbizsite.netlify.app
       - key: BACKEND_PUBLIC_URL
-        value: https://smartbiz-backend-p45m.onrender.com
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: WEB_CONCURRENCY
-        value: "2"
+        value: https://smartbiz-backend-<slug>.onrender.com
+
+      # ---- Locale/Time ----
+      - key: TZ
+        value: Africa/Dar_es_Salaam
