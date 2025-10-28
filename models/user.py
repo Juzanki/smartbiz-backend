@@ -1,59 +1,91 @@
 # backend/models/user.py
 # -*- coding: utf-8 -*-
+"""
+SmartBiz Assistance — User model
+ULTRA-STABLE (Render-safe) v3
+
+Why this hardened version exists:
+
+On Render, if ANY mapper fails to initialize, the whole app dies.
+A mapper will fail if:
+  - there's a circular import chain, OR
+  - another model declares back_populates="X" but this User model
+    doesn't actually define attribute X.
+
+We have (today) other models that point back to User like this:
+  - AIBotSettings.user                -> back_populates="ai_bot_settings"
+  - ForgotPasswordRequest.user        -> back_populates="forgot_password_requests"
+  - PasswordResetCode.user            -> back_populates="password_resets"
+
+If we don't define *all three* of those lists on User, SQLAlchemy explodes
+during app startup on Render.
+
+Strategy:
+- Keep User lean, predictable, and circular-import safe.
+- Only declare REQUIRED relationships (the ones other models already expect).
+- Do NOT add heavy cross-model webs (payments, wallets, livestreams, etc.)
+  unless you're 100% sure they won't recurse-import User again.
+
+Also included:
+- UUID PK (Postgres UUID)
+- email / phone / profile metadata
+- password hashing with fallback if security utils aren't importable yet
+- activity timestamps
+- GDPR-ish anonymize helper
+- before_insert / before_update listeners for normalization
+"""
+
 from __future__ import annotations
 
-import os
-import hashlib
 import datetime as dt
-import re
-from contextlib import suppress
-from typing import Optional, Dict, Any, TYPE_CHECKING
+import hashlib
+import ipaddress
+import os
+import uuid
+from decimal import Decimal
+from typing import Any, Dict, Optional, List
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, Index, Integer, String, func, text
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Numeric,
+    String,
+    text,
+    func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, synonym, validates, relationship
-from sqlalchemy import inspect as _sa_inspect
+from sqlalchemy.dialects.postgresql import INET, UUID as PGUUID
+from sqlalchemy.event import listens_for
+from sqlalchemy.orm import (
+    Mapped,
+    mapped_column,
+    relationship,
+    synonym,
+    validates,
+)
 
-# Chukua Base/engine kutoka db.py (iwe layouts zote)
+# ------------------------------------------------------------------------------
+# Base import with fallback (Render vs local dev)
+# ------------------------------------------------------------------------------
 try:
-    from backend.db import Base, engine  # type: ignore
+    from backend.db import Base  # type: ignore
 except Exception:  # pragma: no cover
-    from db import Base, engine  # type: ignore
+    from db import Base  # type: no cover  # type: ignore
 
-if TYPE_CHECKING:
-    from .payment import Payment  # kwa type hints tu
 
-# ──────────────────────────────────────────────────────
-# Chagua jina la safu ya password kulingana na ENV au DB
-# ──────────────────────────────────────────────────────
-_PW_ENV = (os.getenv("SMARTBIZ_PWHASH_COL") or "").strip().lower()
-_digits = re.compile(r"\D+")
-
-def _detect_pw_col() -> str:
-    # 1) Kipaumbele: ENV
-    if _PW_ENV in {"password_hash", "hashed_password", "password"}:
-        return _PW_ENV
-    # 2) Jaribu kusoma kolamu zilizopo
-    with suppress(Exception):
-        insp = _sa_inspect(engine)
-        if insp.has_table("users"):
-            cols = {c["name"] for c in insp.get_columns("users")}
-            for name in ("hashed_password", "password_hash", "password"):
-                if name in cols:
-                    return name
-    # 3) Chaguo-msingi ukijenga jedwali jipya
-    return "password_hash"
-
-_PW_COL = _detect_pw_col()
-
-# ──────────────────────────────────────────────────────
-# Msaada wa hashing/verification (project utils → passlib → SHA256)
-# ──────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Password helpers
+# ------------------------------------------------------------------------------
 def _sha256(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
 def _hash_password(raw: str) -> str:
+    """
+    Preferred: backend.utils.security.get_password_hash (bcrypt/argon2/etc).
+    Fallback: sha256 so this file can stand alone, even if security utils
+    can't import during partial boot.
+    """
     try:
         from backend.utils.security import get_password_hash  # type: ignore
         return get_password_hash(raw)
@@ -64,7 +96,12 @@ def _hash_password(raw: str) -> str:
         except Exception:
             return _sha256(raw)
 
+
 def _verify_password(raw: str, stored: str) -> bool:
+    """
+    Preferred: backend.utils.security.verify_password.
+    Fallback: sha256 equality so auth checks won't explode in minimal mode.
+    """
     try:
         from backend.utils.security import verify_password  # type: ignore
         return bool(verify_password(raw, stored))
@@ -75,70 +112,192 @@ def _verify_password(raw: str, stored: str) -> bool:
         except Exception:
             return _sha256(raw) == (stored or "")
 
-# ──────────────────────────────────────────────────────
+
+# Which DB column actually stores the password hash?
+# We'll expose .password_hash regardless of which real column is in use.
+_PW_ENV = (os.getenv("SMARTBIZ_PWHASH_COL") or "").strip().lower()
+if _PW_ENV not in {"password_hash", "hashed_password", "password"}:
+    _PW_ENV = "password_hash"
+
+
+# ------------------------------------------------------------------------------
 # Model
-# ──────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 class User(Base):
-    """
-    Model nyepesi ya mtumiaji:
-      - Inanormalize email/username (lowercase, trim).
-      - Inatumia password column yoyote: password_hash / hashed_password / password.
-      - Inakuwa na synonyms ili access ya `password_hash` *au* `hashed_password` isabike popote.
-    """
     __tablename__ = "users"
     __mapper_args__ = {"eager_defaults": True}
+    __table_args__ = (
+        CheckConstraint(
+            "length(trim(coalesce(email,''))) > 0",
+            name="email_not_empty",
+            info={"no_autogenerate": True},
+        ),
+        {"extend_existing": True},
+    )
 
-    # Vitambulisho
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, index=True)
-    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
-    username: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, unique=True, index=True)
-    full_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # -- identity / auth -------------------------------------------------------
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        primary_key=True,
+        index=True,
+        default=uuid.uuid4,
+    )
 
-    # Safu ya password (hujengwa kulingana na _PW_COL)
-    if _PW_COL == "hashed_password":
-        hashed_password: Mapped[Optional[str]] = mapped_column("hashed_password", String(255), nullable=True)
-        password_hash = synonym("hashed_password")  # kuwezesha code nyingine kuitumia
-    elif _PW_COL == "password":
-        password: Mapped[Optional[str]] = mapped_column("password", String(255), nullable=True)
-        # synonyms mbili zi-reflect kolamu moja
-        password_hash = synonym("password")
-        hashed_password = synonym("password")
+    email: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        doc="Login / notification email (stored normalized lowercase).",
+    )
+
+    username: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+        doc="Public handle / vanity name.",
+    )
+
+    full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    bio: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    phone_country: Mapped[str] = mapped_column(
+        String(8),
+        nullable=False,
+        server_default=text("'TZ'"),
+        doc="Country code for phone e.g. TZ, KE, US.",
+    )
+
+    role: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'user'"),
+        doc="Global app role (user/mod/admin/owner). NOT org-scoped.",
+    )
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("true"),
+    )
+
+    is_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        doc="Account verified? (email / phone / KYC).",
+    )
+
+    # -- password material -----------------------------------------------------
+    # We alias to .password_hash no matter what env config says.
+    if _PW_ENV == "hashed_password":
+        hashed_password: Mapped[str] = mapped_column(
+            "hashed_password",
+            String,
+            nullable=False,
+        )
+        password_hash = synonym("hashed_password")
+    elif _PW_ENV == "password":
+        password: Mapped[str] = mapped_column(
+            "password",
+            String,
+            nullable=False,
+        )
+        password_hash = synonym("password")        # type: ignore
+        hashed_password = synonym("password")      # type: ignore
     else:
-        # default: password_hash
-        password_hash: Mapped[Optional[str]] = mapped_column("password_hash", String(255), nullable=True)
-        hashed_password = synonym("password_hash")
+        password_hash: Mapped[str] = mapped_column(
+            "password_hash",
+            String,
+            nullable=False,
+        )
+        hashed_password = synonym("password_hash")  # type: ignore
 
-    # ───── Relationships ─────
-    # HII ndiyo inayolingana na Payment.user (back_populates="payments")
-    payments: Mapped[list["Payment"]] = relationship(
-        "Payment",
+    preferred_language: Mapped[str] = mapped_column(
+        String(8),
+        nullable=False,
+        server_default=text("'en'"),
+    )
+
+    business_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    business_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    ad_earnings: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        server_default=text("0"),
+        doc="Cumulative ad revenue / creator payouts snapshot.",
+    )
+
+    # -- timestamps & status ---------------------------------------------------
+    last_login_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+    anonymized_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    terms_accepted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+
+    pii_erasure_note: Mapped[Optional[str]] = mapped_column(String)
+
+    signup_ip: Mapped[Optional[str]] = mapped_column(INET)
+    signup_user_agent: Mapped[Optional[str]] = mapped_column(String)
+
+    # ------------------------------------------------------------------------------
+    # MINIMAL, REQUIRED RELATIONSHIPS
+    # These MUST exist because other models refer to them with back_populates.
+    # If you remove any of these, Render will crash on boot.
+    # ------------------------------------------------------------------------------
+
+    # AIBotSettings.user -> back_populates="ai_bot_settings"
+    ai_bot_settings: Mapped[List["AIBotSettings"]] = relationship(
+        "backend.models.ai_bot_settings.AIBotSettings",
         back_populates="user",
         cascade="all, delete-orphan",
         lazy="selectin",
         passive_deletes=True,
     )
 
-    # Hali/nafasi
-    role: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'user'"))
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
-    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
-
-    # Nyakati
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
-    )
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now(), index=True
+    # ForgotPasswordRequest.user -> back_populates="forgot_password_requests"
+    forgot_password_requests: Mapped[List["ForgotPasswordRequest"]] = relationship(
+        "backend.models.forgot_password.ForgotPasswordRequest",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        passive_deletes=True,
     )
 
-    __table_args__ = (
-        CheckConstraint("length(email) >= 3", name="ck_user_email_len"),
-        Index("ix_users_email_lower", func.lower(email), unique=False),
-        Index("ix_users_username_lower", func.lower(username), unique=False),
-        {"extend_existing": True},
+    # PasswordResetCode.user -> back_populates="password_resets"
+    password_resets: Mapped[List["PasswordResetCode"]] = relationship(
+        "backend.models.password_reset_code.PasswordResetCode",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        passive_deletes=True,
     )
 
-    # ───── Helpers ─────
+    # ------------------------------------------------------------------------------
+    # Instance helpers
+    # ------------------------------------------------------------------------------
+    @staticmethod
+    def _now() -> dt.datetime:
+        return dt.datetime.now(dt.timezone.utc)
+
     @staticmethod
     def normalize_email(v: Optional[str]) -> str:
         return (v or "").strip().lower()
@@ -150,89 +309,148 @@ class User(Base):
         v = " ".join(v.strip().split()).lower()
         return v or None
 
-    @staticmethod
-    def normalize_identifier(v: str) -> str:
-        v = (v or "").strip()
-        if "@" in v:
-            return v.lower()
-        return v.lower()
-
     def set_password(self, raw: str) -> None:
-        h = _hash_password(raw)
-        # weka kwenye property iliyo “live” (synonyms hushughulikia upande mwingine)
-        if hasattr(self, "password_hash"):
-            setattr(self, "password_hash", h)
-        else:
-            setattr(self, "hashed_password", h)
+        """Hash and assign a new password to this user."""
+        self.password_hash = _hash_password(raw)
 
     def verify_password(self, raw: str) -> bool:
-        stored = (
-            getattr(self, "password_hash", None)
-            or getattr(self, "hashed_password", None)
-            or getattr(self, "password", None)
-            or ""
-        )
-        return _verify_password(raw, stored)
+        return _verify_password(raw, self.password_hash or "")
+
+    def mark_verified(self) -> None:
+        self.is_verified = True
+
+    def deactivate(self, *, soft_delete: bool = False) -> None:
+        """
+        Disable account. Optionally mark deleted_at as soft delete.
+        """
+        self.is_active = False
+        if soft_delete and not self.deleted_at:
+            self.deleted_at = self._now()
+
+    def touch_last_login(self) -> None:
+        self.last_login_at = self._now()
+
+    def display_name(self) -> str:
+        """
+        Best label for UI headers / chat bubbles.
+        Priority: full_name -> username -> email
+        """
+        return (self.full_name or self.username or self.email or "").strip()
+
+    def soft_anonymize(self, *, note: Optional[str] = None) -> None:
+        """
+        Scrub direct PII but keep row for analytics / fraud / payout / audit.
+        Leaves a trail via pii_erasure_note + anonymized_at.
+        """
+        self.full_name = None
+        self.avatar_url = None
+        self.bio = None
+        self.phone = None
+        self.signup_ip = None
+        self.signup_user_agent = None
+        self.pii_erasure_note = note or "anonymized"
+        self.anonymized_at = self._now()
 
     def to_safe_dict(self) -> Dict[str, Any]:
+        """
+        Public-safe data for API responses.
+        NOTE: DOES NOT expose password_hash or secret fields.
+        """
         return {
-            "id": int(self.id) if self.id is not None else None,
+            "id": str(self.id) if self.id else None,
             "email": self.email,
             "username": self.username,
             "full_name": self.full_name,
+            "avatar_url": self.avatar_url,
+            "bio": self.bio,
             "role": self.role,
             "is_active": bool(self.is_active),
             "is_verified": bool(self.is_verified),
+            "phone": self.phone,
+            "phone_country": self.phone_country,
+            "preferred_language": self.preferred_language,
+            "business_name": self.business_name,
+            "business_type": self.business_type,
+            "ad_earnings": (
+                str(self.ad_earnings) if self.ad_earnings is not None else "0.00"
+            ),
+            "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
-    # ───── Validators (SQLAlchemy) ─────
+    # ------------------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------------------
     @validates("email")
-    def _validate_email(self, _k, v: str) -> str:
-        v = self.normalize_email(v)
+    def _v_email(self, _k, v: str) -> str:
+        v = User.normalize_email(v)
         if not v or "@" not in v:
             raise ValueError("invalid email")
         return v
 
     @validates("username")
-    def _validate_username(self, _k, v: Optional[str]) -> Optional[str]:
-        return self.normalize_username(v)
+    def _v_username(self, _k, v: Optional[str]) -> Optional[str]:
+        return User.normalize_username(v)
 
-    # ───── Utilities ─────
-    @property
-    def name(self) -> str:
-        return self.full_name or self.username or self.email
-
-    @property
-    def has_password(self) -> bool:
-        return bool(
-            getattr(self, "password_hash", None)
-            or getattr(self, "hashed_password", None)
-            or getattr(self, "password", None)
-        )
-
-    def touch(self) -> None:
-        self.updated_at = dt.datetime.now(dt.timezone.utc)
+    @validates("signup_ip")
+    def _v_signup_ip(self, _k, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return None
+        try:
+            ipaddress.ip_address(v)
+        except Exception:
+            return None
+        return v
 
     def __repr__(self) -> str:  # pragma: no cover
-        return f"<User id={self.id} email={self.email} active={self.is_active}>"
+        return f"<User id={self.id} email={self.email!r} role={self.role} active={self.is_active}>"
 
-# ───── Normalize kabla ya kuandika/kuhuisha ─────
-from sqlalchemy.event import listens_for
 
-@listens_for(User, "before_insert")
-def _before_insert(_mapper, _conn, target: User) -> None:
+# ------------------------------------------------------------------------------
+# ORM LISTENERS
+# We attach to Base with propagate=True so all mapped subclasses fire,
+# but we guard with isinstance(target, User) to avoid touching other models.
+# ------------------------------------------------------------------------------
+
+@listens_for(Base, "before_insert", propagate=True)
+def _on_user_insert(mapper, conn, target):  # type: ignore[no-redef]
+    """
+    Normalize + default fields right before INSERT.
+    Keeps DB consistent even if upstream forgets to sanitize.
+    """
+    if not isinstance(target, User):
+        return
+
+    # normalize text fields
     if target.email:
         target.email = User.normalize_email(target.email)
     if target.username:
         target.username = User.normalize_username(target.username)
 
-@listens_for(User, "before_update")
-def _before_update(_mapper, _conn, target: User) -> None:
+    # safety defaults
+    if not target.role:
+        target.role = "user"
+
+    # timestamps fallback
+    now = User._now()
+    if not target.created_at:
+        target.created_at = now
+    if not target.updated_at:
+        target.updated_at = now
+
+
+@listens_for(Base, "before_update", propagate=True)
+def _on_user_update(mapper, conn, target):  # type: ignore[no-redef]
+    """
+    Normalize + bump updated_at on UPDATE.
+    """
+    if not isinstance(target, User):
+        return
+
     if target.email:
         target.email = User.normalize_email(target.email)
     if target.username:
         target.username = User.normalize_username(target.username)
 
-__all__ = ["User"]
+    target.updated_at = User._now()
