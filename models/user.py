@@ -1,526 +1,1109 @@
-# backend/models/user.py
+# backend/main.py
 # -*- coding: utf-8 -*-
-"""
-SmartBiz Assistance — User model
-ULTRA-STABLE (Render-safe) v4
-
-WHY THIS FILE EXISTS
---------------------
-On Render, if ANY SQLAlchemy mapper fails to initialize, the entire app
-refuses to boot. A mapper can fail if:
-
-  1. There's a circular import chain that prevents some model class from
-     being fully defined before SQLAlchemy tries to configure mappers.
-
-  2. Another model says back_populates="something", but THIS User model
-     doesn't actually define attribute "something". Example crashes we've hit:
-
-        AIBotSettings.user
-            -> back_populates="ai_bot_settings"
-        ForgotPasswordRequest.user
-            -> back_populates="forgot_password_requests"
-        PasswordResetCode.user
-            -> back_populates="password_resets"
-
-     If User is missing ANY of those attributes, mapper init dies on boot.
-
-GOAL / STRATEGY
----------------
-- Keep this model lean and predictable.
-- Explicitly declare ONLY the relationships that other models currently
-  REQUIRE via back_populates. (Do NOT import those models directly; we
-  reference them using fully-qualified dotted path strings to avoid
-  circular imports.)
-- Avoid declaring heavy optional relationships (payments, wallets,
-  livestream guests, etc.) unless we're sure they are safe.
-
-Currently guaranteed required:
-    - ai_bot_settings            <-> AIBotSettings.user
-    - forgot_password_requests   <-> ForgotPasswordRequest.user
-    - password_resets            <-> PasswordResetCode.user
-
-NOTE:
-We will probably ALSO need to add in future:
-    - gift_movements_sent        <-> GiftMovement.sender
-    - gift_movements_received    <-> GiftMovement.host
-BUT those aren't declared yet unless gift_movement.py expects them.
-If/when gift_movement.py uses back_populates="gift_movements_sent"/
-"gift_movements_received", we MUST add them here or Render will crash.
-
-OTHER THINGS WE KEEP
---------------------
-- UUID primary key
-- auth / profile metadata
-- password hashing (with fallback if security utils can't import yet)
-- timestamps, soft-delete, GDPR-style anonymize
-- before_insert / before_update listeners that normalize data
-"""
-
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
-import ipaddress
+"""
+SmartBiz Assistance — Main ASGI Entrypoint (Production-Grade, Render-Safe)
+=========================================================================
+v13.0.3 (ANNOUNCEMENTS GUARANTEE FIXED • INDENT SAFE • ROUTE-DEDUPED)
+
+KEY UPGRADES:
+✅ FIX: Announcements guarantee block is now correctly inside create_app() (no SyntaxError)
+✅ Keeps your existing CORS guard + security middlewares + diagnostics + router guarantees
+✅ Path-fallback router loader preserved
+"""
+
 import os
+import re
+import sys
+import time
+import json
 import uuid
-from decimal import Decimal
-from typing import Any, Dict, Optional, List
+import types
+import anyio
+import logging
+import inspect
+import importlib
+import importlib.util as _importlib_util
+import pkgutil as _pkgutil
+import traceback
+from pathlib import Path
+from typing import Dict, List, Tuple, Callable, Any, Optional, Set
+from contextlib import asynccontextmanager, suppress
 
-from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    Numeric,
-    String,
-    text,
-    func,
-)
-from sqlalchemy.dialects.postgresql import INET, UUID as PGUUID
-from sqlalchemy.event import listens_for
-from sqlalchemy.orm import (
-    Mapped,
-    mapped_column,
-    relationship,
-    synonym,
-    validates,
-)
+from backend.middleware.cors import setup_cors as setup_cors_guarded
 
-# ------------------------------------------------------------------------------
-# Base import with fallback (Render vs local dev)
-# ------------------------------------------------------------------------------
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.responses import JSONResponse, RedirectResponse, Response, PlainTextResponse
+from starlette.requests import ClientDisconnect
+
+
+# Optional proxy middleware (only if installed)
 try:
-    from backend.db import Base  # type: ignore
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # type: ignore
+    _HAS_PROXY_MW = True
 except Exception:  # pragma: no cover
-    from db import Base  # type: ignore
+    ProxyHeadersMiddleware = None  # type: ignore
+    _HAS_PROXY_MW = False
 
 
-# ------------------------------------------------------------------------------
-# Password helpers
-# ------------------------------------------------------------------------------
-def _sha256(raw: str) -> str:
-    """SHA256 fallback so we never fail hard if bcrypt libs can't import."""
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+# =====================================================================
+# Path / namespace bootstrap (Render-safe)
+# =====================================================================
+
+_THIS = Path(__file__).resolve()
+_BACKEND = _THIS.parent
+_ROOT = _BACKEND.parent
+
+if str(_ROOT) not in sys.path:
+    sys.path.append(str(_ROOT))
 
 
-def _hash_password(raw: str) -> str:
-    """
-    Preferred path: backend.utils.security.get_password_hash (bcrypt/argon2/etc).
-    Fallback: SHA256 so this file can still run in "bootstrap mode" even if
-    security utilities aren't available yet.
-    """
+def _ensure_pkg_ns(name: str, path: Path) -> types.ModuleType:
+    mod = sys.modules.get(name)
+    if mod is None:
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(path)]  # type: ignore[attr-defined]
+        sys.modules[name] = mod
+    return mod
+
+
+_ensure_pkg_ns("backend", _BACKEND)
+_ensure_pkg_ns("backend.models", _BACKEND / "models")
+_ensure_pkg_ns("backend.routes", _BACKEND / "routes")
+_ensure_pkg_ns("backend.routers", _BACKEND / "routers")
+
+# Legacy aliases (avoid breaking older imports)
+sys.modules.setdefault("models", sys.modules["backend.models"])
+sys.modules.setdefault("routes", sys.modules["backend.routes"])
+sys.modules.setdefault("routers", sys.modules["backend.routers"])
+
+
+# =====================================================================
+# Env helpers
+# =====================================================================
+
+def _env_bool(k: str, default: bool = False) -> bool:
+    v = os.getenv(k)
+    return default if v is None else v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(k: str, default: int) -> int:
     try:
-        from backend.utils.security import get_password_hash  # type: ignore
-        return get_password_hash(raw)
+        return int((os.getenv(k) or "").strip() or default)
     except Exception:
-        try:
-            from utils.security import get_password_hash  # type: ignore
-            return get_password_hash(raw)
-        except Exception:
-            # last-resort fallback
-            return _sha256(raw)
+        return default
 
 
-def _verify_password(raw: str, stored: str) -> bool:
-    """
-    Preferred path: backend.utils.security.verify_password.
-    Fallback: constant-time-ish SHA256 equality.
-    """
+def _env_list(k: str) -> List[str]:
+    raw = os.getenv(k, "") or ""
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+ENV = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "production").strip().lower()
+
+
+def _default_import_all_models() -> bool:
+    return False if ENV == "production" else True
+
+
+# =====================================================================
+# Logging (safe JSON)
+# =====================================================================
+
+LOG_JSON = (os.getenv("LOG_JSON", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+LOG_LEVEL = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+
+
+class _JsonFmt(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+        out: Dict[str, Any] = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            out["exc"] = self.formatException(record.exc_info)
+        return json.dumps(out, ensure_ascii=False)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(
+    _JsonFmt() if LOG_JSON else logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+)
+root_logger = logging.getLogger()
+root_logger.handlers = [_handler]
+root_logger.setLevel(LOG_LEVEL)
+
+log = logging.getLogger("smartbiz.main")
+routes_log = logging.getLogger("smartbiz.routes")
+
+try:
+    import starlette as _st
+    STARLETTE_VER = getattr(_st, "__version__", "?")
+except Exception:  # pragma: no cover
+    STARLETTE_VER = "?"
+
+
+# =====================================================================
+# DB glue (robust)
+# =====================================================================
+
+Base = None  # type: ignore[assignment]
+SessionLocal = None  # type: ignore[assignment]
+engine = None  # type: ignore[assignment]
+
+
+def datetime_now_utc():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def datetime_utc_iso() -> str:
+    return datetime_now_utc().isoformat()
+
+
+def _noop(*args, **kwargs):
+    return True
+
+
+warm_db = _noop
+reload_engine_from_env = _noop
+
+
+def _sanitize_db(url: str) -> str:
+    if not url:
+        return ""
+    return re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:****@", url)
+
+
+_HAS_DB_HEALTHCHECK = False
+_db_healthcheck_fn = None
+
+try:
+    from backend.db import (  # type: ignore
+        Base as _Base,
+        SessionLocal as _SessionLocal,
+        engine as _engine,
+        warm_db as _warm_db,
+        reload_engine_from_env as _reload_engine_from_env,
+    )
+    Base = _Base
+    SessionLocal = _SessionLocal
+    engine = _engine
+    warm_db = _warm_db
+    reload_engine_from_env = _reload_engine_from_env
+
     try:
-        from backend.utils.security import verify_password  # type: ignore
-        return bool(verify_password(raw, stored))
+        from backend.db import db_healthcheck as _db_hc  # type: ignore
+        _HAS_DB_HEALTHCHECK = True
+        _db_healthcheck_fn = _db_hc
     except Exception:
+        _HAS_DB_HEALTHCHECK = False
+        _db_healthcheck_fn = None
+
+except Exception as e:
+    raise RuntimeError(f"❌ DB glue not found. Ensure backend/db.py exports Base, SessionLocal, engine. ({e})")
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+
+def get_db():
+    db: Session = SessionLocal()  # type: ignore[misc]
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _db_ping() -> Tuple[bool, float, str]:
+    t0 = time.perf_counter()
+    try:
+        with engine.connect() as conn:  # type: ignore[union-attr]
+            conn.execute(text("SELECT 1"))
+        return True, (time.perf_counter() - t0) * 1000.0, ""
+    except Exception as e:
+        return False, (time.perf_counter() - t0) * 1000.0, f"{type(e).__name__}: {str(e)[:220]}"
+
+
+def _db_health_fallback() -> Dict[str, Any]:
+    ok, ms, err = _db_ping()
+    return {"ok": ok, "ms": ms, "error": err, "time_utc": datetime_utc_iso()}
+
+
+def db_healthcheck() -> Dict[str, Any]:
+    if _HAS_DB_HEALTHCHECK and callable(_db_healthcheck_fn):
         try:
-            from utils.security import verify_password  # type: ignore
-            return bool(verify_password(raw, stored))
+            return _db_healthcheck_fn()  # type: ignore[misc]
         except Exception:
-            return _sha256(raw) == (stored or "")
+            return _db_health_fallback()
+    return _db_health_fallback()
 
 
-# Which DB column actually stores the password hash?
-# We ALWAYS expose .password_hash on the instance either way.
-_PW_ENV = (os.getenv("SMARTBIZ_PWHASH_COL") or "").strip().lower()
-if _PW_ENV not in {"password_hash", "hashed_password", "password"}:
-    _PW_ENV = "password_hash"
+# =====================================================================
+# Deterministic model import (registry-first) + fail-fast mapper config
+# =====================================================================
+
+with suppress(Exception):
+    import backend.models  # noqa: F401
+
+with suppress(Exception):
+    from backend.models.registry import load_all_models  # type: ignore
+    load_all_models()
+    log.info("✅ load_all_models(): models registry loaded early")
+
+_MAPPERS_OK = False
+_MAPPERS_ERR = ""
+_MAPPERS_ERR_FULL = ""
+_MAPPERS_TRIGGER = ""
+_MAPPERS_ORIGINAL = ""
+_MAPPERS_TS = 0.0
+_MAPPERS_TRACE = ""
 
 
-# ------------------------------------------------------------------------------
-# Main model
-# ------------------------------------------------------------------------------
-class User(Base):
-    __tablename__ = "users"
-    __mapper_args__ = {"eager_defaults": True}
-    __table_args__ = (
-        CheckConstraint(
-            "length(trim(coalesce(email,''))) > 0",
-            name="email_not_empty",
-            info={"no_autogenerate": True},
-        ),
-        {"extend_existing": True},
-    )
+def _extract_mapper_root(msg: str) -> Tuple[str, str]:
+    trigger = ""
+    original = ""
+    s = msg or ""
 
-    # -- Identity / auth -------------------------------------------------------
-    id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True),
-        primary_key=True,
-        index=True,
-        default=uuid.uuid4,
-    )
+    if "Triggering mapper:" in s:
+        part = s.split("Triggering mapper:", 1)[1].strip()
+        if ". Original exception was:" in part:
+            trigger = part.split(". Original exception was:", 1)[0].strip()
+        else:
+            trigger = part.strip()
 
-    email: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-        index=True,
-        doc="Login / notification email. Stored normalized (lowercase+trim).",
-    )
+    if "Original exception was:" in s:
+        original = s.split("Original exception was:", 1)[1].strip()
 
-    username: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-        index=True,
-        doc="Public handle / vanity name.",
-    )
+    return trigger, original
 
-    full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    avatar_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    bio: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+def _configure_mappers_failfast() -> None:
+    global _MAPPERS_OK, _MAPPERS_ERR, _MAPPERS_ERR_FULL, _MAPPERS_TRIGGER, _MAPPERS_ORIGINAL, _MAPPERS_TS, _MAPPERS_TRACE
+    _MAPPERS_TS = time.time()
+    _MAPPERS_TRACE = ""
 
-    phone_country: Mapped[str] = mapped_column(
-        String(8),
-        nullable=False,
-        server_default=text("'TZ'"),
-        doc="Phone country code e.g. TZ, KE, US.",
-    )
+    try:
+        from sqlalchemy.orm import configure_mappers
+        configure_mappers()
+        _MAPPERS_OK = True
+        _MAPPERS_ERR = ""
+        _MAPPERS_ERR_FULL = ""
+        _MAPPERS_TRIGGER = ""
+        _MAPPERS_ORIGINAL = ""
+        return
 
-    role: Mapped[str] = mapped_column(
-        String(32),
-        nullable=False,
-        server_default=text("'user'"),
-        doc="Global app role (user/mod/admin/owner). NOT org-scoped.",
-    )
+    except Exception as e:
+        _MAPPERS_OK = False
+        full = str(e) or repr(e)
+        short = f"{type(e).__name__}: {full}"
+        _MAPPERS_ERR = short[:900]
+        _MAPPERS_ERR_FULL = short
 
-    is_active: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        server_default=text("true"),
-    )
+        trig, orig = _extract_mapper_root(short)
+        _MAPPERS_TRIGGER = trig
+        _MAPPERS_ORIGINAL = orig[:2000] if orig else ""
 
-    is_verified: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        server_default=text("false"),
-        doc="Account verified? (email / phone / KYC).",
-    )
+        _MAPPERS_TRACE = "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
-    # -- Password material -----------------------------------------------------
-    # We always want a .password_hash attribute on the instance regardless of
-    # what the underlying column is called in the DB. That keeps the rest of
-    # the codebase simple.
-    if _PW_ENV == "hashed_password":
-        hashed_password: Mapped[str] = mapped_column(
-            "hashed_password",
-            String,
-            nullable=False,
-        )
-        password_hash = synonym("hashed_password")
-    elif _PW_ENV == "password":
-        password: Mapped[str] = mapped_column(
-            "password",
-            String,
-            nullable=False,
-        )
-        password_hash = synonym("password")        # type: ignore
-        hashed_password = synonym("password")      # type: ignore
+        log.error("❌ SQLAlchemy mapper configure FAILED")
+        if _MAPPERS_TRIGGER:
+            log.error("➡️ Triggering mapper: %s", _MAPPERS_TRIGGER)
+        if _MAPPERS_ORIGINAL:
+            log.error("➡️ Original exception: %s", _MAPPERS_ORIGINAL[:900])
+        log.error("➡️ Hint: open /__diag/mappers/full or /__diag/mappers/trace for full info")
+        log.exception("root traceback (platform may truncate)")
+        raise RuntimeError(f"SQLAlchemy mapper configuration failed: {_MAPPERS_ERR}") from e
+
+
+def check_dupe_mappers() -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    try:
+        if not Base or not getattr(Base, "registry", None):
+            return out
+
+        name_map: Dict[str, set[str]] = {}
+        for m in Base.registry.mappers:  # type: ignore[union-attr]
+            c = m.class_
+            name_map.setdefault(c.__name__, set()).add(f"{c.__module__}.{c.__name__}")
+
+        for k, v in name_map.items():
+            if len(v) > 1:
+                out[k] = sorted(v)
+
+        if out:
+            log.error("SQLAlchemy duplicate mappers: %s", out)
+        else:
+            log.info("SQLAlchemy mappers OK (no duplicates)")
+    except Exception as e:
+        log.warning("mapper check failed: %s", e)
+    return out
+
+
+# =====================================================================
+# Security middlewares
+# =====================================================================
+
+class SecurityHeaders(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            resp: Response = await call_next(request)
+        except (ClientDisconnect, anyio.EndOfStream):
+            return Response(status_code=204)
+
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+        if request.headers.get("x-forwarded-proto", "").lower() == "https":
+            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+
+        resp.headers.setdefault("Vary", "Origin")
+        return resp
+
+
+class RequestIDTiming(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+        t0 = time.perf_counter()
+        try:
+            resp: Response = await call_next(request)
+        except (ClientDisconnect, anyio.EndOfStream):
+            resp = Response(status_code=204)
+        except Exception:
+            log.exception("unhandled xrid=%s", rid)
+            resp = JSONResponse(status_code=500, content={"detail": "internal_error", "xrid": rid})
+
+        dur_ms = (time.perf_counter() - t0) * 1000.0
+        resp.headers["x-request-id"] = rid
+        resp.headers["x-process-time-ms"] = str(int(dur_ms))
+        return resp
+
+
+class NoCookieMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            resp: Response = await call_next(request)
+        except (ClientDisconnect, anyio.EndOfStream):
+            return Response(status_code=204)
+
+        for k in list(resp.headers.keys()):
+            if k.lower() == "set-cookie":
+                del resp.headers[k]
+        return resp
+
+
+# =====================================================================
+# Model import helpers (dev-only)
+# =====================================================================
+
+def _should_skip_module(fq: str) -> bool:
+    base = fq.rsplit(".", 1)[-1]
+    if base.startswith("_"):
+        return True
+    if any(bad in fq for bad in (".__disabled__", ".disabled", ".bak", ".backup")):
+        return True
+    return False
+
+
+def _walk_pkg(pkg_name: str) -> List[str]:
+    pkg = sys.modules[pkg_name]
+    out: List[str] = []
+    for m in _pkgutil.walk_packages(pkg.__path__, prefix=pkg_name + "."):  # type: ignore[attr-defined]
+        fq = m.name
+        if _should_skip_module(fq):
+            continue
+        out.append(fq)
+    return sorted(out)
+
+
+def _import_all_models_devonly() -> List[str]:
+    loaded: List[str] = []
+    for fq in _walk_pkg("backend.models"):
+        try:
+            importlib.import_module(fq)
+            loaded.append(fq)
+        except Exception as e:
+            log.error("Model import failed: %s → %s", fq, e)
+    return loaded
+
+
+# =====================================================================
+# Background tasks (env-gated)
+# =====================================================================
+
+async def _start_callable_in_tg(tg: anyio.abc.TaskGroup, fn: Callable[..., Any], *args, **kwargs) -> None:
+    if inspect.iscoroutinefunction(fn):
+        tg.start_soon(fn, *args, **kwargs)
     else:
-        password_hash: Mapped[str] = mapped_column(
-            "password_hash",
-            String,
-            nullable=False,
-        )
-        hashed_password = synonym("password_hash")  # type: ignore
+        tg.start_soon(anyio.to_thread.run_sync, lambda: fn(*args, **kwargs))
 
-    preferred_language: Mapped[str] = mapped_column(
-        String(8),
-        nullable=False,
-        server_default=text("'en'"),
+
+async def _maybe_start_scheduler(tg: anyio.abc.TaskGroup) -> None:
+    if not _env_bool("ENABLE_SCHEDULER", True):
+        log.info("Scheduler disabled by env")
+        return
+    try:
+        import backend.tasks.scheduler as _sched  # type: ignore
+    except Exception as e:
+        log.info("No scheduler module found (%s)", e)
+        return
+
+    entry: Optional[Callable[..., Any]] = None
+    for candidate in ("start", "run", "serve", "main", "launch"):
+        if hasattr(_sched, candidate):
+            entry = getattr(_sched, candidate)
+            break
+    if entry is None:
+        log.warning("Scheduler module present but no start/run/serve/main/launch found")
+        return
+
+    await _start_callable_in_tg(tg, entry)
+    log.info("Scheduler started using %s()", entry.__name__)
+
+
+async def _auto_end_live_loop(tg: anyio.abc.TaskGroup) -> None:
+    if not _env_bool("ENABLE_CRON_AUTO_END", True):
+        return
+    try:
+        from backend.cronjobs.auto_end_live import auto_end_inactive_streams  # type: ignore
+    except Exception:
+        log.info("auto_end_live cron not found; skipping")
+        return
+
+    interval = max(15, _env_int("CRON_AUTO_END_INTERVAL", 60))
+
+    async def _loop():
+        while True:
+            try:
+                await anyio.to_thread.run_sync(auto_end_inactive_streams)
+            except Exception as e:
+                log.warning("auto_end_live error: %s", e)
+            await anyio.sleep(interval)
+
+    tg.start_soon(_loop)
+    log.info("Auto-end-live cron loop started (interval=%ss)", interval)
+
+
+async def _badge_updater_loop(tg: anyio.abc.TaskGroup) -> None:
+    if not _env_bool("ENABLE_BADGE_UPDATER", True):
+        return
+    try:
+        from backend.cronjobs.badge_updater import run as _run_badges  # type: ignore
+    except Exception:
+        log.info("badge_updater cron not found; skipping")
+        return
+
+    interval = max(300, _env_int("BADGE_UPDATER_INTERVAL", 3600))
+
+    async def _loop():
+        while True:
+            try:
+                await anyio.to_thread.run_sync(_run_badges)
+            except Exception as e:
+                log.warning("badge_updater error: %s", e)
+            await anyio.sleep(interval)
+
+    tg.start_soon(_loop)
+    log.info("Badge-updater cron loop started (interval=%ss)", interval)
+
+
+# =====================================================================
+# Lifespan (startup/shutdown)
+# =====================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    with suppress(Exception):
+        reload_engine_from_env()
+
+    if _env_bool("IMPORT_ALL_MODELS", _default_import_all_models()):
+        loaded_models = _import_all_models_devonly()
+        log.info("Models autoscan loaded (%d)", len(loaded_models))
+    else:
+        log.info("Models autoscan skipped (IMPORT_ALL_MODELS=0). Using registry only.")
+
+    _configure_mappers_failfast()
+
+    try:
+        ok_warm = await anyio.to_thread.run_sync(warm_db)
+        log.info("DB warm-up: %s", "OK" if ok_warm else "FAILED")
+    except Exception as e:
+        log.warning("DB warm-up error: %s", e)
+
+    ok, ms, err = _db_ping()
+    log.info(
+        "🚀 SmartBiz boot: env=%s starlette=%s db_ok=%s db_ms=%.1f auth=bearer_only",
+        ENV, STARLETTE_VER, ok, ms
+    )
+    if not ok:
+        log.error("Database ping failed at startup (%s)", err)
+
+    auto_create = (os.getenv("AUTO_CREATE_TABLES", "0" if ENV == "production" else "1") or "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if auto_create:
+        with suppress(Exception):
+            Base.metadata.create_all(bind=engine, checkfirst=True)  # type: ignore[union-attr]
+            log.info("Tables verified/created (AUTO_CREATE_TABLES=1)")
+
+    check_dupe_mappers()
+
+    tg = anyio.create_task_group()
+    await tg.__aenter__()
+    app.state.task_group = tg
+
+    with suppress(Exception):
+        await _maybe_start_scheduler(tg)
+    with suppress(Exception):
+        await _auto_end_live_loop(tg)
+    with suppress(Exception):
+        await _badge_updater_loop(tg)
+
+    try:
+        yield
+    finally:
+        with suppress(Exception):
+            tg.cancel_scope.cancel()
+            await tg.__aexit__(None, None, None)
+        log.info("Shutting down SmartBiz")
+
+
+# =====================================================================
+# CORS (FIXED) — kept for compatibility (you currently call setup_cors_guarded)
+# =====================================================================
+
+def setup_cors(app: FastAPI) -> None:
+    static_defaults = [
+        "https://smartbiz.site",
+        "https://www.smartbiz.site",
+        "https://smartbizsite.netlify.app",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+    ]
+
+    origins_env = _env_list("CORS_ALLOW_ORIGINS") + _env_list("FRONTEND_URLS")
+    single = (os.getenv("FRONTEND_URL") or "").strip()
+    if single:
+        origins_env.append(single)
+
+    origins: List[str] = []
+    for o in origins_env + static_defaults:
+        if o and o not in origins:
+            origins.append(o)
+
+    site = (os.getenv("NETLIFY_SITE_SUBDOMAIN") or "smartbizsite").strip()
+    preview_regex = rf"^https://[a-z0-9\-]+--{re.escape(site)}\.netlify\.app$"
+
+    allow_methods = _env_list("CORS_ALLOW_METHODS") or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+
+    default_allow_headers = [
+        "authorization",
+        "content-type",
+        "accept",
+        "accept-language",
+        "x-client-reqid",
+        "x-store-id",
+        "if-none-match",
+        "if-modified-since",
+        "x-request-id",
+    ]
+    allow_headers = _env_list("CORS_ALLOW_HEADERS") or default_allow_headers
+
+    expose_headers = _env_list("CORS_EXPOSE_HEADERS") or [
+        "etag",
+        "x-request-id",
+        "location",
+        "link",
+        "last-modified",
+        "x-total-count",
+        "x-page",
+        "x-per-page",
+        "x-pages",
+        "x-process-time-ms",
+    ]
+
+    max_age = int(os.getenv("CORS_MAX_AGE", "86400"))
+    allow_credentials = _env_bool("CORS_ALLOW_CREDENTIALS", True)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=preview_regex,
+        allow_credentials=allow_credentials,
+        allow_methods=allow_methods,
+        allow_headers=allow_headers,
+        expose_headers=expose_headers,
+        max_age=max_age,
     )
 
-    business_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    business_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    log.info("CORS configured: credentials=%s origins=%s regex=%s", allow_credentials, origins, preview_regex)
 
-    ad_earnings: Mapped[Decimal] = mapped_column(
-        Numeric(12, 2),
-        nullable=False,
-        server_default=text("0"),
-        doc="Cumulative ad revenue / creator payouts snapshot.",
+
+# =====================================================================
+# Router mounting helpers (file fallback + BOM hint)
+# =====================================================================
+
+def _skip_routes_list() -> List[str]:
+    return _env_list("ROUTES_SKIP")
+
+
+def _auto_scan_enabled() -> bool:
+    return _env_bool("ROUTES_AUTOSCAN", True)
+
+
+def _is_route_module_candidate(fq: str) -> bool:
+    base = fq.rsplit(".", 1)[-1]
+    if base.startswith("_"):
+        return False
+    if any(tag in fq for tag in (".__disabled__", ".disabled", ".bak", ".backup")):
+        return False
+    return True
+
+
+def _always_skip_for_safety() -> set[str]:
+    return {
+        "backend.routes.subscriptions",
+    }
+
+
+def _hint_if_bom(e: BaseException) -> str:
+    msg = str(e) or ""
+    if "U+FEFF" in msg or "non-printable character" in msg:
+        return " (HINT: file has BOM/hidden char U+FEFF; re-save as UTF-8 without BOM)"
+    return ""
+
+
+def _load_router_by_path(app: FastAPI, module_name: str, file_path: Path, attr: str = "router") -> bool:
+    try:
+        if not file_path.exists():
+            routes_log.error("Path fallback missing: %s", file_path)
+            return False
+
+        spec = _importlib_util.spec_from_file_location(module_name, str(file_path))
+        if not spec or not spec.loader:
+            routes_log.error("Path fallback spec failed: %s", file_path)
+            return False
+
+        mod = _importlib_util.module_from_spec(spec)  # type: ignore[attr-defined]
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+
+        if not hasattr(mod, attr):
+            routes_log.error("Path fallback loaded but no '%s': %s", attr, file_path)
+            return False
+
+        app.include_router(getattr(mod, attr))
+        routes_log.info("Path-fallback included %s (%s)", module_name, file_path.name)
+        return True
+
+    except (UnicodeDecodeError, SyntaxError) as e:
+        routes_log.error("Path fallback failed %s: %s%s", file_path, e, _hint_if_bom(e))
+        return False
+    except Exception as e:
+        routes_log.error("Path fallback failed %s: %s", file_path, e)
+        return False
+
+
+# =====================================================================
+# App factory
+# =====================================================================
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=os.getenv("APP_NAME", "SmartBiz Assistance API"),
+        version=os.getenv("APP_VERSION", "1.0.0"),
+        docs_url="/docs",
+        redoc_url=None,
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
     )
+    app.router.redirect_slashes = True
 
-    # -- timestamps & status ---------------------------------------------------
-    last_login_at: Mapped[Optional[dt.datetime]] = mapped_column(
-        DateTime(timezone=True)
-    )
+    _trusted_hosts = [h.strip() for h in (os.getenv("TRUSTED_HOSTS") or "").split(",") if h.strip()]
+    if _trusted_hosts and _trusted_hosts != ["*"]:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=_trusted_hosts)
 
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        index=True,
-    )
+    if _HAS_PROXY_MW and _env_bool("ENABLE_PROXY_MW", True):
+        with suppress(Exception):
+            app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")  # type: ignore[arg-type]
+            log.info("ProxyHeadersMiddleware enabled")
 
-    updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-        index=True,
-    )
+    # You are using guarded CORS
+    setup_cors_guarded(app, enable_guard=True)
 
-    anonymized_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    deleted_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
-    terms_accepted_at: Mapped[Optional[dt.datetime]] = mapped_column(
-        DateTime(timezone=True)
-    )
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(SecurityHeaders)
+    app.add_middleware(NoCookieMiddleware)
+    app.add_middleware(RequestIDTiming)
 
-    pii_erasure_note: Mapped[Optional[str]] = mapped_column(String)
+    mounted_modules: Set[str] = set()
+    skip_modules = set(_skip_routes_list()) | _always_skip_for_safety()
 
-    signup_ip: Mapped[Optional[str]] = mapped_column(INET)
-    signup_user_agent: Mapped[Optional[str]] = mapped_column(String)
+    # --------------------------------------------------------------
+    # Exception handlers
+    # --------------------------------------------------------------
 
-    # ------------------------------------------------------------------------------
-    # REQUIRED RELATIONSHIPS
-    #
-    # These MUST exist because other models define back_populates expecting
-    # these names. If you remove/rename them, Render will FAIL TO BOOT.
-    #
-    # Use fully-qualified dotted model paths so SQLAlchemy can lazy-resolve the
-    # class without importing it immediately. This avoids circular import loops.
-    # ------------------------------------------------------------------------------
+    @app.exception_handler(HTTPException)
+    async def _http_exc(_: Request, e: HTTPException):
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
-    # AIBotSettings.user  -> back_populates="ai_bot_settings"
-    ai_bot_settings: Mapped[List["AIBotSettings"]] = relationship(
-        "backend.models.ai_bot_settings.AIBotSettings",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
+    @app.exception_handler(RequestValidationError)
+    async def _val_exc(_: Request, e: RequestValidationError):
+        return JSONResponse(status_code=422, content={"detail": "validation_error", "errors": e.errors()})
 
-    # ForgotPasswordRequest.user -> back_populates="forgot_password_requests"
-    forgot_password_requests: Mapped[List["ForgotPasswordRequest"]] = relationship(
-        "backend.models.forgot_password.ForgotPasswordRequest",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, e: Exception):
+        rid = request.headers.get("x-request-id", "-")
+        log.exception("unhandled-exception xrid=%s", rid)
+        return JSONResponse(status_code=500, content={"detail": "internal_error", "xrid": rid})
 
-    # PasswordResetCode.user -> back_populates="password_resets"
-    password_resets: Mapped[List["PasswordResetCode"]] = relationship(
-        "backend.models.password_reset_code.PasswordResetCode",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
+    # --------------------------------------------------------------
+    # Utility endpoints
+    # --------------------------------------------------------------
 
-    # NOTE (future):
-    # If GiftMovement.sender has `back_populates="gift_movements_sent"`
-    # and GiftMovement.host   has `back_populates="gift_movements_received"`
-    # we MUST add:
-    #
-    # gift_movements_sent: Mapped[List["GiftMovement"]] = relationship(
-    #     "backend.models.gift_movement.GiftMovement",
-    #     back_populates="sender",
-    #     foreign_keys="backend.models.gift_movement.GiftMovement.sender_id",
-    #     passive_deletes=True,
-    #     lazy="selectin",
-    # )
-    #
-    # gift_movements_received: Mapped[List["GiftMovement"]] = relationship(
-    #     "backend.models.gift_movement.GiftMovement",
-    #     back_populates="host",
-    #     foreign_keys="backend.models.gift_movement.GiftMovement.host_id",
-    #     passive_deletes=True,
-    #     lazy="selectin",
-    # )
-    #
-    # If we forget to add them after updating gift_movement.py, Render will
-    # hard crash during startup.
+    @app.get("/")
+    def _root():
+        return RedirectResponse("/docs", status_code=302)
 
-    # ------------------------------------------------------------------------------
-    # Instance helpers
-    # ------------------------------------------------------------------------------
-    @staticmethod
-    def _now() -> dt.datetime:
-        return dt.datetime.now(dt.timezone.utc)
+    @app.head("/", include_in_schema=False)
+    def _root_head():
+        return Response(status_code=204)
 
-    @staticmethod
-    def normalize_email(v: Optional[str]) -> str:
-        return (v or "").strip().lower()
+    @app.get("/robots.txt", include_in_schema=False)
+    def _robots():
+        return PlainTextResponse("User-agent: *\nDisallow:\n", media_type="text/plain")
 
-    @staticmethod
-    def normalize_username(v: Optional[str]) -> Optional[str]:
-        if not v:
-            return None
-        v = " ".join(v.strip().split()).lower()
-        return v or None
+    @app.get("/favicon.ico", include_in_schema=False)
+    def _favicon():
+        return Response(status_code=204)
 
-    def set_password(self, raw: str) -> None:
-        """Hash and assign a new password to this user."""
-        self.password_hash = _hash_password(raw)
-
-    def verify_password(self, raw: str) -> bool:
-        return _verify_password(raw, self.password_hash or "")
-
-    def mark_verified(self) -> None:
-        self.is_verified = True
-
-    def deactivate(self, *, soft_delete: bool = False) -> None:
-        """
-        Disable account. Optionally stamp deleted_at for soft-deletion.
-        """
-        self.is_active = False
-        if soft_delete and not self.deleted_at:
-            self.deleted_at = self._now()
-
-    def touch_last_login(self) -> None:
-        """Update last_login_at to now()."""
-        self.last_login_at = self._now()
-
-    def display_name(self) -> str:
-        """
-        Best label for UI/chat bubbles:
-        priority full_name -> username -> email.
-        """
-        return (self.full_name or self.username or self.email or "").strip()
-
-    def soft_anonymize(self, *, note: Optional[str] = None) -> None:
-        """
-        Scrub direct PII but keep row for analytics/fraud/payout/audit.
-        Leaves a trace for audit via pii_erasure_note + anonymized_at.
-        """
-        self.full_name = None
-        self.avatar_url = None
-        self.bio = None
-        self.phone = None
-        self.signup_ip = None
-        self.signup_user_agent = None
-        self.pii_erasure_note = note or "anonymized"
-        self.anonymized_at = self._now()
-
-    def to_safe_dict(self) -> Dict[str, Any]:
-        """
-        Public-safe profile data for API responses.
-        DOES NOT expose password_hash.
-        """
+    @app.get("/health")
+    def _health():
+        h = db_healthcheck() if callable(db_healthcheck) else {}
+        ok = bool(h.get("ok", False))
         return {
-            "id": str(self.id) if self.id else None,
-            "email": self.email,
-            "username": self.username,
-            "full_name": self.full_name,
-            "avatar_url": self.avatar_url,
-            "bio": self.bio,
-            "role": self.role,
-            "is_active": bool(self.is_active),
-            "is_verified": bool(self.is_verified),
-            "phone": self.phone,
-            "phone_country": self.phone_country,
-            "preferred_language": self.preferred_language,
-            "business_name": self.business_name,
-            "business_type": self.business_type,
-            "ad_earnings": (
-                str(self.ad_earnings) if self.ad_earnings is not None else "0.00"
-            ),
-            "last_login_at": (
-                self.last_login_at.isoformat() if self.last_login_at else None
-            ),
-            "created_at": (
-                self.created_at.isoformat() if self.created_at else None
-            ),
-            "updated_at": (
-                self.updated_at.isoformat() if self.updated_at else None
-            ),
+            "status": "ok" if ok else "degraded",
+            "db_ok": ok,
+            "db_msg": h.get("error"),
+            "db_ms": h.get("ms"),
+            "time_utc": h.get("time_utc"),
+            "env": ENV,
+            "starlette": STARLETTE_VER,
+            "auth_mode": "bearer_only",
+            "ts": time.time(),
         }
 
-    # ------------------------------------------------------------------------------
-    # Validators
-    # ------------------------------------------------------------------------------
-    @validates("email")
-    def _v_email(self, _k, v: str) -> str:
-        v = User.normalize_email(v)
-        if not v or "@" not in v:
-            raise ValueError("invalid email")
-        return v
+    @app.get("/readyz")
+    def _ready():
+        ok, ms, _ = _db_ping()
+        return {"ready": ok, "db_ms": ms}
 
-    @validates("username")
-    def _v_username(self, _k, v: Optional[str]) -> Optional[str]:
-        return User.normalize_username(v)
+    @app.get("/_routes")
+    def _routes_dump():
+        items = []
+        for r in app.router.routes:
+            methods = sorted(list(getattr(r, "methods", []) or []))
+            if methods:
+                items.append(
+                    {
+                        "path": getattr(r, "path", getattr(r, "path_format", "")),
+                        "methods": methods,
+                        "name": getattr(r, "name", ""),
+                    }
+                )
+        return sorted(items, key=lambda x: (x["path"], ",".join(x["methods"])))
 
-    @validates("signup_ip")
-    def _v_signup_ip(self, _k, v: Optional[str]) -> Optional[str]:
-        if not v:
-            return None
+    @app.get("/_about")
+    def _about():
+        return {
+            "name": os.getenv("APP_NAME", "SmartBiz Assistance API"),
+            "version": os.getenv("APP_VERSION", "1.0.0"),
+            "env": ENV,
+            "python": sys.version.split()[0],
+            "starlette": STARLETTE_VER,
+            "db_url_masked": _sanitize_db(os.getenv("DATABASE_URL", "")),
+        }
+
+    @app.get("/__diag/mappers")
+    def _diag_mappers():
+        return {
+            "ok": _MAPPERS_OK,
+            "error": _MAPPERS_ERR,
+            "triggering_mapper": _MAPPERS_TRIGGER,
+            "original_exception": _MAPPERS_ORIGINAL,
+            "checked_at": _MAPPERS_TS,
+            "time_utc": datetime_utc_iso(),
+        }
+
+    @app.get("/__diag/mappers/full")
+    def _diag_mappers_full():
+        return {
+            "ok": _MAPPERS_OK,
+            "error_full": _MAPPERS_ERR_FULL,
+            "triggering_mapper": _MAPPERS_TRIGGER,
+            "original_exception": _MAPPERS_ORIGINAL,
+            "checked_at": _MAPPERS_TS,
+            "time_utc": datetime_utc_iso(),
+        }
+
+    @app.get("/__diag/mappers/trace", include_in_schema=False)
+    def _diag_mappers_trace():
+        return PlainTextResponse(_MAPPERS_TRACE or "NO_TRACE_AVAILABLE", media_type="text/plain")
+
+    # --------------------------------------------------------------
+    # Router mounting (GUARANTEES first, then central bootstrap)
+    # --------------------------------------------------------------
+
+    def _include_if_exists(mod_name: str, attr: str = "router") -> bool:
+        if mod_name in mounted_modules:
+            return True
+        if mod_name in skip_modules:
+            routes_log.warning("Skipped: %s", mod_name)
+            return False
         try:
-            ipaddress.ip_address(v)
-        except Exception:
-            return None
-        return v
+            spec = _importlib_util.find_spec(mod_name)
+            if not spec:
+                routes_log.warning("%s not found", mod_name)
+                return False
 
-    def __repr__(self) -> str:  # pragma: no cover
-        return (
-            f"<User id={self.id} "
-            f"email={self.email!r} "
-            f"role={self.role!r} "
-            f"active={self.is_active}>"
+            mod = importlib.import_module(mod_name)
+            if not hasattr(mod, attr):
+                routes_log.warning("%s found but has no '%s'", mod_name, attr)
+                return False
+
+            app.include_router(getattr(mod, attr))
+            mounted_modules.add(mod_name)
+            routes_log.info("Included %s.%s", mod_name, attr)
+            return True
+
+        except (UnicodeDecodeError, SyntaxError) as e:
+            routes_log.error("FAILED include %s (syntax/encoding): %s%s", mod_name, e, _hint_if_bom(e))
+            return False
+        except Exception as e:
+            routes_log.error("FAILED include %s: %s", mod_name, e)
+            return False
+
+    def _include_any(candidates: List[str], attr: str = "router") -> bool:
+        ok = False
+        for name in candidates:
+            ok = _include_if_exists(name, attr=attr) or ok
+        return ok
+
+    def _include_dual(mod_name: str, attr: str = "router") -> bool:
+        if mod_name in mounted_modules:
+            return True
+        if mod_name in skip_modules:
+            routes_log.warning("Skipped: %s", mod_name)
+            return False
+        try:
+            spec = _importlib_util.find_spec(mod_name)
+            if not spec:
+                routes_log.warning("%s not found", mod_name)
+                return False
+
+            mod = importlib.import_module(mod_name)
+            if not hasattr(mod, attr):
+                routes_log.warning("%s found but has no '%s'", mod_name, attr)
+                return False
+
+            r = getattr(mod, attr)
+            app.include_router(r)
+            app.include_router(r, prefix="/api")
+            mounted_modules.add(mod_name)
+            routes_log.info("Included %s.%s (+ /api)", mod_name, attr)
+            return True
+
+        except (UnicodeDecodeError, SyntaxError) as e:
+            routes_log.error("FAILED include %s (syntax/encoding): %s%s", mod_name, e, _hint_if_bom(e))
+            return False
+        except Exception as e:
+            routes_log.error("FAILED include %s: %s", mod_name, e)
+            return False
+
+    # (A) Optional health router
+    with suppress(Exception):
+        from backend.routes import health_routes  # type: ignore
+        app.include_router(health_routes.router)
+        mounted_modules.add("backend.routes.health_routes")
+        routes_log.info("Included backend.routes.health_routes")
+
+    # (B) Core includes
+    _include_if_exists("backend.routes.auth_routes")
+    _include_if_exists("backend.routes.user_routes")
+    _include_if_exists("backend.routes.profile_routes") or _include_if_exists("backend.routes.profile")
+
+    # Uploads guarantee (R2)
+    with suppress(Exception):
+        from backend.routers import uploads  # type: ignore
+        app.include_router(uploads.router)
+        app.include_router(uploads.router, prefix="/api")
+        routes_log.info("✅ Uploads router mounted (+ /api) (backend.routers.uploads)")
+
+    # ✅✅✅ Announcements guarantee (UPDATED + INDENT SAFE)
+    announce_module: str | None = None
+
+    if _include_if_exists("backend.routes.announcements"):
+        ok_announce = True
+        announce_module = "backend.routes.announcements"
+    else:
+        ok_announce = False
+
+    if not ok_announce:
+        candidates = [
+            "backend.routes.announcements_routes",
+            "backend.routes.announcement_routes",
+            "backend.routes.announcement",
+            "backend.routes.announce_routes",
+        ]
+        ok_announce = _include_any(candidates)
+        if ok_announce:
+            announce_module = candidates[0]
+
+    if not ok_announce:
+        ok_announce = _load_router_by_path(
+            app=app,
+            module_name="backend.routes.__path_fallback_announcements__",
+            file_path=_BACKEND / "routes" / "announcements.py",
+            attr="router",
         )
+        if ok_announce:
+            announce_module = "backend.routes.__path_fallback_announcements__"
+
+    if ok_announce:
+        mounted_modules.add(announce_module or "backend.routes.announcements")
+        routes_log.info("✅ Announcements router mounted (%s)", announce_module or "unknown")
+    else:
+        routes_log.info("❌ Announcements router NOT mounted (no module matched and path fallback failed)")
+
+    # Dashboard guarantee
+    ok_dash = _include_if_exists("backend.routes.dashboard_routes")
+    if not ok_dash:
+        ok_dash = _include_any(["backend.routes.dashboard", "backend.routes.dashboard_route", "backend.routes.dashboard_router"])
+    if not ok_dash:
+        ok_dash = _load_router_by_path(
+            app=app,
+            module_name="backend.routes.__path_fallback_dashboard__",
+            file_path=_BACKEND / "routes" / "dashboard_routes.py",
+            attr="router",
+        )
+    routes_log.info("✅ Dashboard router mounted" if ok_dash else "❌ Dashboard router NOT mounted")
+
+    # Stats guarantee
+    ok_stats = _include_if_exists("backend.routes.stats_routes")
+    if not ok_stats:
+        ok_stats = _include_any(["backend.routes.stats", "backend.routes.stats_route", "backend.routes.stats_router"])
+    if not ok_stats:
+        ok_stats = _load_router_by_path(
+            app=app,
+            module_name="backend.routes.__path_fallback_stats__",
+            file_path=_BACKEND / "routes" / "stats_routes.py",
+            attr="router",
+        )
+    routes_log.info("✅ Stats router mounted" if ok_stats else "❌ Stats router NOT mounted")
+
+    # Inbox (+ /api compat)
+    _include_dual("backend.routes.inbox_routes") or _include_dual("backend.routes.inbox")
+    _include_dual("backend.routes.conversations_routes") or _include_dual("backend.routes.conversations")
+    _include_dual("backend.routes.messages_routes") or _include_dual("backend.routes.messages")
+
+    # Products guarantee
+    ok_products = _include_if_exists("backend.routes.products")
+    if not ok_products:
+        ok_products = _include_any(["backend.routes.products_routes", "backend.routes.product_routes", "backend.routes.product"])
+    if not ok_products:
+        ok_products = _load_router_by_path(
+            app=app,
+            module_name="backend.routes.__path_fallback_products__",
+            file_path=_BACKEND / "routes" / "products.py",
+            attr="router",
+        )
+    routes_log.info("✅ Products router mounted" if ok_products else "❌ Products router NOT mounted")
+
+    # MyStore hub guarantee
+    ok_mystore = _include_if_exists("backend.routes.mystore")
+    if not ok_mystore:
+        ok_mystore = _include_any(["backend.routes.mystore_routes", "backend.routes.store_hub_routes"])
+    if not ok_mystore:
+        ok_mystore = _load_router_by_path(
+            app=app,
+            module_name="backend.routes.__path_fallback_mystore__",
+            file_path=_BACKEND / "routes" / "mystore.py",
+            attr="router",
+        )
+    routes_log.info("✅ MyStore router mounted" if ok_mystore else "❌ MyStore router NOT mounted")
+
+    # mystore_products_compat optional
+    with suppress(Exception):
+        from backend.routes import mystore_products_compat  # type: ignore
+        app.include_router(mystore_products_compat.router)
+        app.include_router(mystore_products_compat.router, prefix="/api")
+        mounted_modules.add("backend.routes.mystore_products_compat")
+        routes_log.info("✅ mystore_products_compat mounted (+ /api)")
+
+    # Central router bootstrap (optional)
+    with suppress(Exception):
+        from backend.routes import include_default_routers  # type: ignore
+        added = include_default_routers(app)
+        for m in added:
+            mounted_modules.add(m)
+        routes_log.info("Central bootstrap included: %s", added)
+
+    # Optional autoscan leftovers (safe)
+    if _auto_scan_enabled():
+        with suppress(Exception):
+            import backend.routes as _routes_pkg  # type: ignore
+            for m in _pkgutil.walk_packages(_routes_pkg.__path__, prefix="backend.routes."):  # type: ignore[attr-defined]
+                fq = m.name
+                if not _is_route_module_candidate(fq):
+                    continue
+                if fq in mounted_modules or fq in skip_modules:
+                    continue
+                try:
+                    mod = importlib.import_module(fq)
+                    if hasattr(mod, "router"):
+                        app.include_router(getattr(mod, "router"))
+                        mounted_modules.add(fq)
+                        routes_log.info("Auto-included %s.router", fq)
+                except (SyntaxError, UnicodeDecodeError) as e:
+                    routes_log.error("Failed auto-include %s (syntax/encoding): %s%s", fq, e, _hint_if_bom(e))
+                except Exception as e:
+                    routes_log.error("Failed auto-include %s: %s", fq, e)
+    else:
+        routes_log.warning("Autoscan disabled (ROUTES_AUTOSCAN=0)")
+
+    return app
 
 
-# ------------------------------------------------------------------------------
-# ORM LISTENERS
-# We attach to Base with propagate=True so all mapped subclasses fire,
-# but we guard with isinstance(target, User) to only touch User rows.
-# ------------------------------------------------------------------------------
+# =====================================================================
+# Singleton ASGI app
+# =====================================================================
 
-@listens_for(Base, "before_insert", propagate=True)
-def _on_user_insert(mapper, conn, target):  # type: ignore[no-redef]
-    """
-    Normalize + default fields right before INSERT.
-
-    WHY:
-    - Keeps DB consistent even if upstream/routers forget to sanitize data.
-    - Works as a last line of defense in production and during migrations.
-    """
-    if not isinstance(target, User):
-        return
-
-    if target.email:
-        target.email = User.normalize_email(target.email)
-    if target.username:
-        target.username = User.normalize_username(target.username)
-
-    if not target.role:
-        target.role = "user"
-
-    now = User._now()
-    if not target.created_at:
-        target.created_at = now
-    if not target.updated_at:
-        target.updated_at = now
+app = create_app()
 
 
-@listens_for(Base, "before_update", propagate=True)
-def _on_user_update(mapper, conn, target):  # type: ignore[no-redef]
-    """
-    Normalize + bump updated_at on UPDATE.
-    """
-    if not isinstance(target, User):
-        return
+# =====================================================================
+# Local dev runner
+# =====================================================================
 
-    if target.email:
-        target.email = User.normalize_email(target.email)
-    if target.username:
-        target.username = User.normalize_username(target.username)
-
-    target.updated_at = User._now()
-
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+    uvicorn.run(
+        "backend.main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        reload=(os.getenv("RELOAD") or ("0" if ENV == "production" else "1")).strip().lower() in {"1", "true", "yes", "on"},
+    )
